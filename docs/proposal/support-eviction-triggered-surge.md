@@ -172,21 +172,21 @@ Eviction budget fields are operational policy and do not produce a new Controlle
 For ServingGroup protection with steady desired replicas $R$:
 
 $$
-M = \operatorname{ResolveMinAvailable}(R)
+M = \mathrm{ResolveMinAvailable}(R)
 $$
 
 $$
-S = \operatorname{ResolveMaxSurge}(R)
+S = \mathrm{ResolveMaxSurge}(R)
 $$
 
 For Role $r$ in target ServingGroup $g$, with steady desired replicas $R_{g,r}$:
 
 $$
-M_{g,r} = \operatorname{ResolveRoleMinAvailable}(R_{g,r})
+M_{g,r} = \mathrm{ResolveRoleMinAvailable}(R_{g,r})
 $$
 
 $$
-S_{g,r} = \operatorname{ResolveRoleMaxSurge}(R_{g,r})
+S_{g,r} = \mathrm{ResolveRoleMaxSurge}(R_{g,r})
 $$
 
 Percentage values are rounded up. A surge slot is consumed by every active request, including `Pending` before resource creation, and by every marked orphan temporary unit. The slot invariants are:
