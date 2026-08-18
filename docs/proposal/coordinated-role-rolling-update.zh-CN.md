@@ -49,6 +49,12 @@ ModelServing 模板发生变化后，controller 会比较目标模板和当前 R
 
 #### 需要解决的场景
 
+下面的示例只说明为什么需要等比例滚动。假设 A、B、C 的期望副本数为 `10:5:5`，该比例代表一条完整服务链路所需的容量比例；新版流量只在新版 Role 之间流转。
+
+![Role 等比例滚动需求示意](images/coordinated-role-rollout-motivation.svg)
+
+如果各 Role 独立滚动，某一时刻可能分别完成 60%、40% 和 20%，新版容量变成 `6:2:1`，偏离原有的 `2:1:1`，最慢的 C 会成为整条新版链路的瓶颈。等比例滚动约束的是完成百分比而不是相同副本数：当三个 Role 都完成 40% 时，新版容量为 `4:2:2`，仍然保持原有容量比例。
+
 假设一个 ServingGroup 包含：
 
 ```text
@@ -57,6 +63,10 @@ B 依赖 C
 ```
 
 依赖方向的含义是：新版 A 只访问新版 B，新版 B 只访问新版 C。具体的版本路由由业务实现，Kthena 不负责路由。
+
+依赖门控只控制每个 Role 第一次开始滚动：C 至少有一个目标版本副本进入 `RoleRunning` 后，B 才能开始；B 至少有一个目标版本副本进入 `RoleRunning` 后，A 才能开始。它不要求 C 或 B 全部升级完成。
+
+![依赖 Role 的目标版本先启动](images/coordinated-role-rollout-dependency-start.svg)
 
 如果 controller 同时开始替换 A、B、C 各一个副本，而 A、B 比 C 更快 Ready，就可能形成：
 
@@ -74,6 +84,38 @@ B 依赖 C
 
 - **依赖安全**：下游至少存在一个目标版本 Ready 副本，上游才能开始替换；
 - **比例协调**：参与滚动的 Role 按各自升级完成百分比推进，Role 之间的进度差保持在用户允许的范围内。
+
+### 友商方案对比
+
+RBG 通过独立的 `CoordinatedPolicy` 资源协调一个 `RoleBasedGroup` 内的多个 Role。其滚动升级策略提供 `maxSkew`、`partition` 和 `maxUnavailable`；`OrderScheduled`、`OrderReady` 属于扩缩容策略，不参与滚动升级。
+
+RBG 的滚动进度为：
+
+```text
+滚动进度 = 已更新副本数 / 期望副本数
+```
+
+每次协调时，RBG 找出当前进度最慢的 Role，为它计算下一步允许达到的已更新副本数，再把这个目标换算成动态 `partition` 交给底层 workload 执行。其他 Role 本轮保持当前更新目标。底层 workload 仍然通过 `maxUnavailable` 控制可用性。
+
+本方案和 RBG 解决的核心问题相同：副本数不同的 Role 不能直接比较已更新副本数量，而应通过百分比进度和 `maxSkew` 协调。但两者所处的 controller 架构和依赖安全要求不同，因此实现方式不同。
+
+| 对比项 | RBG `CoordinatedPolicy` | Kthena 本方案 |
+|---|---|---|
+| API 载体 | 使用独立的 `CoordinatedPolicy` CRD，通过规则选择参与协调的 Role | 在 `ModelServing.spec.rolloutStrategy.roleRollingUpdateConfiguration` 中增加 `coordination`，与现有 Role 滚动配置放在一起 |
+| 协调范围 | 一个 `RoleBasedGroup` 内策略选中的 Role | 一个 ServingGroup 内 `roles` 选中的 Role；未配置 `roles` 时为全部 Role |
+| 滚动进度 | `updatedReplicas / desiredReplicas`，副本完成版本更新后即计入进度，不要求 Ready | 同时统计 Ready 进度和已开始进度；只有目标版本 `RoleRunning` 副本计入 Ready，已经删除、补建或等待 Ready 的副本计入更新中 |
+| 推进方式 | 重点推进当前最慢的 Role，为它计算阶段性更新目标，并转换成动态 `partition` | 先由现有逻辑为每个 Role 产生本地候选，再逐个判断候选是否满足依赖和 `maxSkew`；一次 reconcile 可以批准多个 Role 的候选 |
+| `maxSkew` 判断 | 比较各 Role 的已更新百分比；实现中允许整数副本粒度造成的单副本误差 | 比较候选执行后的已开始进度和当前最小 Ready 进度；显式使用“配置值与最大单副本进度中的较大值”作为实际 `maxSkew` |
+| `partition` | 除用户配置的最终 `partition` 外，协调器还会生成阶段性动态 `partition`，限制底层 workload 暂时更新到哪里 | 保留用户配置的静态 `partition`，用它确定本次滚动范围和进度分母；协调器不修改 `partition`，只控制当前批准哪些候选 |
+| `maxUnavailable` | 由底层 workload 在执行动态更新目标时继续保证 | 先由现有单 Role 逻辑应用，再执行跨 Role 候选判断，职责保持不变 |
+| 未 Ready 的更新 | 已更新但未 Ready 的副本已经计入滚动进度；Ready 主要由底层可用性逻辑处理 | 未 Ready 的更新计入“已开始进度”，防止重复批准；但不计入 Ready 进度，不能抬高其他 Role 的推进基线 |
+| Role 依赖 | RBG 支持一般性的 Role 依赖，但它不是目标版本感知的滚动启动门控；配置 `maxSkew` 的滚动过程中，workload Ready 依赖检查会被跳过 | 显式声明滚动依赖；下游至少有一个目标版本 `RoleRunning` 副本后，才允许上游第一次替换 |
+| `OrderScheduled` / `OrderReady` | 只用于协调扩缩容，决定当前扩容目标达到 Scheduled 还是 Ready 后再推进下一个目标；不是 Role 顺序，也不用于滚动升级 | 不增加此切换项；滚动启动依赖固定使用目标版本 `RoleRunning`，后续比例推进使用 Ready 进度和已开始进度 |
+| 对 `maxSurge` 的关系 | 由底层 workload 的滚动策略负责 | 本方案不实现 `maxSurge`，只要求将未来已获准创建的 surge 副本计入更新中，并保持目标副本数作为分母 |
+
+本方案借鉴 RBG 的三个设计点：用归一化百分比表达跨 Role 进度、用 `maxSkew` 限制进度偏差、允许整数副本粒度带来的最小可执行误差。没有直接采用动态 `partition`，是因为 Kthena 已经在 controller 中直接选出并删除具体的旧 Role replica；在这一架构下，对候选进行协调批准可以复用现有删除、补建和 `maxUnavailable` 流程，也能在同一处准确记录已经开始但尚未 Ready 的更新。
+
+此外，RBG 的协调滚动主要解决进度均衡，不保证“目标版本下游先 Ready”。Kthena 的业务场景存在新版 A 只能访问新版 B、新版 B 只能访问新版 C 的约束，因此本方案额外增加目标版本感知的依赖启动门控。这一门控只控制 Role 第一次开始滚动，不形成持续的 `A <= B <= C` 进度关系；后续仍统一由 `maxSkew` 协调。
 
 ### 目标与非目标
 
@@ -699,3 +741,6 @@ feature gate 关闭或未配置 `coordination` 时，行为与现有 `RoleRollin
 ### 参考
 
 - [Kthena Role rolling update proposal](https://github.com/volcano-sh/kthena/blob/main/docs/proposal/role-rollingupdate.md)
+- [RBG CoordinatedPolicy API](https://github.com/sgl-project/rbg/blob/ba7b952ea287e80d98cf6a110a11a25af77997f6/api/workloads/v1alpha2/coordinatedpolicy_types.go#L52-L107)
+- [RBG coordinated rolling update implementation](https://github.com/sgl-project/rbg/blob/ba7b952ea287e80d98cf6a110a11a25af77997f6/internal/controller/workloads/rolebasedgroup_controller.go#L1244-L1509)
+- [RBG maxSkew rolling dependency behavior](https://github.com/sgl-project/rbg/blob/ba7b952ea287e80d98cf6a110a11a25af77997f6/pkg/reconciler/roleinstanceset_reconciler.go#L485-L500)

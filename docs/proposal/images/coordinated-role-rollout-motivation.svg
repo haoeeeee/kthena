@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760" role="img" aria-labelledby="title desc">
+  <title id="title">Role 等比例滚动需求示意</title>
+  <desc id="desc">对比多个 Role 独立滚动造成的新版容量比例失衡，以及等比例滚动保持原有容量比例的效果。</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <style>
+      text { font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #172033; }
+      .panel-title { font-size: 26px; font-weight: 700; }
+      .subtitle { font-size: 17px; fill: #526077; }
+      .role { font-size: 20px; font-weight: 700; }
+      .ratio { font-size: 18px; font-weight: 700; }
+      .small { font-size: 16px; fill: #526077; }
+      .chain { font-size: 19px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <rect width="1400" height="760" fill="#ffffff"/>
+
+  <text x="700" y="48" text-anchor="middle" font-size="31" font-weight="700">为什么需要 Role 等比例滚动</text>
+  <text x="700" y="80" text-anchor="middle" class="subtitle">假设期望副本数 A:B:C = 10:5:5，新版流量只在新版 A → B → C 链路中流转</text>
+
+  <rect x="44" y="112" width="636" height="566" rx="18" fill="#fff7f7" stroke="#f0a3a3" stroke-width="2"/>
+  <rect x="720" y="112" width="636" height="566" rx="18" fill="#f4fbf6" stroke="#86c99a" stroke-width="2"/>
+
+  <text x="76" y="158" class="panel-title" fill="#9f2929">各 Role 独立滚动：可能失衡</text>
+  <text x="752" y="158" class="panel-title" fill="#176b38">按滚动进度协调：保持比例</text>
+
+  <rect x="462" y="135" width="18" height="18" rx="3" fill="#2f6fe4"/>
+  <text x="488" y="151" class="small">新版 v2</text>
+  <rect x="572" y="135" width="18" height="18" rx="3" fill="#d7dde7"/>
+  <text x="598" y="151" class="small">旧版 v1</text>
+
+  <rect x="1138" y="135" width="18" height="18" rx="3" fill="#2f6fe4"/>
+  <text x="1164" y="151" class="small">新版 v2</text>
+  <rect x="1248" y="135" width="18" height="18" rx="3" fill="#d7dde7"/>
+  <text x="1274" y="151" class="small">旧版 v1</text>
+
+  <!-- Left: Role A, 6/10 updated -->
+  <text x="78" y="226" class="role">Role A</text>
+  <text x="78" y="249" class="small">6 / 10 = 60%</text>
+  <g transform="translate(210 204)">
+    <rect x="0" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="37" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="74" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="111" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="148" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="185" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="222" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="259" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="296" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="333" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+  </g>
+
+  <!-- Left: Role B, 2/5 updated -->
+  <text x="78" y="292" class="role">Role B</text>
+  <text x="78" y="315" class="small">2 / 5 = 40%</text>
+  <g transform="translate(210 270)">
+    <rect x="0" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="37" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="74" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="111" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="148" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+  </g>
+
+  <!-- Left: Role C, 1/5 updated -->
+  <text x="78" y="358" class="role">Role C</text>
+  <text x="78" y="381" class="small">1 / 5 = 20%</text>
+  <g transform="translate(210 336)">
+    <rect x="0" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="37" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="74" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="111" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="148" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+  </g>
+
+  <!-- Right: Role A, 4/10 updated -->
+  <text x="754" y="226" class="role">Role A</text>
+  <text x="754" y="249" class="small">4 / 10 = 40%</text>
+  <g transform="translate(886 204)">
+    <rect x="0" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="37" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="74" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="111" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="148" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="185" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="222" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="259" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="296" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="333" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+  </g>
+
+  <!-- Right: Role B, 2/5 updated -->
+  <text x="754" y="292" class="role">Role B</text>
+  <text x="754" y="315" class="small">2 / 5 = 40%</text>
+  <g transform="translate(886 270)">
+    <rect x="0" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="37" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="74" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="111" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="148" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+  </g>
+
+  <!-- Right: Role C, 2/5 updated -->
+  <text x="754" y="358" class="role">Role C</text>
+  <text x="754" y="381" class="small">2 / 5 = 40%</text>
+  <g transform="translate(886 336)">
+    <rect x="0" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="37" y="0" width="31" height="31" rx="4" fill="#2f6fe4"/>
+    <rect x="74" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="111" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+    <rect x="148" y="0" width="31" height="31" rx="4" fill="#d7dde7"/>
+  </g>
+
+  <!-- Left new-version chain -->
+  <text x="76" y="432" class="ratio">新版调用链容量</text>
+  <rect x="82" y="456" width="142" height="58" rx="10" fill="#ffffff" stroke="#7395d8" stroke-width="2"/>
+  <text x="153" y="492" text-anchor="middle" class="chain">新 A：6</text>
+  <line x1="224" y1="485" x2="277" y2="485" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <rect x="282" y="456" width="142" height="58" rx="10" fill="#ffffff" stroke="#7395d8" stroke-width="2"/>
+  <text x="353" y="492" text-anchor="middle" class="chain">新 B：2</text>
+  <line x1="424" y1="485" x2="477" y2="485" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <rect x="482" y="456" width="142" height="58" rx="10" fill="#fff0f0" stroke="#dc4b4b" stroke-width="3"/>
+  <text x="553" y="492" text-anchor="middle" class="chain" fill="#a52424">新 C：1</text>
+  <text x="353" y="551" text-anchor="middle" font-size="21" font-weight="700" fill="#b42323">新版容量比例 6:2:1，C 成为瓶颈</text>
+  <text x="353" y="579" text-anchor="middle" class="small">提前更新出的 A、B 容量无法形成有效服务能力</text>
+
+  <!-- Right new-version chain -->
+  <text x="752" y="432" class="ratio">新版调用链容量</text>
+  <rect x="758" y="456" width="142" height="58" rx="10" fill="#ffffff" stroke="#4b9f69" stroke-width="2"/>
+  <text x="829" y="492" text-anchor="middle" class="chain">新 A：4</text>
+  <line x1="900" y1="485" x2="953" y2="485" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <rect x="958" y="456" width="142" height="58" rx="10" fill="#ffffff" stroke="#4b9f69" stroke-width="2"/>
+  <text x="1029" y="492" text-anchor="middle" class="chain">新 B：2</text>
+  <line x1="1100" y1="485" x2="1153" y2="485" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <rect x="1158" y="456" width="142" height="58" rx="10" fill="#ecf8ef" stroke="#2c8a4d" stroke-width="3"/>
+  <text x="1229" y="492" text-anchor="middle" class="chain" fill="#176b38">新 C：2</text>
+  <text x="1029" y="551" text-anchor="middle" font-size="21" font-weight="700" fill="#176b38">新版容量比例 4:2:2，保持原有 2:1:1</text>
+  <text x="1029" y="579" text-anchor="middle" class="small">各 Role 的新版容量能够组成完整、匹配的服务链路</text>
+
+  <rect x="194" y="615" width="1012" height="82" rx="14" fill="#f6f8fc" stroke="#cad2df"/>
+  <text x="700" y="649" text-anchor="middle" font-size="21" font-weight="700">等比例不是“更新相同数量的副本”，而是让各 Role 的滚动完成百分比保持接近</text>
+  <text x="700" y="680" text-anchor="middle" class="subtitle">maxSkew 用于限制最大进度差，避免任一 Role 的新版容量过度领先或落后</text>
+
+  <text x="700" y="734" text-anchor="middle" font-size="14" fill="#748096">示例假设期望副本数体现各 Role 所需容量比例；图中仅说明比例协调的必要性。</text>
+</svg>

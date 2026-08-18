@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="720" viewBox="0 0 1400 720" role="img" aria-labelledby="title desc">
+  <title id="title">为什么被依赖 Role 必须先启动</title>
+  <desc id="desc">对比新 A 和新 B 先启动但新 C 尚未启动造成调用中断，以及按照 C、B、A 的顺序启动后新版调用链可用。</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc4242"/>
+    </marker>
+    <style>
+      text { font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #172033; }
+      .panel-title { font-size: 25px; font-weight: 700; }
+      .role { font-size: 22px; font-weight: 700; }
+      .status { font-size: 16px; fill: #526077; }
+      .small { font-size: 15px; fill: #657188; }
+    </style>
+  </defs>
+
+  <rect width="1400" height="720" fill="#ffffff"/>
+
+  <text x="700" y="46" text-anchor="middle" font-size="31" font-weight="700">为什么被依赖 Role 必须先启动</text>
+  <text x="700" y="79" text-anchor="middle" font-size="17" fill="#526077">A 依赖 B，B 依赖 C；业务保证目标版本只访问目标版本</text>
+
+  <!-- Comparison panels -->
+  <rect x="44" y="112" width="636" height="514" rx="18" fill="#fff7f7" stroke="#ed9898" stroke-width="2"/>
+  <rect x="720" y="112" width="636" height="514" rx="18" fill="#f3fbf5" stroke="#76bf8c" stroke-width="2"/>
+
+  <!-- Left: bad case -->
+  <text x="76" y="158" class="panel-title" fill="#a52424">错误：新 A、新 B 先启动</text>
+  <text x="76" y="187" class="status">新 C 尚未 Ready，但请求已经进入目标版本链路</text>
+
+  <rect x="84" y="234" width="158" height="92" rx="12" fill="#eef4ff" stroke="#2f6fe4" stroke-width="3"/>
+  <text x="163" y="269" text-anchor="middle" class="role">新 A</text>
+  <text x="163" y="300" text-anchor="middle" class="status">RoleRunning：1</text>
+
+  <line x1="242" y1="280" x2="296" y2="280" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="269" y="261" text-anchor="middle" class="small">请求</text>
+
+  <rect x="302" y="234" width="158" height="92" rx="12" fill="#eef4ff" stroke="#2f6fe4" stroke-width="3"/>
+  <text x="381" y="269" text-anchor="middle" class="role">新 B</text>
+  <text x="381" y="300" text-anchor="middle" class="status">RoleRunning：1</text>
+
+  <line x1="460" y1="280" x2="514" y2="280" stroke="#dc4242" stroke-width="3" stroke-dasharray="8 6" marker-end="url(#arrow-red)"/>
+  <circle cx="487" cy="280" r="17" fill="#fff" stroke="#dc4242" stroke-width="3"/>
+  <line x1="478" y1="271" x2="496" y2="289" stroke="#dc4242" stroke-width="3"/>
+  <line x1="496" y1="271" x2="478" y2="289" stroke="#dc4242" stroke-width="3"/>
+
+  <rect x="520" y="234" width="126" height="92" rx="12" fill="#fff0f0" stroke="#dc4242" stroke-width="3"/>
+  <text x="583" y="269" text-anchor="middle" class="role" fill="#a52424">新 C</text>
+  <text x="583" y="300" text-anchor="middle" class="status" fill="#a52424">Ready：0</text>
+
+  <rect x="84" y="364" width="562" height="112" rx="14" fill="#fff0f0" stroke="#efb0b0"/>
+  <text x="365" y="402" text-anchor="middle" font-size="21" font-weight="700" fill="#a52424">新 B 找不到兼容且可用的新 C</text>
+  <text x="365" y="434" text-anchor="middle" font-size="17" fill="#7d3030">请求在 B → C 处中断、排队或失败</text>
+  <text x="365" y="459" text-anchor="middle" class="small">新 A、新 B 虽然已经 Ready，但还不能组成完整服务能力</text>
+
+  <text x="365" y="529" text-anchor="middle" font-size="20" font-weight="700" fill="#a52424">问题不在 A、B 是否 Ready，而在目标版本下游不存在</text>
+  <text x="365" y="559" text-anchor="middle" class="small">仅靠各 Role 自己的 maxUnavailable 无法避免该状态</text>
+
+  <!-- Right: correct case -->
+  <text x="752" y="158" class="panel-title" fill="#176b38">正确：先启动被依赖的 Role</text>
+  <text x="752" y="187" class="status">先建立最小可用的目标版本下游，再逐级解锁上游</text>
+
+  <rect x="762" y="216" width="552" height="54" rx="12" fill="#e9f7ed" stroke="#9bceaa"/>
+  <circle cx="801" cy="243" r="17" fill="#2f6fe4"/>
+  <text x="801" y="249" text-anchor="middle" font-size="16" font-weight="700" fill="#ffffff">1</text>
+  <text x="833" y="249" font-size="17" font-weight="700">新 C RoleRunning：1，解锁 B</text>
+
+  <rect x="762" y="282" width="552" height="54" rx="12" fill="#e9f7ed" stroke="#9bceaa"/>
+  <circle cx="801" cy="309" r="17" fill="#2f6fe4"/>
+  <text x="801" y="315" text-anchor="middle" font-size="16" font-weight="700" fill="#ffffff">2</text>
+  <text x="833" y="315" font-size="17" font-weight="700">新 B RoleRunning：1，解锁 A</text>
+
+  <rect x="762" y="348" width="552" height="54" rx="12" fill="#e9f7ed" stroke="#9bceaa"/>
+  <circle cx="801" cy="375" r="17" fill="#2f6fe4"/>
+  <text x="801" y="381" text-anchor="middle" font-size="16" font-weight="700" fill="#ffffff">3</text>
+  <text x="833" y="381" font-size="17" font-weight="700">新 A 获得首次启动资格</text>
+
+  <rect x="760" y="448" width="154" height="76" rx="12" fill="#eef4ff" stroke="#2f6fe4" stroke-width="3"/>
+  <text x="837" y="478" text-anchor="middle" class="role">新 A</text>
+  <text x="837" y="505" text-anchor="middle" class="status">Ready：≥ 1</text>
+  <line x1="914" y1="486" x2="960" y2="486" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="966" y="448" width="154" height="76" rx="12" fill="#eef4ff" stroke="#2f6fe4" stroke-width="3"/>
+  <text x="1043" y="478" text-anchor="middle" class="role">新 B</text>
+  <text x="1043" y="505" text-anchor="middle" class="status">Ready：≥ 1</text>
+  <line x1="1120" y1="486" x2="1166" y2="486" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="1172" y="448" width="154" height="76" rx="12" fill="#edf8f0" stroke="#2d9552" stroke-width="3"/>
+  <text x="1249" y="478" text-anchor="middle" class="role" fill="#176b38">新 C</text>
+  <text x="1249" y="505" text-anchor="middle" class="status">Ready：≥ 1</text>
+
+  <text x="1043" y="558" text-anchor="middle" font-size="20" font-weight="700" fill="#176b38">目标版本调用链完整，请求可以到达可用的新 C</text>
+  <text x="1043" y="588" text-anchor="middle" class="small">只要求下游至少有一个目标版本 Ready 副本，不要求全部升级完成</text>
+
+  <!-- Bottom conclusion -->
+  <rect x="188" y="650" width="1024" height="48" rx="14" fill="#f6f8fc" stroke="#cad2df"/>
+  <text x="700" y="681" text-anchor="middle" font-size="19" font-weight="700">依赖门控解决“目标版本链路能否成立”；maxSkew 解决链路成立后的新版容量比例</text>
+</svg>
