@@ -77,7 +77,7 @@ The current implementation cannot provide these properties because `rolesToDelet
 - Change initial ModelServing creation ordering. Dependencies in this proposal apply only to coordinated Role rolling updates.
 - Coordinate rollout progress across different ServingGroups. Each ServingGroup has an independent coordinator.
 - Replace the existing Role `maxUnavailable` or `partition` fields.
-- Coordinate ordinary scaling, failure recovery, or Role addition/removal as proportional rolling-update work.
+- Coordinate replica-only scaling, failure recovery, or Role addition/removal as proportional rolling-update work. When a replica increase and a Role template change are submitted together, creating target-version replicas is part of the rollout and is therefore coordinated.
 - Automatically roll back a revision when rollout progress stalls.
 - Turn Pod readiness on or off, mutate readiness gates, or change Service endpoint selection.
 - Guarantee runtime dependency health after an upstream replica has already completed rollout. Ordinary recovery policy handles later failures.
@@ -94,21 +94,20 @@ metadata:
 spec:
   rolloutStrategy:
     type: RoleRollingUpdate
-    roleRollingUpdateConfiguration:
-      coordination:
-        # Optional. Omission selects all Roles in spec.template.roles.
-        roles: [a, b, c]
+    roleCoordination:
+      # Optional. Omission selects all Roles in spec.template.roles.
+      roles: [a, b, c]
 
-        # Percentage points of normalized rollout progress. Percent only.
-        maxSkew: 10%
+      # Percentage points of normalized rollout progress. Percent only.
+      maxSkew: 10%
 
-        # Rollout-only startup dependency graph. "a dependsOn b" means b
-        # must have one target-revision RoleRunning replica before a starts.
-        dependencies:
-        - role: a
-          dependsOn: [b]
-        - role: b
-          dependsOn: [c]
+      # Rollout-only startup dependency graph. "a dependsOn b" means b
+      # must have one target-revision RoleRunning replica before a starts.
+      dependencies:
+      - role: a
+        dependsOn: [b]
+      - role: b
+        dependsOn: [c]
 
   template:
     roles:
@@ -161,6 +160,12 @@ A has 2 replicas, B has 4, and C has 10. With `maxSkew: 10%` and a zero Ready ba
 
 A has four replicas with `partition: 2`; B and C have four replicas with no partition. A's rollout target contains only A-2 and A-3. Its denominator is therefore two, not four. Once those two replicas are updated and Ready, A's coordinated progress is 100%, while A-0 and A-1 intentionally remain old. B and C may still reach 100% of their own four-replica targets; A's partition does not implicitly partition B or C.
 
+##### Concurrent scale-up and template update
+
+If only a Role's replica count changes, the existing scaling path continues to handle that change without proportional coordination. If a participating Role's replica count and template change in the same update, however, every additional target-version replica introduces new-version capacity and is a rollout start. Its creation is admitted by the same dependency and `maxSkew` checks as a delete-first replacement. This prevents an upstream scale-up from creating target-version A replicas before compatible target-version B and C capacity is Ready.
+
+Scale-down retains the existing behavior. After the desired count changes, the coordinator recalculates the denominator and observed progress from the new desired count and gates subsequent rollout starts. It does not undo or delay a user-requested scale-down.
+
 ### API Design
 
 ```go
@@ -171,14 +176,10 @@ type RolloutStrategy struct {
     RollingUpdateConfiguration *RollingUpdateConfiguration `json:"rollingUpdateConfiguration,omitempty"`
 
     // Used only by RoleRollingUpdate.
-    RoleRollingUpdateConfiguration *RoleRollingUpdateConfiguration `json:"roleRollingUpdateConfiguration,omitempty"`
+    RoleCoordination *RoleCoordination `json:"roleCoordination,omitempty"`
 }
 
-type RoleRollingUpdateConfiguration struct {
-    Coordination *RoleRollingUpdateCoordination `json:"coordination,omitempty"`
-}
-
-type RoleRollingUpdateCoordination struct {
+type RoleCoordination struct {
     // Empty means all Roles.
     Roles []string `json:"roles,omitempty"`
 
@@ -201,8 +202,8 @@ Dependency ordering has one fixed meaning: an upstream entry Role waits for targ
 
 The webhook must enforce:
 
-- When `roleRollingUpdateConfiguration.coordination` is present, `rolloutStrategy.type` must explicitly equal `RoleRollingUpdate`; the default `ServingGroupRollingUpdate` selected when the strategy is omitted is not valid.
-- `coordination.maxSkew` is required and must be a percentage string in `(0%, 100%]`; integer values are rejected.
+- When `roleCoordination` is present, `rolloutStrategy.type` must explicitly equal `RoleRollingUpdate`; the default `ServingGroupRollingUpdate` selected when the strategy is omitted is not valid.
+- `roleCoordination.maxSkew` is required and must be a percentage string in `(0%, 100%]`; integer values are rejected.
 - Role names in `roles`, `role`, and `dependsOn` exist in `spec.template.roles`.
 - Names are unique; self-dependencies and duplicate dependency edges are rejected.
 - The dependency graph is acyclic.
@@ -233,7 +234,9 @@ reservedProgress_r = min(R_r + I_r, T_r) / T_r
 
 - Role replicas in `RoleDeleting` because of this rollout;
 - target-hash Role replicas that are not `RoleRunning`;
-- stable replacement slots missing between deletion completion and successful recreation;
+- stable replacement slots missing between an admitted delete-first action and successful recreation.
+
+An ordinal that is absent only because the desired replica count increased is not reserved before its target-version creation is admitted. After admission, the created target-hash replica is observable and consumes `I_r` until it becomes `RoleRunning`.
 
 Counting in-flight work is essential. If the controller selected A, B, and C using only Ready progress, A and B could become Ready faster than C and exceed a decision made when all progress values were zero. Reservation prevents repeated reconciles from admitting more work than the coordination budget already committed.
 
@@ -268,6 +271,8 @@ readyBaseline = min(readyProgress_r) across active participating Roles
 ratioLimit    = min(1, readyBaseline + configuredSkew)
 allowedStarted_r = min(T_r, ceil(ratioLimit * T_r))
 ```
+
+Ready progress itself is not rounded: the controller compares `R_r / T_r` as an exact ratio using integer cross-multiplication. Rounding is applied only when the ratio limit is converted to an integer number of started replicas, and that conversion uses `ceil`. Rounding down could produce zero at startup for a small Role; for example, `floor(10% * 4) = 0` would prevent a four-replica Role from ever starting. The ceiling permits one replica for that Role without increasing any other Role's limit.
 
 A candidate for Role `r` is skew-eligible only when:
 
@@ -308,7 +313,7 @@ sync Services
 update status
 ```
 
-Coordination changes only the Role rolling-update decision inside `manageRollingUpdate`.
+Coordination changes Role rollout admission in two places: target-version creation during a concurrent scale-up in `syncRoleReplicas`, and delete-first replacement selection in `manageRollingUpdate`.
 
 #### Phase 1: build a snapshot
 
@@ -319,23 +324,24 @@ For each non-deleting ServingGroup:
 3. Resolve per-Role partition and eligible ordinals.
 4. Classify eligible replicas as old Ready, old unavailable, deleting, target Creating, or target Running.
 5. Calculate `T`, `R`, `I`, Ready progress, started progress, the shared Ready baseline, and each Role's `allowedStarted` integer limit.
-6. Generate local outdated candidates using the existing `maxUnavailable` logic.
+6. Generate target-version scale-up candidates and local outdated candidates using the existing scaling and `maxUnavailable` rules.
 
-Ordinary scaling remains owned by the existing `syncRoleReplicas` path and is not treated as coordinated rollout progress. The coordinator only filters outdated-role candidates produced by the existing rolling-update logic. Missing replacement slots for an active changed Role remain reserved as in-flight work.
+Replica-only scaling remains owned by the existing `syncRoleReplicas` path and is not coordinated. When a replica increase and template change occur together, missing ordinals that would be created with the target Role hash are rollout-start candidates and must be admitted before creation. Target-version replicas created by an admitted scale-up contribute to `R` when `RoleRunning` and to `I` otherwise. Missing replacement slots created by an admitted delete-first update remain reserved as in-flight work; unadmitted scale-up slots do not.
 
 #### Phase 2: filter and select candidates
 
-The coordinator repeatedly evaluates local candidates using a simulated reservation snapshot:
+The coordinator repeatedly evaluates rollout-start candidates using a simulated reservation snapshot. A candidate may create an additional target-version replica during concurrent scale-up or delete an outdated replica for delete-first replacement:
 
 ```text
 selected = []
 
 while candidates remain:
     eligible = candidates that satisfy all of:
-      1. Role partition allows the ordinal
-      2. Role maxUnavailable/local budget allows the candidate
-      3. projected R + I does not exceed this Role's allowedStarted limit
-      4. dependency Ready gate is satisfied
+      1. the existing local scaling or rolling-update rule allows the action
+      2. Role partition allows the ordinal
+      3. Role maxUnavailable/local budget allows a delete-first candidate
+      4. projected R + I does not exceed this Role's allowedStarted limit
+      5. dependency Ready gate is satisfied
 
     if eligible is empty:
         break
@@ -345,13 +351,13 @@ while candidates remain:
       2. Role order in spec
       3. highest replica ordinal
 
-    append candidate to selected
+    append candidate to the corresponding create or delete selection
     increment the simulated in-flight reservation for its Role
 ```
 
 The simulated increment prevents one reconcile from selecting an unlimited number of replicas before informer events report `RoleDeleting`.
 
-After selection, the existing `DeleteRole` path performs the actual delete. Deletion-completion events remove the logical Role from the datastore and enqueue the ModelServing. The next reconcile recreates the missing Role with the target hash. A target-hash non-Running Role consumes both the local `maxUnavailable` budget and the cross-Role reservation until it becomes `RoleRunning`.
+After selection, the existing `scaleUpRoles` path creates admitted target-version scale-up replicas, while the existing `DeleteRole` path performs admitted delete-first replacements. Deletion-completion events remove the logical Role from the datastore and enqueue the ModelServing. The next reconcile recreates the missing Role with the target hash. A target-hash non-Running Role consumes both the local `maxUnavailable` budget, where applicable, and the cross-Role reservation until it becomes `RoleRunning`.
 
 #### Phase 3: event-driven continuation
 
@@ -389,6 +395,10 @@ Coordination may reduce the number selected by the existing logic but never incr
 #### partition
 
 Partition is resolved separately for every Role and affects only that Role's denominator. A partition on A never stops B or C from completing their own rollout. Protected old replicas remain old after coordinated rollout completes.
+
+#### ordinary scaling
+
+A replica-only update continues through the existing scaling path without dependency or skew admission. When the desired count and template of a participating Role change together, target-version scale-up creation is admitted as rollout work because it can expose the new Role version to traffic. Scale-down remains an ordinary scaling action; once it changes `D_r`, subsequent coordination uses the new `T_r`, Ready progress, and reserved progress. If scale-down creates an observed skew greater than the configured limit, the coordinator does not undo the scale-down and admits no additional work for the leading Role until the other Roles catch up.
 
 #### recovery policy
 
@@ -449,7 +459,7 @@ type coordinatedRoleState struct {
 
 func selectCoordinatedRoleCandidates(
     states []coordinatedRoleState,
-    coordination *RoleRollingUpdateCoordination,
+    coordination *RoleCoordination,
 ) ([]roleToDelete, error)
 ```
 
@@ -457,8 +467,9 @@ Expected code touch points:
 
 - API types and generated clients/deepcopy/CRDs.
 - ModelServing webhook validation/defaulting.
+- `syncRoleReplicas` and `scaleUpRoles`: admit target-version creation when a replica increase and template change occur together.
 - `rolesToDeleteForRoleRollingUpdate`: build all Role candidates first instead of immediately concatenating independent selections.
-- `buildCoordinatedRoleState`: classify target Ready and in-flight replicas.
+- `buildCoordinatedRoleState`: classify target Ready and admitted in-flight replicas without reserving unadmitted scale-up slots.
 - `handleReadyPod`: enqueue on participating Role transition to Running.
 
 The existing `DeleteRole`, role recreation, ControllerRevision, Pod hash labels, and workqueue retry paths remain in use.
@@ -483,7 +494,7 @@ API documentation states that `A dependsOn B` makes B a startup prerequisite of 
 
 #### Feature interaction complexity
 
-The coordinator only filters candidates that already passed existing Role update rules. It does not own deletion, creation, readiness, or recovery.
+The coordinator only admits actions that already passed existing Role scaling or rolling-update rules. Existing paths continue to own creation, deletion, readiness, and recovery.
 
 ### Test Plan
 
@@ -496,6 +507,7 @@ The coordinator only filters candidates that already passed existing Role update
 - Per-Role partition denominator and different partitions across Roles.
 - Unchanged selected Roles and fully partitioned changed dependencies.
 - Per-Role integer limits for equal and unequal replica counts.
+- Ceiling conversion from percentage limits to integer replica counts, including small Roles whose floor would be zero.
 - Quantization of a small Role does not inflate other Roles' limits.
 - Ready-based startup dependency gating at equal and unequal replica counts.
 - Coordination preserves the existing behavior when `maxUnavailable` is omitted.
@@ -503,6 +515,9 @@ The coordinator only filters candidates that already passed existing Role update
 - Deterministic selection order and descending ordinal behavior.
 - Existing `maxUnavailable` always remains an upper bound.
 - Controller restart snapshot produces the same decision.
+- Replica-only scale-up bypasses coordination.
+- Concurrent template update and scale-up cannot create a target-version dependent before its dependency is Ready or exceed the Role's skew allowance.
+- Scale-down changes the denominator and subsequent decisions use the new desired count.
 
 #### Property and fuzz tests
 
@@ -523,6 +538,7 @@ For random DAGs, replica counts, partitions, Ready states, and local budgets:
 - rate-limited retries do not duplicate deletions.
 - controller restart during Deleting and Creating reconstructs reservations.
 - a second template update during rollout switches target hashes safely.
+- concurrent scale-up creation follows the same dependency and skew admission as delete-first replacement.
 
 #### End-to-end tests
 
@@ -531,15 +547,16 @@ For random DAGs, replica counts, partitions, Ready states, and local budgets:
 - Mixed partitions: A partially remains old while B/C complete.
 - One Role unschedulable: upstream stops and old capacity remains.
 - Explicit Role subset: selected Roles coordinate; unselected Role preserves legacy behavior.
+- Concurrent scale-up and template update: additional target-version replicas cannot bypass dependency or `maxSkew` admission.
 
 ### Rollout Plan
 
 1. Add the opt-in alpha API and webhook validation.
 2. Add per-ServingGroup state construction and pure candidate selection.
-3. Integrate candidate filtering into `RoleRollingUpdate` and enqueue intermediate participating RoleRunning transitions.
+3. Integrate rollout-start admission into concurrent target-version scale-up and `RoleRollingUpdate`, and enqueue intermediate participating RoleRunning transitions.
 4. Add unit, controller, and end-to-end coverage with injected readiness delays.
 
-When `coordination` is absent, the existing independent Role rolling update behavior remains unchanged.
+When `roleCoordination` is absent, the existing independent Role rolling update behavior remains unchanged.
 
 ### Alternatives
 
