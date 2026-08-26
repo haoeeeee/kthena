@@ -1,7 +1,7 @@
 ---
 title: Coordinated Proportional Role Rolling Update
 authors:
-- haoeeeee
+- "@haoeeeee"
 reviewers:
 - TBD
 approvers:
@@ -15,76 +15,106 @@ creation-date: 2026-08-17
 
 ### Summary
 
-Kthena supports `RoleRollingUpdate`, but the current controller calculates `partition` and `maxUnavailable` independently for every Role in every ServingGroup. If several cooperating Roles change in one ModelServing revision, a fast Role can advance much further than a slow Role. The controller also has no Role dependency graph, so an upstream Role may be replaced and become ready before the new revision of its downstream dependency is ready.
+Kthena supports `RoleRollingUpdate` for replacing changed Role replicas inside a ServingGroup. The existing controller calculates each Role's rolling candidates independently. For a ServingGroup whose Roles cooperate in one request path, independent replacement can create a large difference between their target-version capacities.
 
-This proposal adds optional, per-ServingGroup coordination to `RoleRollingUpdate`. Users select the participating Roles, define a maximum percentage-point skew between their normalized ready progress, and optionally define a dependency DAG. The controller continues to use each Role's existing `partition` and `maxUnavailable` as local safety limits, then applies a second, cross-Role filter before deleting or creating a rollout candidate.
+This proposal adds optional coordination to `RoleRollingUpdate`. Users configure:
 
-Dependencies are a startup gate, not a permanent progress order. For `A -> B -> C`, the internal B and C stages may prestart together while A remains on the old revision. A starts only after both B and C have target-revision `RoleRunning` capacity. After a Role has a target-revision Ready replica, `maxSkew` coordinates later progress without maintaining `progress_A <= progress_B <= progress_C`. Every reconcile derives progress and in-flight reservations from Role state, Pod labels, and readiness.
+- the Roles participating in one coordination domain;
+- `maxSkew`, which limits the percentage-point difference in normalized rollout progress;
+- a Role dependency DAG, which describes the version call topology.
 
-### Applicability Prerequisite
+For every reconcile, the controller builds one snapshot for all participating Roles in a ServingGroup, calculates a temporary `coordinationPartition` for each Role, and combines it with the Role's configured partition:
 
-This proposal applies only when the user explicitly selects:
+```text
+effectivePartition = max(userPartition, coordinationPartition)
+```
+
+The existing Role rolling-update path then uses `effectivePartition` and `maxUnavailable` to perform deletion and recreation.
+
+For a dependency chain `A -> B -> C`, A is the rollout root. B and C can prestart within the `maxSkew` limit. A starts after B and C have eligible target-version `RoleRunning` capacity. At rollout completion, an old A keeps at least one old B, and an old B keeps at least one old C.
+
+### Motivation
+
+Consider one ServingGroup with:
+
+```text
+A: 100 replicas
+B:  50 replicas
+C:  10 replicas
+
+A depends on B
+B depends on C
+```
+
+The target revision changes all three Roles. The application routes new-version requests through the new-version dependency chain.
+
+Independent Role rolling updates can produce two problems:
+
+1. A large Role can accumulate much more target-version Ready capacity than another Role, so the dependency chain has unbalanced processing capacity.
+2. A target-version upstream Role can become reachable before its target-version dependency has Ready capacity.
+
+The coordinated rollout maintains proportional target-version capacity and establishes the new dependency chain before exposing its root.
+
+#### Goals
+
+- Coordinate selected Roles independently inside each ServingGroup.
+- Express rollout progress as target-version `RoleRunning` replicas divided by update-eligible replicas.
+- Bound proportional progress with a percentage `maxSkew`.
+- Support different replica counts and user partitions across Roles.
+- Allow internal dependency Roles to prestart together.
+- Start each rollout root after its complete dependency closure has target-version Ready capacity.
+- Preserve the old-version dependency chain until old callers have exited.
+- Reuse the existing Role partition, `maxUnavailable`, deletion, recreation, and readiness mechanisms.
+- Reconstruct rollout decisions from Kubernetes resources after controller restart.
+- Report the current coordination blocker through ModelServing status.
+
+### Proposal
+
+#### Applicability
+
+Coordination is enabled under `RoleRollingUpdate`:
 
 ```yaml
 spec:
   rolloutStrategy:
     type: RoleRollingUpdate
+    roleCoordination:
+      maxSkew: 10%
 ```
 
-Users still submit the target A/B/C configuration through `ModelServing.spec.template.roles`, because Roles are embedded in the ServingGroup template. The configuration location does not determine the execution unit; `rolloutStrategy.type` does:
+Users continue to submit Role templates through `ModelServing.spec.template.roles`. With `RoleRollingUpdate`, the controller compares Role template hashes and replaces changed Role replicas inside each existing ServingGroup. Coordination is calculated separately for every ServingGroup.
 
-- With `RoleRollingUpdate`, the controller enters each ServingGroup, compares per-Role `RoleTemplateHash` values, and replaces only changed Role replicas. This proposal coordinates those Role-level candidates.
-- With `ServingGroupRollingUpdate`, or with the default strategy when `rolloutStrategy` is omitted, the controller deletes and recreates an outdated ServingGroup as a whole. It does not calculate independent A/B/C progress and this proposal does not apply.
+#### API Design
 
-Updating A, B, and C in one ModelServing update therefore gives the controller one shared target Spec; they become three coordinated rollout objects only under explicit `RoleRollingUpdate`. This proposal neither changes strategy selection nor converts a ServingGroup rollout into a Role rollout automatically.
+```go
+type RolloutStrategy struct {
+    Type RolloutStrategyType `json:"type"`
 
-### Motivation
+    RollingUpdateConfiguration *RollingUpdateConfiguration
+        `json:"rollingUpdateConfiguration,omitempty"`
 
-Consider one ServingGroup containing three Roles:
+    RoleCoordination *RoleCoordination
+        `json:"roleCoordination,omitempty"`
+}
 
-```text
-A depends on B
-B depends on C
+type RoleCoordination struct {
+    // Empty selects every Role in spec.template.roles.
+    Roles []string `json:"roles,omitempty"`
+
+    // Maximum percentage-point difference in normalized rollout progress.
+    MaxSkew *intstr.IntOrString `json:"maxSkew"`
+
+    // Version call topology used for root startup and old-chain retention.
+    Dependencies []RoleRolloutDependency `json:"dependencies,omitempty"`
+}
+
+type RoleRolloutDependency struct {
+    Role      string   `json:"role"`
+    DependsOn []string `json:"dependsOn"`
+}
 ```
 
-The application guarantees version-aware routing: new A calls new B, and new B calls new C. That guarantee alone does not make an uncoordinated rollout safe. In the first reconcile, the current Role rolling update can independently select one replica from A, B, and C. If new A and B become Ready before new C, traffic can reach new A and then fail because the required new C endpoint is not Ready.
-
-Updating only C until completion is also undesirable. New C receives no new-version traffic before B advances, and a large excess of new C replicas may be idle. The required behavior is:
-
-1. keep normalized new-version Ready progress approximately proportional across selected Roles;
-2. keep an upstream entry Role on the old revision until its dependency closure has target-revision Ready capacity;
-3. retain existing per-Role availability and partition semantics;
-4. allow slow or failed dependencies to stop upstream progress safely.
-
-The current implementation cannot provide these properties because `rolesToDeleteForRoleRollingUpdate` loops over Role specs and calculates each Role's `maxScaleDown` independently. `RoleRunning` is already a useful readiness signal: a Role replica becomes Running only after its entry Pod and all worker Pods are Running and Ready. This proposal builds coordination on that existing signal instead of introducing a separate readiness definition.
-
-#### Goals
-
-- Coordinate Role rolling updates independently inside each ServingGroup.
-- Define progress as the percentage of update-eligible Role replicas that are both on the target Role template hash and `RoleRunning`.
-- Limit the progress difference among selected active Roles with a user-supplied percentage such as `10%`.
-- Allow users to define an acyclic Role dependency graph for rollout ordering.
-- Keep an upstream entry Role from starting until every Role in its dependency closure has at least one target-version `RoleRunning` replica, while allowing internal dependency stages to prestart together.
-- Preserve each Role's current `maxUnavailable` and `partition` behavior.
-- Reserve in-flight work so asynchronous deletion, creation, scheduling, and readiness cannot oversubscribe the skew budget.
-- Remain compatible with the current informer, workqueue, and repeated-reconcile architecture.
-- Reconstruct coordination state from current objects after controller restarts.
-- Define validation, failure behavior, and a complete test plan.
-
-#### Non-Goals
-
-- Implement business request routing or verify that new A actually calls only new B.
-- Change initial ModelServing creation ordering. Dependencies in this proposal apply only to coordinated Role rolling updates.
-- Coordinate rollout progress across different ServingGroups. Each ServingGroup has an independent coordinator.
-- Replace the existing Role `maxUnavailable` or `partition` fields.
-- Coordinate replica-only scaling, failure recovery, or Role addition/removal as proportional rolling-update work. When a replica increase and a Role template change are submitted together, creating target-version replicas is part of the rollout and is therefore coordinated.
-- Automatically roll back a revision when rollout progress stalls.
-- Turn Pod readiness on or off, mutate readiness gates, or change Service endpoint selection.
-- Guarantee runtime dependency health after an upstream replica has already completed rollout. Ordinary recovery policy handles later failures.
-
-### Proposal
-
-Coordination is opt-in and only valid with `rolloutStrategy.type: RoleRollingUpdate`.
+Example:
 
 ```yaml
 apiVersion: workload.serving.volcano.sh/v1alpha1
@@ -95,14 +125,8 @@ spec:
   rolloutStrategy:
     type: RoleRollingUpdate
     roleCoordination:
-      # Optional. Omission selects all Roles in spec.template.roles.
       roles: [a, b, c]
-
-      # Percentage points of normalized rollout progress. Percent only.
       maxSkew: 10%
-
-      # Rollout-only startup dependency graph. "a dependsOn b" means b
-      # must have one target-revision RoleRunning replica before a starts.
       dependencies:
       - role: a
         dependsOn: [b]
@@ -112,177 +136,134 @@ spec:
   template:
     roles:
     - name: a
-      replicas: 4
+      replicas: 100
       maxUnavailable: 1
       partition: 0
-      # templates omitted
     - name: b
-      replicas: 4
+      replicas: 50
       maxUnavailable: 1
       partition: 0
     - name: c
-      replicas: 4
+      replicas: 10
       maxUnavailable: 1
       partition: 0
 ```
 
-The `roles` list scopes one coordination domain:
+The `roles` list defines one coordination domain:
 
-- omitted or empty: all Roles in `spec.template.roles`;
-- specified: exactly those Roles participate in progress skew and dependency ordering;
-- an unchanged selected Role is treated as complete for the current revision and does not block changed Roles;
-- a non-selected Role retains the existing independent Role rollout behavior;
-- a dependency endpoint must be in the selected set.
+- an empty list selects all Roles in `spec.template.roles`;
+- a non-empty list selects the named Roles;
+- selected Roles share one `maxSkew` calculation;
+- each selected Role keeps its own `partition` and `maxUnavailable`.
 
-#### User Stories
+The webhook validates:
 
-##### Proportional PD rollout
+- `roleCoordination` is used with `RoleRollingUpdate`;
+- `maxSkew` is a percentage in the range `(0%, 100%]`;
+- at least two Roles participate;
+- all Role names exist;
+- Role names and dependency edges are unique;
+- dependency endpoints belong to the selected Role set;
+- the dependency graph contains no self-edge or cycle.
 
-A ServingGroup has 10 prefill and 20 decode Role replicas. Both templates change. With `maxSkew: 10%`, the controller prevents one Role from accumulating substantially more target-hash Ready capacity than the other while both still have rollout work.
+### Design Details
 
-##### Dependency-safe three-stage rollout
+#### Overall Flow
 
-A, B, and C each have four replicas, `maxUnavailable: 1`, `maxSkew: 10%`, and dependencies A -> B -> C. Each Role's first integer step is 25%. Startup proceeds as follows:
+For each non-deleting ServingGroup, one reconcile performs the following work:
 
-```text
-B and C each start one replacement; A remains old
-    -> B and C reach target hash and RoleRunning
-    -> A starts one replacement
-```
+1. Resolve the participating Roles and their target Role template hashes.
+2. Resolve each Role's `userPartition` and rollout ordinal range.
+3. Classify current Role replicas as target Ready, target in-flight, or old.
+4. Calculate normalized Ready progress and the `maxSkew` allowance.
+5. Apply rollout-root startup and old-version dependency constraints.
+6. Calculate `coordinationPartition` and `effectivePartition` for every participating Role.
+7. Pass the allowed ordinal range to the existing Role rolling-update logic.
+8. Apply the existing per-Role `maxUnavailable` budget.
+9. Delete admitted old Role replicas and recreate their target-version replacements through the existing paths.
+10. Reconcile again when deletion, creation, or readiness changes the observed state.
 
-After these first Ready replicas exist, all three Roles are unlocked. Later selection is based on `maxSkew` and deterministic candidate ordering; it does not have to repeat C/B/A order. New A cannot start before compatible new B and C capacity exists.
+Each reconcile uses the complete cross-Role snapshot before admitting new rollout work.
 
-##### Different Role replica counts
+#### Per-Role State
 
-A has 2 replicas, B has 4, and C has 10. With `maxSkew: 10%` and a zero Ready baseline, their per-Role integer start limits are `ceil(0.1*2)=1`, `ceil(0.1*4)=1`, and `ceil(0.1*10)=1`. A's first replica is an unavoidable local 50% step, but that does not inflate B or C to a global 50% bound.
-
-##### Different partitions
-
-A has four replicas with `partition: 2`; B and C have four replicas with no partition. A's rollout target contains only A-2 and A-3. Its denominator is therefore two, not four. Once those two replicas are updated and Ready, A's coordinated progress is 100%, while A-0 and A-1 intentionally remain old. B and C may still reach 100% of their own four-replica targets; A's partition does not implicitly partition B or C.
-
-##### Concurrent scale-up and template update
-
-If only a Role's replica count changes, the existing scaling path continues to handle that change without proportional coordination. If a participating Role's replica count and template change in the same update, however, every additional target-version replica introduces new-version capacity and is a rollout start. Its creation is admitted by the same dependency and `maxSkew` checks as a delete-first replacement. This prevents an upstream scale-up from creating target-version A replicas before compatible target-version B and C capacity is Ready.
-
-Scale-down retains the existing behavior. After the desired count changes, the coordinator recalculates the denominator and observed progress from the new desired count and gates subsequent rollout starts. It does not undo or delay a user-requested scale-down.
-
-### API Design
-
-```go
-type RolloutStrategy struct {
-    Type RolloutStrategyType `json:"type"`
-
-    // Used only by ServingGroupRollingUpdate.
-    RollingUpdateConfiguration *RollingUpdateConfiguration `json:"rollingUpdateConfiguration,omitempty"`
-
-    // Used only by RoleRollingUpdate.
-    RoleCoordination *RoleCoordination `json:"roleCoordination,omitempty"`
-}
-
-type RoleCoordination struct {
-    // Empty means all Roles.
-    Roles []string `json:"roles,omitempty"`
-
-    // Required. Percentage strings only, for example "10%".
-    MaxSkew *intstr.IntOrString `json:"maxSkew"`
-
-    Dependencies []RoleRolloutDependency `json:"dependencies,omitempty"`
-}
-
-type RoleRolloutDependency struct {
-    Role      string   `json:"role"`
-    DependsOn []string `json:"dependsOn"`
-}
-
-```
-
-Dependency ordering has one fixed meaning: an upstream entry Role waits for target-revision `RoleRunning` capacity across its dependency closure. Internal stages may prestart together while all of their upstream dependents remain unstarted. Once a Role has a target-revision Ready replica, dependency edges do not impose a continuing progress order. The API intentionally does not expose a scheduled-only readiness mode.
-
-#### Validation and defaulting
-
-The webhook must enforce:
-
-- When `roleCoordination` is present, `rolloutStrategy.type` must explicitly equal `RoleRollingUpdate`; the default `ServingGroupRollingUpdate` selected when the strategy is omitted is not valid.
-- `roleCoordination.maxSkew` is required and must be a percentage string in `(0%, 100%]`; integer values are rejected.
-- Role names in `roles`, `role`, and `dependsOn` exist in `spec.template.roles`.
-- Names are unique; self-dependencies and duplicate dependency edges are rejected.
-- The dependency graph is acyclic.
-- Every dependency endpoint belongs to the effective selected Role set.
-- At least two Roles are selected; a single Role provides no coordination benefit.
-- Existing Role-level `partition` and `maxUnavailable` syntax validation remains unchanged.
-
-Coordination does not introduce a `maxUnavailable` default. If it is omitted, the existing Role rolling logic supplies all outdated replicas as local candidates, and the coordinator may still reduce that set through skew and dependency constraints. Operators should configure `maxUnavailable` when they require an explicit per-Role availability bound.
-
-### Progress Model
-
-All calculations are performed independently for each ServingGroup and target ModelServing revision.
-
-For participating Role `r`:
+For a participating Role `r`:
 
 ```text
 D_r = desired Role replica count
-P_r = resolved partition count
-T_r = max(D_r - P_r, 0)              update-eligible target replicas
-R_r = eligible replicas with target RoleTemplateHash and RoleRunning
-I_r = eligible rollout work already reserved but not Ready
+P_r = resolved user partition
+T_r = max(D_r - P_r, 0)
 
-readyProgress_r    = R_r / T_r
-reservedProgress_r = min(R_r + I_r, T_r) / T_r
+R_r = target-hash replicas in RoleRunning
+I_r = admitted target-version work that is not RoleRunning
+O_r = old-hash replicas that still exist
 ```
+
+The rollout ordinal range is:
+
+```text
+[P_r, D_r)
+```
+
+Only replicas in this range contribute to `T_r`, `R_r`, `I_r`, and target-version dependency Ready capacity.
+
+Replicas below `P_r` remain protected by the user partition. Replicas at or above `D_r` belong to ordinary scale-down. Old-hash replicas that still exist contribute to `O_r` while they can remain part of the old-version request path.
 
 `I_r` includes:
 
-- Role replicas in `RoleDeleting` because of this rollout;
-- target-hash Role replicas that are not `RoleRunning`;
-- stable replacement slots missing between an admitted delete-first action and successful recreation.
+- an old Role replica whose rollout deletion is in progress;
+- a target-hash Role replica that has not reached `RoleRunning`;
+- a missing replacement ordinal between deletion completion and target-version recreation.
 
-An ordinal that is absent only because the desired replica count increased is not reserved before its target-version creation is admitted. After admission, the created target-hash replica is observable and consumes `I_r` until it becomes `RoleRunning`.
+The in-flight count reserves already admitted work across asynchronous deletion, creation, scheduling, and readiness.
 
-Counting in-flight work is essential. If the controller selected A, B, and C using only Ready progress, A and B could become Ready faster than C and exceed a decision made when all progress values were zero. Reservation prevents repeated reconciles from admitting more work than the coordination budget already committed.
+#### Rollout Progress
 
-Only ordinals greater than or equal to the resolved Role partition contribute to `T_r`, `R_r`, or `I_r`. Protected replicas remain available but are outside the rollout target.
-
-If a selected Role's template did not change, it is excluded from the active skew minimum, while its current target-hash Ready replicas may still satisfy a dependency. If `T_r` is zero for a changed dependency Role, it cannot provide target-revision Ready capacity and its dependents remain blocked.
-
-#### Percentage semantics
-
-`maxSkew: 10%` means a target difference of ten percentage points before conversion to integer replica limits:
+The coordinator calculates two normalized values:
 
 ```text
-progress_r <= minimum Ready progress + 0.10
+readyProgress_r =
+    R_r / T_r
+
+startedProgress_r =
+    min(R_r + I_r, T_r) / T_r
 ```
 
-It does not mean:
+Ready progress supplies the common baseline. Started progress consumes the allowance already granted to a Role.
 
-- ten replica instances;
-- ten percent of the larger Role's raw replica count;
-- a relative error such as `progress_a / progress_b`.
+A selected Role participates in the active baseline while its template changed and its update-eligible rollout still has work in progress. Completed and unchanged Roles leave the active minimum. Their eligible target-version Ready replicas can still satisfy a rollout-root dependency.
 
-The only permitted overshoot is the local integer quantization described below. The implementation should use integer cross-multiplication or fixed-point basis points rather than floating-point comparison.
+#### maxSkew
 
-#### Per-Role integer limits
-
-A Role with `T_r` eligible replicas advances in increments of `1/T_r`. The controller must not increase one global effective skew to the coarsest Role's step, because that would grant unrelated large Roles extra work.
-
-For every reconcile, define:
+`maxSkew` is expressed as percentage points of normalized progress. For each reconcile:
 
 ```text
-readyBaseline = min(readyProgress_r) across active participating Roles
-ratioLimit    = min(1, readyBaseline + configuredSkew)
-allowedStarted_r = min(T_r, ceil(ratioLimit * T_r))
+readyBaseline =
+    minimum readyProgress across active participating Roles
+
+ratioLimit =
+    min(1, readyBaseline + maxSkew)
+
+allowedStarted_r =
+    min(T_r, ceil(ratioLimit * T_r))
 ```
 
-Ready progress itself is not rounded: the controller compares `R_r / T_r` as an exact ratio using integer cross-multiplication. Rounding is applied only when the ratio limit is converted to an integer number of started replicas, and that conversion uses `ceil`. Rounding down could produce zero at startup for a small Role; for example, `floor(10% * 4) = 0` would prevent a four-replica Role from ever starting. The ceiling permits one replica for that Role without increasing any other Role's limit.
+The per-Role ceiling converts the percentage allowance to a replica count. Each Role keeps its own integer step.
 
-A candidate for Role `r` is skew-eligible only when:
+With A=100, B=50, C=10, and `maxSkew: 10%`:
 
-```text
-R_r + I_r + 1 <= allowedStarted_r
-```
+| State | Ready progress A/B/C | Allowed started total A/B/C |
+| --- | --- | --- |
+| Initial | 0% / 0% / 0% | 10 / 5 / 1 |
+| B=5 and C=1 Ready | 0% / 10% / 10% | 10 / 5 / 1 |
+| A=10 Ready | 10% / 10% / 10% | 20 / 10 / 2 |
+| A=20, B=10, C=2 Ready | 20% / 20% / 20% | 30 / 15 / 3 |
 
-For A/B/C with 8, 4, and 10 eligible replicas, a `10%` limit at a zero Ready baseline permits 1, 1, and 1 started replica respectively: 12.5%, 25%, and 10%. B's unavoidable 25% integer step does not raise A or C to a 25% global limit. Implementations use integer cross-multiplication rather than floating point.
+The table shows the percentage relationship across unequal replica counts. The startup dependency rule blocks A in the first row, so initial target-version work is admitted only for B and C. Each Role's §maxUnavailable§ can further reduce the number acted on in one reconcile.
 
-### Dependency Semantics
+The implementation compares ratios with integer cross-multiplication and converts the configured percentage to fixed-point integer units.
+
+#### Dependency Graph
 
 An edge:
 
@@ -291,294 +272,382 @@ An edge:
   dependsOn: [b]
 ```
 
-means that B is a rollout prerequisite of A.
+describes a version call from A to B.
 
-Before A's first replacement is admitted, every dependency B must have at least one eligible target-revision `RoleRunning` replica. A dependency that is merely created or scheduled does not unlock A.
+The graph provides two coordination rules:
 
-After A is unlocked, the edge no longer compares A and B progress. A may advance ahead of B when A's own candidate remains inside the shared `maxSkew` limit. No ordinal pairing such as A-3 to B-3 is required.
+1. rollout-root startup;
+2. old-version dependency retention.
 
-The dependency gate is checked when rollout work is admitted, before deleting the old upstream Role replica. It does not change Kubernetes Pod readiness. Consequently, the required downstream new-version capacity already exists before the upstream replacement can be created and become reachable.
+##### Rollout roots
 
-Among currently eligible candidates, the Role with the lowest started progress is preferred, followed by Role order in the ModelServing spec and descending Role ordinal. Dependency order affects eligibility only while a Role is locked; it does not remain a priority after startup unlock.
+A rollout root is a selected Role whose name does not appear in another selected Role's `dependsOn` list.
 
-### Reconcile Algorithm
-
-The existing `syncModelServing` order remains conceptually unchanged:
-
-```text
-sync ServingGroup count
-sync Role count and missing Pods
-manage rolling update
-sync Services
-update status
-```
-
-Coordination changes Role rollout admission in two places: target-version creation during a concurrent scale-up in `syncRoleReplicas`, and delete-first replacement selection in `manageRollingUpdate`.
-
-#### Phase 1: build a snapshot
-
-For each non-deleting ServingGroup:
-
-1. Resolve selected Roles and determine which Role templates changed in the current revision.
-2. Calculate the target Role template hash for every Role.
-3. Resolve per-Role partition and eligible ordinals.
-4. Classify eligible replicas as old Ready, old unavailable, deleting, target Creating, or target Running.
-5. Calculate `T`, `R`, `I`, Ready progress, started progress, the shared Ready baseline, and each Role's `allowedStarted` integer limit.
-6. Generate target-version scale-up candidates and local outdated candidates using the existing scaling and `maxUnavailable` rules.
-
-Replica-only scaling remains owned by the existing `syncRoleReplicas` path and is not coordinated. When a replica increase and template change occur together, missing ordinals that would be created with the target Role hash are rollout-start candidates and must be admitted before creation. Target-version replicas created by an admitted scale-up contribute to `R` when `RoleRunning` and to `I` otherwise. Missing replacement slots created by an admitted delete-first update remain reserved as in-flight work; unadmitted scale-up slots do not.
-
-#### Phase 2: filter and select candidates
-
-The coordinator repeatedly evaluates rollout-start candidates using a simulated reservation snapshot. A candidate may create an additional target-version replica during concurrent scale-up or delete an outdated replica for delete-first replacement:
+For:
 
 ```text
-selected = []
-
-while candidates remain:
-    eligible = candidates that satisfy all of:
-      1. the existing local scaling or rolling-update rule allows the action
-      2. Role partition allows the ordinal
-      3. Role maxUnavailable/local budget allows a delete-first candidate
-      4. projected R + I does not exceed this Role's allowedStarted limit
-      5. dependency Ready gate is satisfied
-
-    if eligible is empty:
-        break
-
-    choose the candidate with:
-      1. lowest projected/reserved Role progress
-      2. Role order in spec
-      3. highest replica ordinal
-
-    append candidate to the corresponding create or delete selection
-    increment the simulated in-flight reservation for its Role
+A -> B -> C
 ```
 
-The simulated increment prevents one reconcile from selecting an unlimited number of replicas before informer events report `RoleDeleting`.
+A is the rollout root. Its transitive dependency closure is `{B, C}`. B and C are internal Roles.
 
-After selection, the existing `scaleUpRoles` path creates admitted target-version scale-up replicas, while the existing `DeleteRole` path performs admitted delete-first replacements. Deletion-completion events remove the logical Role from the datastore and enqueue the ModelServing. The next reconcile recreates the missing Role with the target hash. A target-hash non-Running Role consumes both the local `maxUnavailable` budget, where applicable, and the cross-Role reservation until it becomes `RoleRunning`.
+Before the first target-version A replacement is admitted, B and C must each have at least one target-hash `RoleRunning` replica inside their own `[P, D)` range. B and C can prestart together under `maxSkew`.
 
-#### Phase 3: event-driven continuation
-
-The Pod handler already changes a Role to `RoleRunning` only after its entry Pod and all worker Pods are Running and Ready. The current `syncModelServing` function itself has no whole-ServingGroup Ready gate: whenever a ModelServing is enqueued, it runs the normal reconcile. The subtle issue is the current Ready-event path. `handleReadyPod` updates an individual Role to `RoleRunning`, but that path normally calls `enqueueModelServing` only after `checkServingGroupReady` reports that the whole ServingGroup is Ready. Delete completion, spec changes, retries, or other events may still enqueue earlier, so this is not a hard semantic barrier; it is a missing immediate enqueue for an intermediate Role Ready transition.
-
-Coordinated rollout therefore additionally enqueues the ModelServing whenever a participating Role replica transitions to `RoleRunning`, while retaining the existing ServingGroup status update. This lets the first Ready dependency unlock its dependent and lets later Ready progress release new skew capacity promptly.
-
-The controller still does not wait inside reconcile:
+For a graph containing only:
 
 ```text
-reconcile -> select/delete -> return
-Pod/Service delete events -> enqueue
-reconcile -> recreate -> return
-Pod Ready events -> RoleRunning -> enqueue
-reconcile -> select the next allowed work
+B -> C
 ```
 
-After restart, Pod revision/hash labels, Role status reconstruction, desired counts, and missing slots reproduce the same constraints.
+B is the rollout root and waits for target-version C Ready capacity.
 
-### Interaction with Existing Features
+The first-start state is reconstructed from `R_r + I_r`. A root with `R_r + I_r = 0` applies the startup check. Once target-version work for that root has started, subsequent progress is coordinated by `maxSkew`.
 
-#### maxUnavailable
+##### Old-version dependency retention
 
-`maxUnavailable` remains a local availability constraint for one Role. Coordination is an additional global filter:
+Every direct edge also protects the old-version request path.
+
+For `A -> B -> C`:
+
+- while an old A replica exists, B retains at least one old replica;
+- while an old B replica exists, C retains at least one old replica.
+
+With zero user partitions, the old-version completion order is:
 
 ```text
-final candidates = local maxUnavailable candidates
-                 intersect partition-eligible candidates
-                 intersect skew-allowed candidates
-                 intersect dependency-allowed candidates
+A completes
+    -> B can remove its final old replica
+        -> C can remove its final old replica
 ```
 
-Coordination may reduce the number selected by the existing logic but never increases it.
+The retention rule uses observed old replicas. A terminating old replica contributes to `O_r` until its Pods have disappeared.
 
-#### partition
+If a Role's `userPartition` already preserves one or more old replicas, that boundary satisfies the retention requirement. A partition-protected old caller also keeps its direct old dependency for the same lifetime.
 
-Partition is resolved separately for every Role and affects only that Role's denominator. A partition on A never stops B or C from completing their own rollout. Protected old replicas remain old after coordinated rollout completes.
+#### Effective Partition
 
-#### ordinary scaling
+The coordinator maintains three partition values:
 
-A replica-only update continues through the existing scaling path without dependency or skew admission. When the desired count and template of a participating Role change together, target-version scale-up creation is admitted as rollout work because it can expose the new Role version to traffic. Scale-down remains an ordinary scaling action; once it changes `D_r`, subsequent coordination uses the new `T_r`, Ready progress, and reserved progress. If scale-down creates an observed skew greater than the configured limit, the coordinator does not undo the scale-down and admits no additional work for the leading Role until the other Roles catch up.
+- `userPartition`: the Role partition supplied by the user;
+- `coordinationPartition`: the temporary boundary calculated for the current snapshot;
+- `effectivePartition`: the boundary passed to the Role rolling-update executor.
 
-#### recovery policy
+The initial coordination boundary comes from `maxSkew`:
 
-Intentional deletion continues to be identified by `RoleDeleting`, so it must not be treated as a failure-recovery event. A later failure after rollout admission follows the configured RecoveryPolicy. The coordinator does not retract already Ready upstream replicas.
+```text
+coordinationPartition_r =
+    D_r - allowedStarted_r
+```
 
-#### new template changes during rollout
+The dependency rules then adjust the same boundary:
 
-The latest ModelServing spec remains authoritative. A new target hash starts a new reconciliation target. Previously created replicas that no longer match become outdated again.
+```text
+if r is a rollout root,
+   R_r + I_r = 0,
+   and a Role in r's dependency closure has R = 0:
+    coordinationPartition_r = D_r
 
-### Failure and Blocking Behavior
+if D_r > 0 and a direct dependent d has O_d > 0:
+    coordinationPartition_r =
+        max(coordinationPartition_r, 1)
+```
 
-#### Slow or failed dependency
+The final boundary is:
 
-If new C remains Creating:
+```text
+effectivePartition_r =
+    max(userPartition_r, coordinationPartition_r)
+```
 
-- C consumes its local and reserved budget;
-- B may consume its initial skew budget while all upstream Roles remain unstarted;
-- A cannot start until both B and C have target-revision `RoleRunning` replicas;
-- B and C cannot consume more than their per-Role integer limits derived from `maxSkew`;
-- old A replicas remain serving.
+The existing rolling-update path selects outdated Role replicas in:
 
-The rollout is intentionally stalled rather than exposing an incompatible upstream chain.
+```text
+[effectivePartition_r, D_r)
+```
 
-#### Unschedulable replicas
+and applies the Role's `maxUnavailable` budget to that range. Existing descending ordinal ordering remains in use.
 
-Unschedulable target replicas remain in-flight and do not release budget. Existing Kubernetes Pod events explain scheduling failure, and the rollout remains waiting for Role readiness.
+The rollout denominator continues to use:
 
-#### Dependency cycle or missing Role
+```text
+T_r = D_r - userPartition_r
+```
 
-These are admission errors and never reach the controller.
+This keeps normalized progress stable while `coordinationPartition` changes between reconciles.
 
-#### No eligible dependency replica
+#### Example: A, B, and C
 
-If a changed dependency is fully protected by partition, it cannot provide target-revision Ready capacity and dependent rollout remains blocked. The controller does not bypass the dependency.
+Assume each Role has ten replicas, `maxUnavailable: 1`, `partition: 0`, and `maxSkew: 10%`.
 
-#### Inconsistent or legacy hash data
+Startup:
 
-The existing ControllerRevision fallback is used to infer missing Role template hashes. If a hash cannot be resolved, the controller conservatively does not count the replica as target Ready and logs the unresolved comparison.
+| Role | maxSkew boundary | Dependency adjustment | effectivePartition |
+| --- | ---: | ---: | ---: |
+| A | 9 | A is a blocked root: 10 | 10 |
+| B | 9 | old A retention: at least 1 | 9 |
+| C | 9 | old B retention: at least 1 | 9 |
+
+B and C each replace one replica. When both replacements become `RoleRunning`, A's startup adjustment is released and A can replace one replica.
+
+Middle:
+
+- the Ready baseline advances as target replicas become `RoleRunning`;
+- `allowedStarted` grows independently for A, B, and C from the same percentage limit;
+- dependency edges impose no continuous A/B/C progress ordering.
+
+Completion:
+
+```text
+effective partitions near the tail
+
+A = 0
+B = 1
+C = 1
+
+old A disappears  -> B may use 0
+old B disappears  -> C may use 0
+```
+
+#### Interaction with Existing Role Rolling Update
+
+The current `rolesToDeleteForRoleRollingUpdate` path calculates outdated replicas and each Role's local `maxUnavailable` allowance. Coordination adds one cross-Role calculation before the final delete list is returned:
+
+```text
+current Role objects
+    -> build all participating Role states
+    -> calculate coordinationPartition
+    -> calculate effectivePartition
+    -> filter outdated ordinals to [effectivePartition, D)
+    -> apply existing maxUnavailable
+    -> DeleteRole
+    -> existing scaleUpRoles recreates the target replica
+```
+
+Replica-only scaling continues through the existing scaling logic.
+
+When a replica increase and template change are submitted together, creation of additional target-version ordinals is admitted through the same `effectivePartition`. A rollout-root scale-up therefore waits for its dependency closure, and every participating Role consumes its `maxSkew` allowance.
+
+Scale-down continues through the existing scaling logic. The new desired count immediately defines `D_r`, so scale-down excess at or above `D_r` leaves progress and dependency Ready calculations.
+
+`maxUnavailable` remains a per-Role availability budget. The coordinator determines the rollout range, and `maxUnavailable` determines how many replicas inside that range can be deleted.
+
+#### Reconcile Continuation
+
+The controller completes one bounded amount of work and returns from reconcile. Later resource state changes enqueue the ModelServing again.
+
+A participating Role replica becomes `RoleRunning` after its entry Pod and all worker Pods are Running and Ready. That transition enqueues the ModelServing so the next reconcile can:
+
+- unlock a rollout root;
+- advance the Ready baseline;
+- admit the next proportional work;
+- release an old-version retention boundary.
+
+#### Controller Restart
+
+The controller rebuilds coordination state from:
+
+- the current ModelServing spec;
+- current and target ControllerRevisions;
+- Role and Pod revision/hash labels;
+- Pod Ready conditions;
+- Pod deletion timestamps;
+- current and missing Role ordinals.
+
+The startup path lists existing Pods, rebuilds the datastore, and enqueues existing ModelServings. The first reconcile recalculates `coordinationPartition` and `effectivePartition`.
+
+Restart-state classification:
+
+| Observed state | Reconstructed state |
+| --- | --- |
+| target-hash Role is `RoleRunning` | Ready progress |
+| target-hash Role exists and is not `RoleRunning` | in-flight work |
+| old-hash Pods are terminating | in-flight replacement and old-version presence |
+| an ordinal in current `[P, D)` is missing after delete-first admission | in-flight replacement awaiting recreation |
+| a missing ordinal belongs to a requested scale-up | scale-up work awaiting admission |
+| an ordinal is at or above current `D` | scale-down excess |
+
+Terminating old Pods are read from the Pod informer cache so old-version dependency retention survives datastore reconstruction.
 
 ### Status and Observability
 
-This change does not add a new public status or metric API. Operators can inspect existing Pod Ready conditions, Role template-hash labels, Role lifecycle events, and controller logs. `status.updatedReplicas` remains ServingGroup-level and is not Role rollout progress.
+The proposal adds a ModelServing condition through the existing `status.conditions` field:
 
-### Controller Integration
+```go
+const ModelServingCoordinatedRoleRolloutBlocked ModelServingConditionType =
+    "CoordinatedRoleRolloutBlocked"
+```
 
-The implementation introduces a compact per-Role snapshot and a pure selection function so algorithm tests do not require Kubernetes clients:
+The condition is `True` when a participating Role still has rollout work and is waiting on a coordination constraint or admitted target-version readiness.
+
+Supported reasons:
+
+- `DependencyNotReady`;
+- `MaxSkewLimitReached`;
+- `OldVersionDependencyPresent`;
+- `TargetReplicaNotReady`.
+
+Example:
+
+```yaml
+status:
+  conditions:
+  - type: CoordinatedRoleRolloutBlocked
+    status: "True"
+    reason: DependencyNotReady
+    message: "ServingGroup example-0: root role a is waiting for target-version RoleRunning capacity from roles b and c"
+    observedGeneration: 12
+```
+
+Current blockers are ordered by ServingGroup ordinal, Role declaration order, and fixed reason priority. The first blocker supplies the condition reason, and the message summarizes the affected Roles.
+
+The controller sets the condition to `False` with `ProgressAvailable` or `RolloutComplete` when the corresponding state is observed. Kubernetes Events record blocker changes and rollout resumption.
+
+### Failure and Blocking Behavior
+
+#### Slow or failed target replica
+
+A target replica in Creating, pending scheduling, or waiting for Pod Ready remains in `I_r`. Its reserved allowance stays occupied. The blocker condition reports `TargetReplicaNotReady`.
+
+#### Dependency readiness
+
+A rollout root remains at `coordinationPartition = D` while a Role in its dependency closure has no eligible target-version `RoleRunning` replica. The blocker condition reports `DependencyNotReady` and identifies the dependency Roles.
+
+#### maxSkew limit
+
+A Role whose `R_r + I_r` reaches `allowedStarted_r` waits for the shared Ready baseline to advance. The blocker condition reports `MaxSkewLimitReached`.
+
+#### Old-version retention
+
+A dependency at its final old replica keeps an effective partition of at least one while an old direct caller exists. The blocker condition reports `OldVersionDependencyPresent`.
+
+#### Partition-limited dependency
+
+A dependency with no eligible target-version ordinal remains unable to satisfy a rollout-root Ready requirement. Its user partition remains authoritative and the root remains blocked.
+
+#### Single-replica dependency
+
+With delete-first replacement, a one-replica dependency can require the same replica for the old chain and for creation of new-version capacity. The rollout remains blocked at that boundary and reports the current dependency reason.
+
+### Implementation
+
+The implementation adds a per-ServingGroup coordinator with a pure calculation interface:
 
 ```go
 type coordinatedRoleState struct {
-    roleName  string
-    specIndex int
-    target    int
-    ready     int
-    inFlight int
-    active    bool
-    candidates []roleToDelete
+    roleName string
+
+    desired       int
+    userPartition int
+    target        int
+    ready         int
+    inFlight      int
+    oldReplicas   int
+    active        bool
 }
 
-func selectCoordinatedRoleCandidates(
+type coordinatedRoleDecision struct {
+    effectivePartitions map[string]int
+    blockers             []coordinatedRoleBlocker
+}
+
+func coordinatedRolePartitions(
     states []coordinatedRoleState,
     coordination *RoleCoordination,
-) ([]roleToDelete, error)
+) (coordinatedRoleDecision, error)
 ```
 
-Expected code touch points:
+Main code changes:
 
-- API types and generated clients/deepcopy/CRDs.
-- ModelServing webhook validation/defaulting.
-- `syncRoleReplicas` and `scaleUpRoles`: admit target-version creation when a replica increase and template change occur together.
-- `rolesToDeleteForRoleRollingUpdate`: build all Role candidates first instead of immediately concatenating independent selections.
-- `buildCoordinatedRoleState`: classify target Ready and admitted in-flight replicas without reserving unadmitted scale-up slots.
-- `handleReadyPod`: enqueue on participating Role transition to Running.
+- API types, generated clients, deepcopy code, and CRDs for `roleCoordination`;
+- webhook validation for Role selection, `maxSkew`, and dependency DAGs;
+- Role-state construction from datastore Roles, Pods, hashes, readiness, and ordinals;
+- `rolesToDeleteForRoleRollingUpdate` integration for `effectivePartition`;
+- `scaleUpRoles` integration for concurrent template update and scale-up;
+- immediate ModelServing enqueue on participating Role `RoleRunning` transitions;
+- ModelServing condition and Event updates for coordination blockers.
 
-The existing `DeleteRole`, role recreation, ControllerRevision, Pod hash labels, and workqueue retry paths remain in use.
+Existing `DeleteRole`, `CreatePodsByRole`, ControllerRevision, Role template hash, and per-Role `maxUnavailable` execution remain the rollout mechanisms.
 
 ### Risks and Mitigations
 
-#### Rollout throughput reduction
+#### Integer progress granularity
 
-Ready-based startup gating delays an upstream entry Role until its dependency closure is Ready and can be slower than independent rollout. Internal dependency stages may prestart together. After all Roles are unlocked, `maxSkew` and each Role's `maxUnavailable` determine throughput.
+Small Roles have coarse progress steps. Per-Role ceiling conversion permits one local step while retaining the configured percentage baseline for every other Role.
 
-#### Deadlock from discrete replica counts
+#### Repeated reconciliation
 
-Strict percentage inequalities can be impossible for small Roles. Per-Role ceiling conversion provides one-replica liveness without inflating every Role's budget. Coordinator tests cover mixed replica counts.
+In-flight reservations include deleting, missing, Creating, and waiting-for-Ready work. Repeated reconciles calculate the same or a stricter admission boundary from the observed snapshot.
 
-#### Stale informer observations
+#### Informer convergence
 
-Candidate admission uses conservative in-flight reservations and simulated increments. Operations are idempotent, and RoleDeleting/target-Creating/missing replacement slots remain reserved across reconciles.
+Terminating Pods and missing ordinals are classified conservatively. Reconciliation resumes as informer state converges.
 
-#### Misconfigured dependency direction
+#### Long-running blockers
 
-API documentation states that `A dependsOn B` makes B a startup prerequisite of A. Webhook DAG validation and examples reduce ambiguity.
-
-#### Feature interaction complexity
-
-The coordinator only admits actions that already passed existing Role scaling or rolling-update rules. Existing paths continue to own creation, deletion, readiness, and recovery.
+The ModelServing condition records the blocking ServingGroup, Role, reason, and relevant progress data. Events record transitions between blocker states.
 
 ### Test Plan
 
 #### Unit tests
 
-- Percent parsing and rejection of absolute `maxSkew`.
-- Role selection defaulting and explicit subset behavior.
-- Dependency existence, duplicate, self-edge, and cycle validation.
-- Progress calculation with target hash, `RoleRunning`, Creating, Deleting, and missing replacement slots.
-- Per-Role partition denominator and different partitions across Roles.
-- Unchanged selected Roles and fully partitioned changed dependencies.
-- Per-Role integer limits for equal and unequal replica counts.
-- Ceiling conversion from percentage limits to integer replica counts, including small Roles whose floor would be zero.
-- Quantization of a small Role does not inflate other Roles' limits.
-- Ready-based startup dependency gating at equal and unequal replica counts.
-- Coordination preserves the existing behavior when `maxUnavailable` is omitted.
-- Candidate simulation prevents over-selection in one reconcile.
-- Deterministic selection order and descending ordinal behavior.
-- Existing `maxUnavailable` always remains an upper bound.
-- Controller restart snapshot produces the same decision.
-- Replica-only scale-up bypasses coordination.
-- Concurrent template update and scale-up cannot create a target-version dependent before its dependency is Ready or exceed the Role's skew allowance.
-- Scale-down changes the denominator and subsequent decisions use the new desired count.
+- Role selection and `maxSkew` validation.
+- Dependency existence, duplicate edge, self-edge, and cycle validation.
+- Rollout-root inference for chains, branches, multiple roots, and isolated Roles.
+- Exact ordinal range `[P, D)`.
+- Scale-down excess excluded from progress and dependency Ready capacity.
+- Ready and in-flight progress from Running, Creating, Deleting, terminating, and missing states.
+- Equal and unequal Role replica counts.
+- Per-Role ceiling conversion and small-Role quantization.
+- `A -> B -> C` internal prestart and root startup behavior.
+- `B -> C` root startup behavior.
+- Direct-edge old-version retention.
+- User partition combined with coordination partition.
+- Descending ordinal selection and `maxUnavailable`.
+- Deterministic blocker aggregation and condition transitions.
+- Restart reconstruction during deletion, missing replacement, creation, and readiness.
 
 #### Property and fuzz tests
 
-For random DAGs, replica counts, partitions, Ready states, and local budgets:
+For generated replica counts, partitions, Role states, and acyclic graphs:
 
-- selected candidates never violate local availability or partition;
-- projected reservations never exceed that Role's quantized integer limit;
-- dependency gating never admits a dependent before every dependency has a target-revision Ready replica;
-- selection is deterministic for the same snapshot;
-- repeated Ready transitions eventually complete when all creations succeed;
-- invalid graphs are always rejected.
+- `effectivePartition >= userPartition`;
+- projected started work stays within each Role's quantized allowance;
+- a rollout root starts after every Role in its closure has eligible Ready capacity;
+- target Ready replicas outside `[P, D)` never unlock a root;
+- an observed old caller retains its direct old dependency;
+- identical snapshots produce identical decisions;
+- generated invalid graphs fail validation.
 
 #### Integration tests
 
-- Spec update event enqueues a ModelServing and selects only dependency-allowed work.
-- Delete events preserve reservation through deletion/recreation gaps.
-- each participating RoleRunning transition enqueues reconciliation.
-- rate-limited retries do not duplicate deletions.
-- controller restart during Deleting and Creating reconstructs reservations.
-- a second template update during rollout switches target hashes safely.
-- concurrent scale-up creation follows the same dependency and skew admission as delete-first replacement.
+- A ModelServing spec update enters coordinated Role rolling update.
+- Deletion and recreation gaps preserve in-flight reservation.
+- Participating Role `RoleRunning` transitions trigger the next decision.
+- Controller restart reconstructs deleting and Creating work.
+- Terminating old Pods retain the old-version dependency boundary.
+- Status updates preserve existing conditions and update `CoordinatedRoleRolloutBlocked`.
+- Concurrent template update and scale-up uses the same effective partition.
 
 #### End-to-end tests
 
-- A/B/C equal replicas, delayed C readiness: B and C may prestart, while A waits until both dependencies have a target-revision Ready replica.
-- Different replica counts with configured skew below one Role's single-replica step.
-- Mixed partitions: A partially remains old while B/C complete.
-- One Role unschedulable: upstream stops and old capacity remains.
-- Explicit Role subset: selected Roles coordinate; unselected Role preserves legacy behavior.
-- Concurrent scale-up and template update: additional target-version replicas cannot bypass dependency or `maxSkew` admission.
+- Equal-replica A/B/C rollout with delayed C readiness.
+- A/B/C rollout completion in old-version order A, B, C.
+- Unequal A/B/C replica counts with `maxSkew: 10%`.
+- Different user partitions across Roles.
+- Unschedulable dependency with a visible blocker condition.
+- Explicit Role subset coordination.
+- Controller restart during delete, create, and readiness stages.
 
 ### Rollout Plan
 
-1. Add the opt-in alpha API and webhook validation.
-2. Add per-ServingGroup state construction and pure candidate selection.
-3. Integrate rollout-start admission into concurrent target-version scale-up and `RoleRollingUpdate`, and enqueue intermediate participating RoleRunning transitions.
-4. Add unit, controller, and end-to-end coverage with injected readiness delays.
+The feature is enabled by configuring `roleCoordination` under `RoleRollingUpdate`. ModelServings without `roleCoordination` continue through the existing independent Role rolling-update path.
 
-When `roleCoordination` is absent, the existing independent Role rolling update behavior remains unchanged.
+Implementation proceeds in four stages:
 
-### Alternatives
-
-#### Rely only on business-layer version routing
-
-Rejected as the controller can still make a new upstream Role reachable before any compatible downstream replica is Ready. Routing cannot select a nonexistent endpoint.
-
-#### Use only dependency order
-
-The invariant `progress_A <= progress_B <= progress_C` prevents upstream from leading, but by itself allows C to reach 100% while A remains at 0%. `maxSkew` is still needed to bound idle downstream progress.
-
-#### Use only maxSkew with simultaneous candidate admission
-
-Rejected because all Roles can be at zero when A, B, and C are admitted simultaneously. Different readiness latency can then expose A before C. The dependency Ready gate must constrain admission.
-
-#### Define skew as a raw replica-count difference
-
-Rejected because Roles commonly have different desired counts. A one-replica difference means 50% for a two-replica Role but 1% for a hundred-replica Role.
-
-#### Mutate Pod readiness until dependencies are Ready
-
-Rejected for the initial design. It couples rollout control to kubelet readiness and Service endpoint semantics, can hide otherwise healthy Pods, and still needs a policy for already Ready Pods when a dependency later fails. Candidate admission prevents the unsafe state earlier.
+1. add the API, generated artifacts, and webhook validation;
+2. add per-ServingGroup state construction and the pure coordination calculation;
+3. integrate effective partitions, Ready-triggered continuation, and status reporting;
+4. add unit, integration, and end-to-end coverage.
 
 ### References
 
