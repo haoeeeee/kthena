@@ -195,10 +195,12 @@ For every selected Role, the state builder reads three inputs:
 They define the stable population covered by proportional replacement:
 
 ```text
-T = max(min(previousDesired, desired) - userPartition, 0)
+stableEnd = min(previousDesired, desired)
+stableReplacementRange = [userPartition, stableEnd)
+T = max(stableEnd - userPartition, 0)
 ```
 
-`T` is the number of pre-update stable slots covered by proportional replacement. It uses the smaller of the old and new desired counts, so ordinary scale-up capacity and scale-down excess stay outside the proportional denominator.
+`T` is the number of pre-update stable Role ordinal slots covered by proportional replacement. It uses the smaller of the old and new desired counts, so ordinary scale-up slots at ordinals greater than or equal to `stableEnd` and scale-down excess stay outside the proportional denominator. The controller obtains the ordinal from the Role ID, and the existing scale path fills missing ordinals inside its expected range. If Role scale synchronization fills a missing ordinal inside `stableReplacementRange`, that capacity occupies a pre-update stable slot and is therefore replacement capacity, regardless of which execution path created it.
 
 The proportional calculation keeps only three per-Role values. They are reconstructed on every reconcile and are not persisted in the API or status:
 
@@ -206,7 +208,7 @@ The proportional calculation keeps only three per-Role values. They are reconstr
 | --- | --- | --- |
 | `T` | total pre-update stable slots to replace | Step 2 uses it as the progress denominator and replacement target |
 | `S` | slots whose replacement has started | Step 2 subtracts it from the allowed total so in-flight work is not admitted again |
-| `R` | started slots backed by target-version stable `RoleRunning` capacity | Step 2 uses `R/T` as normalized Ready progress |
+| `R` | started slots in `stableReplacementRange` backed by target-version `RoleRunning` capacity at the same ordinal | Step 2 uses `R/T` as normalized Ready progress |
 
 `S` prevents already admitted deletion and recreation work from consuming the allowance again. `R` advances only when stable target-version capacity reaches `RoleRunning`. Their reconstruction from Role and Pod observations is described later in [State Reconstruction and Controller Restart](#state-reconstruction-and-controller-restart).
 
@@ -256,7 +258,7 @@ Dependency coordination uses two additional per-Role states, separate from the p
 | `targetState` | `NotStarted`, `Started`, or `Ready` | gates the first target-version start of a rollout root |
 | `hasOldVersion` | whether old-version capacity still exists | retains the final old replica on a dependency path |
 
-Replacement, ordinary scale-up, and surge capacity may update `targetState`, but only stable replacement capacity contributes to `T`, `S`, and `R`.
+Replacement, ordinary scale-up, and surge capacity may update `targetState`, but only target-version capacity occupying `stableReplacementRange` contributes to `T`, `S`, and `R`.
 
 An edge:
 
@@ -366,9 +368,9 @@ During a template update, target-version Role capacity can come from three paths
 
 `rolesToDeleteForRoleRollingUpdate` remains responsible for outdated detection, descending Role ordering, and the Role's `maxUnavailable`. Coordination only narrows its candidate set through `effectivePartition`.
 
-For a simultaneous template update and ordinary scale-up, `syncRoleReplicas` creates target capacity toward `desired` after `targetStartAllowed` becomes true. The `desired-previousDesired` expansion amount stays outside proportional progress, while a resulting target-hash `RoleRunning` replica can make `targetState=Ready` for dependency startup.
+For a simultaneous template update and ordinary scale-up, `syncRoleReplicas` creates target capacity toward `desired` after `targetStartAllowed` becomes true. Target capacity at ordinals in `[stableEnd, desired)` stays outside proportional progress, while a resulting target-hash `RoleRunning` replica can make `targetState=Ready` for dependency startup. Target capacity that fills an ordinal in `stableReplacementRange` is counted as replacement progress.
 
-For example, `previousDesired=10`, `desired=12`, and `userPartition=0` produce `T=10`, with two ordinary scale-up replicas outside `T`. The ten pre-update stable slots form the proportional denominator, independent of which ordinals the existing scale-up policy chooses.
+For example, `previousDesired=10`, `desired=12`, and `userPartition=0` produce `stableReplacementRange=[0,10)` and `T=10`. Ordinals 10 and 11 are ordinary scale-up slots outside `T`. The ten pre-update stable ordinal slots form the proportional denominator.
 
 For a simultaneous scale-down, `min(previousDesired, desired)` excludes the removed excess from the proportional population. Existing scale-down policy reconciles that excess, while `T` remains the replacement denominator.
 
@@ -387,7 +389,7 @@ else:
     temporaryExpected = desired
 ```
 
-`dependencyRetentionIsBinding` is true only when dependency coordination, rather than `userPartition`, is retaining the final old replica. Normal Role scale synchronization creates capacity up to `temporaryExpected`. The controller does not label an individual Role as surge and does not infer surge identity from its ordinal. Eligible target-hash capacity that becomes `RoleRunning` can make `targetState=Ready` and unlock a dependent root.
+`dependencyRetentionIsBinding` is true only when dependency coordination, rather than `userPartition`, is retaining the final old replica. Normal Role scale synchronization creates capacity up to `temporaryExpected`. The controller does not persist a permanent replacement, scale-up, or surge origin on an individual Role. Each reconcile classifies its current capacity by ordinal range: `stableReplacementRange` contributes to proportional progress, `[stableEnd, desired)` contributes ordinary scale-up capacity, and `[desired, temporaryExpected)` contributes admitted surge capacity. Eligible target-hash capacity in these admitted ranges that becomes `RoleRunning` can make `targetState=Ready` and unlock a dependent root.
 
 Old-replica deletion still follows `effectivePartition` and `maxUnavailable`. `maxSkew` still follows `R/T`; temporary capacity above `desired` is outside the stable target capacity used to derive `R`.
 
@@ -447,37 +449,38 @@ No coordination state is persisted. Every reconcile derives it from the ModelSer
 
 ##### Proportional state
 
-- `T` is calculated from `previousDesired`, `desired`, and `userPartition`.
-- `S` is `T` minus the non-deleting old replicas that still occupy the updateable stable population. A slot remains started while its old replica is deleting, its stable capacity is missing, or its replacement is Creating.
-- `R` is the part of `S` backed by target-hash `RoleRunning` capacity inside the stable desired count. Before deriving it, the controller conservatively removes ordinary scale-up capacity and any current capacity above `desired` from the observed target Ready count. Those replicas can therefore never inflate proportional progress; an ambiguous snapshot may temporarily undercount `R` until scaling converges.
+- `T` is the size of `stableReplacementRange=[userPartition,min(previousDesired,desired))`.
+- `S` is `T` minus the non-deleting old replicas that still occupy this ordinal range. A slot remains started while its old replica is deleting, its stable capacity is missing, or its replacement is Creating.
+- `R` is the number of started ordinals in this range occupied by a target-hash `RoleRunning` replica.
 
-Here, `remainingOldToUpdate` is the number of non-deleting old replicas still occupying the updateable stable population, `targetReady` is the observed target-hash `RoleRunning` count, and `observedNonDeleting` is the current non-deleting Role count. The count-based reconstruction is:
+Here, `remainingOldToUpdate` is the number of non-deleting old replicas still occupying `stableReplacementRange`, and `stableTargetReady` is the number of target-hash `RoleRunning` replicas whose Role ordinal is in that range. The reconstruction is:
 
 ```text
-S = T - min(T, remainingOldToUpdate)
-
-ordinaryScale       = max(desired - previousDesired, 0)
-temporaryExcess     = max(observedNonDeleting - desired, 0)
-replacementReady    = max(targetReady - ordinaryScale - temporaryExcess, 0)
-R                   = min(S, replacementReady)
+stableEnd              = min(previousDesired, desired)
+stableReplacementRange = [userPartition, stableEnd)
+T                      = max(stableEnd - userPartition, 0)
+S                      = T - min(T, remainingOldToUpdate)
+R                      = min(S, stableTargetReady)
 ```
 
-Subtracting the full ordinary-scale and excess counts is conservative when individual origins are ambiguous: it can delay another admission, but cannot let scale-up, scale-down excess, or surge capacity consume `maxSkew` progress.
+This range-based reconstruction is independent of Ready ordering. If a replacement becomes Ready before an ordinary scale-up replica, it advances `R` immediately. If the scale-up replica becomes Ready first, it may satisfy dependency startup but does not advance `R`. Capacity above `stableEnd` cannot inflate proportional progress.
+
+For example, `previousDesired=2`, `desired=3`, and `userPartition=0` produce `stableReplacementRange=[0,2)`. If target ordinal 0 is `RoleRunning` while scale-up ordinal 2 is not Ready, then `R=1`. If ordinal 2 is Ready while the target replacement at ordinal 0 is not Ready, then `R=0`; the scale-up capacity affects only dependency state.
 
 ##### Dependency state
 
-- `targetState` becomes `Started` when target-version replacement, ordinary scale-up, or admitted surge work exists. It becomes `Ready` when target-hash `RoleRunning` capacity remains after conservatively excluding scale-down excess above the currently admitted capacity limit.
+- `targetState` becomes `Started` when target-version replacement, ordinary scale-up, or admitted surge work exists in the currently admitted ordinal range. It becomes `Ready` when target-hash `RoleRunning` capacity exists in that range.
 - `hasOldVersion` remains true while an old-hash Role or terminating old Pod still exists, or while a partition-protected old slot is temporarily missing and awaiting recovery. Terminating Pods are read from the Pod informer cache so the final-old-replica protection survives datastore reconstruction.
 
 ```text
 dependencyExpected = desired + admittedSurge
-scaleDownExcess    = max(observedNonDeleting - dependencyExpected, 0)
-dependencyReady    = max(targetReady - scaleDownExcess, 0)
+dependencyRange    = [0, dependencyExpected)
+dependencyReady    = target-hash RoleRunning capacity in dependencyRange
 ```
 
-`admittedSurge` is the resolved `maxSurge` only while target startup is allowed and `surgeRequired` from Step 5 is true; otherwise it is zero. `dependencyReady > 0` sets `targetState=Ready`. This allows admitted surge capacity to unlock a root without letting replicas that are merely awaiting ordinary scale-down do so.
+`admittedSurge` is the resolved `maxSurge` only while target startup is allowed and `surgeRequired` from Step 5 is true; otherwise it is zero. `dependencyReady > 0` sets `targetState=Ready`. This allows ordinary scale-up and admitted surge capacity to unlock a root, while Role ordinals outside `dependencyRange` that are awaiting scale-down are ignored.
 
-Ordinary scale-up is derived as `max(desired-previousDesired, 0)`. Capacity above `desired` while `surgeRequired` is true is treated as temporary surge capacity. Revision and template-hash labels distinguish old and target versions; no individual Role ordinal is permanently classified as replacement, scale-up, or surge.
+Ordinary scale-up occupies the admitted desired range above `stableEnd`. Capacity in `[desired, dependencyExpected)` is admitted surge capacity while `surgeRequired` is true. Revision and template-hash labels distinguish old and target versions, and the ordinal boundaries classify their current coordination semantics without persisting an origin label.
 
 After a controller restart, the startup path rebuilds the datastore and enqueues existing ModelServings. The first reconcile observes the same revisions, hashes, deletion state, missing capacity, and Ready conditions, reconstructs the values above, and resumes from the resulting limits.
 
@@ -570,7 +573,7 @@ Main code changes:
 - API types, generated clients, deepcopy code, and CRDs for `roleCoordination`;
 - admission parsing of the old and new ModelServing objects for update-time rollout feasibility validation;
 - webhook validation for Role selection, `maxSkew`, dependency DAGs, partition-limited target capacity, and insufficient bootstrap capacity on update;
-- flat Role-state construction for `T`, `S`, `R`, `targetState`, `hasOldVersion`, and `active` from the ControllerRevision, Role spec, datastore Roles, Pods, hashes, readiness, and current counts;
+- flat Role-state construction for `T`, `S`, `R`, `targetState`, `hasOldVersion`, and `active` from the ControllerRevision, Role spec, datastore Roles, Role ordinals, Pods, hashes, readiness, and admitted capacity ranges;
 - `syncModelServing` construction of one per-ServingGroup decision map before Role replica synchronization, passed to both `syncRoleReplicas` and `manageRollingUpdate`;
 - `rolesToDeleteForRoleRollingUpdate` integration for `effectivePartition`;
 - `scaleUpRoles` integration with dependency startup and `targetState` updates during a coordinated Role rollout;
@@ -592,7 +595,7 @@ Small Roles have coarse progress steps. Per-Role ceiling conversion permits one 
 
 #### Ordinary Scale-up and Surge Capacity
 
-Ordinary scale-up and temporary capacity contribute through `targetState`. After reaching `RoleRunning`, both provide dependency Ready capacity. Ordinary scale-up persists inside `desired`, while the expected count contracts to `desired` after eligible old replicas are gone. Replacement progress remains `R/T`.
+Ordinary scale-up and temporary capacity contribute through `targetState`. After reaching `RoleRunning` in an admitted ordinal range, both provide dependency Ready capacity. Only target Ready capacity inside `stableReplacementRange` contributes to `R`; Ready ordering between replacement and expansion capacity therefore cannot change the measured proportional progress. Ordinary scale-up persists inside `desired`, while the expected count contracts to `desired` after eligible old replicas are gone.
 
 #### Informer convergence
 
@@ -610,8 +613,9 @@ The ModelServing condition records the blocking ServingGroup, Role, reason, and 
 - UPDATE capacity validation for changed dependencies, including `partition < replicas` and single-replica bootstrap through ordinary scale-up or positive `maxSurge`.
 - Rollout-root inference for chains, branches, multiple roots, and isolated Roles.
 - `T=max(min(previousDesired,desired)-userPartition,0)` for equal, scale-up, and scale-down updates.
-- `S` and `R` construction from Running, Creating, Deleting, terminating, missing, ordinary scale-up, and temporary-capacity states.
-- Count-based distinction among ordinary scale-up, stable replacement Ready capacity, and temporary expected capacity without ordinal classification.
+- `S` and `R` construction from Running, Creating, Deleting, terminating, and missing states inside `stableReplacementRange`.
+- Ordinal-range distinction among stable replacement, ordinary scale-up, admitted surge, and scale-down excess capacity.
+- A replacement Ready before ordinary scale-up advances `R` immediately, while ordinary scale-up Ready before replacement leaves `R` unchanged and only advances `targetState`.
 - Ordinary scale-up and surge transitions through `targetState=Started` and `targetState=Ready`.
 - Equal and unequal Role replica counts.
 - Zero or one active replacement Role releases the cross-Role ratio limit.
@@ -635,7 +639,7 @@ For generated replica counts, partitions, Role states, and acyclic graphs:
 - `effectivePartition >= userPartition`;
 - new replacement admission is zero when `S >= allowedStarted`, and otherwise projected `S` stays within `allowedStarted`;
 - a rollout root starts after every Role in its closure reaches `targetState=Ready`;
-- target-hash RoleRunning capacity sets `targetState=Ready`, while `R <= S <= T`;
+- target-hash RoleRunning capacity inside `dependencyRange` sets `targetState=Ready`; only capacity inside `stableReplacementRange` contributes to `R`, while `R <= S <= T`;
 - `T` remains derived solely from `previousDesired`, `desired`, and `userPartition` when ordinary scale-up or temporary excess exists;
 - scale-down capacity is reconciled through the desired range;
 - an observed old caller retains its direct old dependency;
@@ -652,7 +656,7 @@ For generated replica counts, partitions, Role states, and acyclic graphs:
 - Controller restart reconstructs the temporary expected count without creating capacity above `desired+maxSurge`.
 - Terminating old Pods retain the old-version dependency boundary.
 - Status updates preserve existing conditions and update `CoordinatedRoleRolloutBlocked`.
-- Concurrent template update and scale-up uses `R/T` for `maxSkew` and `targetState` for scale-up dependency startup.
+- Concurrent template update and scale-up uses stable-range `R/T` for `maxSkew` and the wider admitted dependency range for scale-up startup, including both Ready-order permutations.
 - Surge creation reaches the configured `maxSurge` through dependency startup.
 - A rollout root creates replacement, ordinary scale-up, or surge target capacity after its dependency closure reaches `Ready`.
 
@@ -662,6 +666,7 @@ For generated replica counts, partitions, Role states, and acyclic graphs:
 - A/B/C rollout completion in old-version order A, B, C.
 - Unequal A/B/C replica counts with `maxSkew: 10%`.
 - Different user partitions across Roles.
+- Concurrent update and ordinary scale-up with replacement Ready before expansion, and with expansion Ready before replacement.
 - One-replica B and C establish target Ready capacity through `maxSurge: 1` while old B and C remain available.
 - Admission reports the capacity requirement for a changed fully partitioned dependency.
 - Admission reports the bootstrap requirement for a one-replica dependency.
