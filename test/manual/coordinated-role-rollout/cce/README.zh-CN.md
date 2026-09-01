@@ -46,51 +46,130 @@ kubectl explain modelserving.spec.rolloutStrategy.roleCoordination
 
 该命令应显示 `maxSkew`、`roles` 和 `dependencies`。
 
-## 2. 准备观察和控制脚本
+## 2. 准备观察和控制函数
 
-本目录的 `validate-rollout.sh` 封装了观察 Pod 状态、等待控制器推进和手工控制 v2 Ready 的函数。
+下面的函数用于观察 Pod 状态、等待控制器推进，以及手工控制 v2 Pod 何时 Ready。
 
-| 函数 | 作用 | 对应子命令 |
+| 函数 | 作用 | 调用示例 |
 |---|---|---|
-| `pod_rows` | 按 Pod、Role、版本和 Ready 状态输出原始观测数据，供其他函数继续统计 | `pod-rows` |
-| `count_pods` | 统计指定 Role、指定版本的 Pod 数量，不要求 Ready | `count-pods ROLE VERSION` |
-| `count_ready` | 统计指定 Role、指定版本中已经 Ready 的 Pod 数量 | `count-ready ROLE VERSION` |
-| `show_state` | 列出全部测试 Pod，并汇总 A、B、C 的 v1、v2 和 v2 Ready 数量 | `show-state` |
-| `wait_count` | 每秒查询一次，等待指定 Role/版本达到预期 Pod 数；默认超时 300 秒 | `wait-count ROLE VERSION EXPECTED [TIMEOUT]` |
-| `wait_ready` | 每秒查询一次，等待指定 Role/版本达到预期 Ready 数；默认超时 300 秒 | `wait-ready ROLE VERSION EXPECTED [TIMEOUT]` |
-| `touch_role` | 对某个 Role 当前已有的所有 NotReady v2 Pod 创建 `/tmp/ready`，手工让它们 Ready | `touch-role ROLE` |
-| `touch_all_v2` | 依次调用 `touch_role a/b/c`，用于验证完关键边界后驱动剩余滚动完成 | `touch-all-v2` |
-| `usage` | 打印脚本支持的子命令和环境变量 | `help` |
-| `main` | 将命令行子命令分发给对应函数，属于脚本内部入口 | 无需直接调用 |
+| `pod_rows` | 按 Pod、Role、版本和 Ready 状态输出原始观测数据，供其他函数继续统计 | `pod_rows` |
+| `count_pods` | 统计指定 Role、指定版本的 Pod 数量，不要求 Ready | `count_pods b v2` |
+| `count_ready` | 统计指定 Role、指定版本中已经 Ready 的 Pod 数量 | `count_ready b v2` |
+| `show_state` | 列出全部测试 Pod，并汇总 A、B、C 的 v1、v2 和 v2 Ready 数量 | `show_state` |
+| `wait_count` | 每秒查询一次，等待指定 Role/版本达到预期 Pod 数；默认超时 300 秒 | `wait_count b v2 2 300` |
+| `wait_ready` | 每秒查询一次，等待指定 Role/版本达到预期 Ready 数；默认超时 300 秒 | `wait_ready b v2 2 300` |
+| `touch_role` | 对某个 Role 当前已有的所有 NotReady v2 Pod 创建 `/tmp/ready`，手工让它们 Ready | `touch_role b` |
+| `touch_all_v2` | 依次调用 `touch_role a/b/c`，用于验证完关键边界后驱动剩余滚动完成 | `touch_all_v2` |
 
-推荐把函数加载到当前 shell。这样后面的验证命令可以直接使用函数名：
+将下面整个代码块复制到同一个 Bash 终端执行一次，函数就会加载到当前终端。之后只运行验证步骤要求的那个函数即可。
 
 ```bash
-source "${TEST_DIR}/validate-rollout.sh"
+# 输出测试 Pod 的名称、Role、版本和 Ready 状态。
+pod_rows() {
+  kubectl get pods -n "${TEST_NS}" \
+    -l "modelserving.volcano.sh/name=${TEST_MS}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.modelserving\.volcano\.sh/role}{"\t"}{.spec.containers[0].env[?(@.name=="VERSION")].value}{"\t"}{.status.containerStatuses[0].ready}{"\n"}{end}'
+}
+
+# 统计一个 Role 中指定版本的 Pod 数量，不要求 Ready。
+count_pods() {
+  pod_rows | awk -v role="$1" -v version="$2" \
+    '$2 == role && $3 == version {n++} END {print n + 0}'
+}
+
+# 统计一个 Role 中指定版本且已经 Ready 的 Pod 数量。
+count_ready() {
+  pod_rows | awk -v role="$1" -v version="$2" \
+    '$2 == role && $3 == version && $4 == "true" {n++} END {print n + 0}'
+}
+
+# 展示全部 Pod，并汇总 A、B、C 当前的版本和 Ready 数量。
+show_state() {
+  printf '%-52s %-6s %-8s %-6s\n' POD ROLE VERSION READY
+  pod_rows | sort
+
+  echo
+  for role in a b c; do
+    printf '%s: v1=%s, v2=%s, v2Ready=%s\n' \
+      "${role}" \
+      "$(count_pods "${role}" v1)" \
+      "$(count_pods "${role}" v2)" \
+      "$(count_ready "${role}" v2)"
+  done
+}
+
+# 等待一个 Role/版本达到指定 Pod 数量，默认最多等待 300 秒。
+wait_count() {
+  local role="$1"
+  local version="$2"
+  local expected="$3"
+  local timeout="${4:-300}"
+
+  for _ in $(seq 1 "${timeout}"); do
+    if [ "$(count_pods "${role}" "${version}")" -eq "${expected}" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Timeout waiting for ${role}/${version}=${expected}"
+  show_state
+  return 1
+}
+
+# 等待一个 Role/版本达到指定 Ready 数量，默认最多等待 300 秒。
+wait_ready() {
+  local role="$1"
+  local version="$2"
+  local expected="$3"
+  local timeout="${4:-300}"
+
+  for _ in $(seq 1 "${timeout}"); do
+    if [ "$(count_ready "${role}" "${version}")" -eq "${expected}" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Timeout waiting for Ready ${role}/${version}=${expected}"
+  show_state
+  return 1
+}
+
+# 让指定 Role 当前已有的所有 NotReady v2 Pod 变成 Ready。
+touch_role() {
+  local role="$1"
+
+  pod_rows |
+    awk -v role="${role}" \
+      '$2 == role && $3 == "v2" && $4 != "true" {print $1}' |
+    while read -r pod; do
+      [ -n "${pod}" ] || continue
+      kubectl exec -n "${TEST_NS}" "${pod}" -- touch /tmp/ready || true
+    done
+}
+
+# 同时放行 A、B、C 当前已有的 NotReady v2 Pod。
+touch_all_v2() {
+  touch_role a
+  touch_role b
+  touch_role c
+}
 ```
 
-例如只查看状态：
+例如，只查看状态时执行：
 
 ```bash
 show_state
 ```
 
-也可以不执行 `source`，直接通过子命令运行某个函数：
+只放行 B 时执行：
 
 ```bash
-chmod +x "${TEST_DIR}/validate-rollout.sh"
-"${TEST_DIR}/validate-rollout.sh" show-state
-"${TEST_DIR}/validate-rollout.sh" touch-role b
-"${TEST_DIR}/validate-rollout.sh" wait-count b v2 2 300
+touch_role b
 ```
 
-查看全部子命令：
-
-```bash
-"${TEST_DIR}/validate-rollout.sh" help
-```
-
-`touch_role` 和 `touch_all_v2` 只控制当前已经存在的 v2 Pod 是否 Ready，不会创建 Pod，也不会修改 v1 Pod。不要在刚更新到 v2 后立即执行 `touch_all_v2`，否则会跳过依赖阻塞和 `maxSkew` 边界的人工观察。
+如果打开了新终端，需要重新执行上面的函数代码块。`touch_role` 和 `touch_all_v2` 只控制当前已经存在的 v2 Pod 是否 Ready，不会创建 Pod，也不会修改 v1 Pod。不要在刚更新到 v2 后立即执行 `touch_all_v2`，否则会跳过依赖阻塞和 `maxSkew` 边界的人工观察。
 
 ## 3. 创建 v1 基线
 
