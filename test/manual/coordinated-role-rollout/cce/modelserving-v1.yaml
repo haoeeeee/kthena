@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: coordinated-role-rollout-test
+---
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelServing
+metadata:
+  name: proportional-role-rollout
+  namespace: coordinated-role-rollout-test
+spec:
+  replicas: 1
+  schedulerName: default-scheduler
+  recoveryPolicy: RoleRecreate
+  rolloutStrategy:
+    type: RoleRollingUpdate
+    roleCoordination:
+      maxSkew: 20%
+      dependencies:
+      - role: a
+        dependsOn:
+        - b
+      - role: b
+        dependsOn:
+        - c
+  template:
+    restartGracePeriodSeconds: 0
+    roles:
+    - name: a
+      replicas: 10
+      workerReplicas: 0
+      entryTemplate:
+        spec:
+          containers:
+          - name: test
+            image: busybox:1.36
+            imagePullPolicy: IfNotPresent
+            command:
+            - sh
+            - -c
+            args:
+            - |
+              if [ "${VERSION}" = "v1" ]; then
+                touch /tmp/ready
+              fi
+              sleep 2147483647
+            env:
+            - name: VERSION
+              value: v1
+            readinessProbe:
+              exec:
+                command:
+                - sh
+                - -c
+                - test -f /tmp/ready
+              periodSeconds: 1
+    - name: b
+      replicas: 10
+      workerReplicas: 0
+      entryTemplate:
+        spec:
+          containers:
+          - name: test
+            image: busybox:1.36
+            imagePullPolicy: IfNotPresent
+            command:
+            - sh
+            - -c
+            args:
+            - |
+              if [ "${VERSION}" = "v1" ]; then
+                touch /tmp/ready
+              fi
+              sleep 2147483647
+            env:
+            - name: VERSION
+              value: v1
+            readinessProbe:
+              exec:
+                command:
+                - sh
+                - -c
+                - test -f /tmp/ready
+              periodSeconds: 1
+    - name: c
+      replicas: 10
+      workerReplicas: 0
+      entryTemplate:
+        spec:
+          containers:
+          - name: test
+            image: busybox:1.36
+            imagePullPolicy: IfNotPresent
+            command:
+            - sh
+            - -c
+            args:
+            - |
+              if [ "${VERSION}" = "v1" ]; then
+                touch /tmp/ready
+              fi
+              sleep 2147483647
+            env:
+            - name: VERSION
+              value: v1
+            readinessProbe:
+              exec:
+                command:
+                - sh
+                - -c
+                - test -f /tmp/ready
+              periodSeconds: 1
