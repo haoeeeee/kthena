@@ -93,6 +93,102 @@ func TestRevisionComparisonPartialRoleUpdate(t *testing.T) {
 	assert.Equal(t, datastore.RoleRunning, c.store.GetRoleStatus(utils.GetNamespaceName(ms), groups[0].Name, "prefill", "prefill-0"))
 }
 
+func TestRoleRollingZeroReplicaRoleConvergesStatus(t *testing.T) {
+	old := createStandardModelServing("zero-role", 1, 0)
+	old.UID = "zero-role-uid"
+	old.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "prefill:v1"
+	decode := *old.Spec.Template.Roles[0].DeepCopy()
+	decode.Name = "decode"
+	decode.Replicas = ptr.To[int32](3)
+	decode.EntryTemplate.Spec.Containers[0].Image = "decode:v1"
+	old.Spec.Template.Roles = append(old.Spec.Template.Roles, decode)
+
+	ms := old.DeepCopy()
+	ms.Spec.RolloutStrategy = &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate}
+	ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
+	ms.Spec.Template.Roles[1].EntryTemplate.Spec.Containers[0].Image = "decode:v2"
+	ms.Status.CurrentRevision = "legacy"
+	ms.Status.UpdateRevision = "legacy"
+
+	c := newRevisionTestController(t, ms)
+	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "legacy", old.Spec.Template.Roles)
+	require.NoError(t, err)
+	targetRevision := utils.ModelServingRevision(ms)
+	_, err = utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, targetRevision, ms.Spec.Template.Roles)
+	require.NoError(t, err)
+
+	key := utils.GetNamespaceName(ms)
+	groupName := utils.GenerateServingGroupName(ms.Name, 0)
+	c.store.AddServingGroup(key, 0, "legacy")
+	require.NoError(t, c.store.UpdateServingGroupStatus(key, groupName, datastore.ServingGroupRunning))
+	targetHash := utils.CalRoleTemplateHash(ms.Spec.Template.Roles[1])
+	for ordinal := 0; ordinal < 3; ordinal++ {
+		roleID := utils.GenerateRoleID("decode", ordinal)
+		c.store.AddRole(key, groupName, "decode", roleID, targetRevision, targetHash)
+		require.NoError(t, c.store.UpdateRoleStatus(key, groupName, "decode", roleID, datastore.RoleRunning))
+	}
+
+	groups, err := c.store.GetServingGroupByModelServing(key)
+	require.NoError(t, err)
+	require.Len(t, groups, 1)
+	ctx := c.withRevisionHistory(context.Background(), ms)
+	assert.Equal(t, templateEquivalent, c.compareServingGroupTemplate(ctx, ms, groups[0], targetRevision))
+
+	require.NoError(t, c.UpdateModelServingStatus(ms, targetRevision))
+	updated, err := c.modelServingClient.WorkloadV1alpha1().ModelServings(ms.Namespace).Get(ctx, ms.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), updated.Status.UpdatedReplicas)
+	assert.Equal(t, targetRevision, updated.Status.CurrentRevision)
+	assert.Equal(t, targetRevision, updated.Status.UpdateRevision)
+	require.NotEmpty(t, updated.Status.Conditions)
+	assert.Equal(t, string(workloadv1alpha1.ModelServingAvailable), updated.Status.Conditions[len(updated.Status.Conditions)-1].Type)
+}
+
+func TestRoleRollingZeroReplicaRoleWaitsForObservedInstance(t *testing.T) {
+	old := createStandardModelServing("zero-role-observed", 1, 1)
+	old.UID = "zero-role-observed-uid"
+	old.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "prefill:v1"
+	ms := old.DeepCopy()
+	ms.Spec.RolloutStrategy = &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate}
+	ms.Spec.Template.Roles[0].Replicas = ptr.To[int32](0)
+	ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
+
+	c := newRevisionTestController(t, ms)
+	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "legacy", old.Spec.Template.Roles)
+	require.NoError(t, err)
+	key := utils.GetNamespaceName(ms)
+	groupName := utils.GenerateServingGroupName(ms.Name, 0)
+	c.store.AddServingGroup(key, 0, "legacy")
+	c.store.AddRole(key, groupName, "prefill", "prefill-0", "legacy", utils.CalRoleTemplateHash(old.Spec.Template.Roles[0]))
+	require.NoError(t, c.store.UpdateRoleStatus(key, groupName, "prefill", "prefill-0", datastore.RoleRunning))
+	groups, err := c.store.GetServingGroupByModelServing(key)
+	require.NoError(t, err)
+
+	assert.Equal(t, templateDifferent, c.compareServingGroupTemplate(context.Background(), ms, groups[0], utils.ModelServingRevision(ms)))
+	c.store.DeleteRole(key, groupName, "prefill", "prefill-0")
+	assert.Equal(t, templateEquivalent, c.compareServingGroupTemplate(context.Background(), ms, groups[0], utils.ModelServingRevision(ms)),
+		"an empty per-Role map must not keep a zero-replica Role rollout active")
+}
+
+func TestServingGroupRollingStillComparesAbsentZeroReplicaRole(t *testing.T) {
+	old := createStandardModelServing("zero-role-group-rollout", 1, 0)
+	old.UID = "zero-role-group-rollout-uid"
+	old.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "prefill:v1"
+	ms := old.DeepCopy()
+	ms.Spec.RolloutStrategy = &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.ServingGroupRollingUpdate}
+	ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
+
+	c := newRevisionTestController(t, ms)
+	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "legacy", old.Spec.Template.Roles)
+	require.NoError(t, err)
+	key := utils.GetNamespaceName(ms)
+	c.store.AddServingGroup(key, 0, "legacy")
+	groups, err := c.store.GetServingGroupByModelServing(key)
+	require.NoError(t, err)
+
+	assert.Equal(t, templateDifferent, c.compareServingGroupTemplate(context.Background(), ms, groups[0], utils.ModelServingRevision(ms)))
+}
+
 func TestRevisionComparisonIgnoresLifecycleAndReplicaCounts(t *testing.T) {
 	for _, status := range []datastore.ServingGroupStatus{datastore.ServingGroupRunning, datastore.ServingGroupCreating, datastore.ServingGroupScaling, datastore.ServingGroupDeleting} {
 		t.Run(string(status), func(t *testing.T) {

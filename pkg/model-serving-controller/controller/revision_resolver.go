@@ -302,9 +302,25 @@ func (c *ModelServingController) compareServingGroupTemplate(ctx context.Context
 	if err != nil {
 		return templateUnknown
 	}
+	roleRollingUpdate := ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate
+	remaining := make(map[string]workloadv1alpha1.Role, len(ms.Spec.Template.Roles))
+	for _, role := range ms.Spec.Template.Roles {
+		// RoleRollingUpdate compares the templates carried by live Role
+		// replicas. A zero-replica Role has no target instance to replace or
+		// observe, so its historical template must not keep the group outdated.
+		// Any old instance that still exists is handled below as unexpected
+		// live capacity and continues to block completion until it disappears.
+		if roleRollingUpdate && roleReplicas(role) == 0 {
+			continue
+		}
+		remaining[role.Name] = role
+	}
 	// Empty groups have no per-Role observation yet. Their recorded revision
 	// still describes the intended template; readiness is evaluated separately.
 	if len(rolesByName) == 0 {
+		if roleRollingUpdate && len(remaining) == 0 {
+			return templateEquivalent
+		}
 		if group.Revision != "" && (group.Revision == targetRevision || group.Revision == utils.ModelServingRevision(ms)) {
 			return templateEquivalent
 		}
@@ -320,18 +336,17 @@ func (c *ModelServingController) compareServingGroupTemplate(ctx context.Context
 		}
 		return templateDifferent
 	}
-	remaining := make(map[string]workloadv1alpha1.Role, len(ms.Spec.Template.Roles))
-	for _, role := range ms.Spec.Template.Roles {
-		remaining[role.Name] = role
-	}
 	result := templateEquivalent
 	for roleName, roles := range rolesByName {
+		// DeleteRole removes the last instance but deliberately retains the
+		// per-Role map. An empty map is therefore absence, not an unexpected
+		// Role template.
+		if len(roles) == 0 {
+			continue
+		}
 		_, exists := remaining[roleName]
 		if !exists {
 			return templateDifferent
-		}
-		if len(roles) == 0 {
-			continue
 		}
 		delete(remaining, roleName)
 		for _, role := range roles {
