@@ -258,6 +258,58 @@ func TestModelServingValidatorNetworkTopologyIsImmutableOnUpdate(t *testing.T) {
 	}
 }
 
+func TestModelServingValidatorRoleNamesAreImmutableOnUpdate(t *testing.T) {
+	newModelServing := func(names ...string) *workloadv1alpha1.ModelServing {
+		roles := make([]workloadv1alpha1.Role, 0, len(names))
+		for _, name := range names {
+			roles = append(roles, workloadv1alpha1.Role{
+				Name:     name,
+				Replicas: ptr.To[int32](1),
+				EntryTemplate: workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: name, Image: "nginx:latest"}},
+				}},
+			})
+		}
+		return &workloadv1alpha1.ModelServing{
+			ObjectMeta: v1.ObjectMeta{Name: "immutable-role-names"},
+			Spec: workloadv1alpha1.ModelServingSpec{
+				Replicas: ptr.To[int32](1),
+				Template: workloadv1alpha1.ServingGroup{Roles: roles},
+			},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		oldRoles    []string
+		newRoles    []string
+		wantAllowed bool
+	}{
+		{name: "unchanged role names", oldRoles: []string{"prefill", "decode"}, newRoles: []string{"prefill", "decode"}, wantAllowed: true},
+		{name: "reordered role names", oldRoles: []string{"prefill", "decode"}, newRoles: []string{"decode", "prefill"}, wantAllowed: true},
+		{name: "renamed role", oldRoles: []string{"prefill", "decode"}, newRoles: []string{"embedding", "decode"}},
+		{name: "added role", oldRoles: []string{"prefill", "decode"}, newRoles: []string{"prefill", "decode", "embedding"}},
+		{name: "removed role", oldRoles: []string{"prefill", "decode"}, newRoles: []string{"prefill"}},
+	}
+
+	validator := NewModelServingValidator(nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allowed, reason := validator.validateModelServingUpdate(
+				context.Background(),
+				newModelServing(tt.oldRoles...),
+				newModelServing(tt.newRoles...),
+			)
+			assert.Equal(t, tt.wantAllowed, allowed)
+			if tt.wantAllowed {
+				assert.Empty(t, reason)
+			} else {
+				assert.Contains(t, reason, "role names are immutable")
+			}
+		})
+	}
+}
+
 func TestValidGeneratedNameLengthUsesReplicaDefaultsForMissingValues(t *testing.T) {
 	replicas := int32(1)
 	longName := "this-is-a-very-long-name-that-exceeds-the-allowed-length-for-generated-name"
