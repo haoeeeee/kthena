@@ -988,14 +988,16 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 	return nil
 }
 
-// syncRoleReplicas coordinates role replicas within each active ServingGroup,
-// deciding to use either the older revision if bound by the partition rules, or adopting
-// the new revision otherwise. It traverses every Role to align actual pods to expected status.
+// syncRoleReplicas coordinates role replicas within each active ServingGroup.
+// A partition-protected group keeps its historical template while independently
+// scalable Role replica counts follow the latest spec. An outdated group waiting
+// for ServingGroupRollingUpdate keeps its complete historical Role configuration
+// until the group itself is replaced.
 //
 // Main processing steps:
 // 1. Iterate over all existing ServingGroups and skip those already marked as "Deleting".
-// 2. Identify if the current ServingGroup falls under the rollout Partition protection.
-// 3. Fallback to an older revision (ControllerRevision) if the group is protected by the partition.
+// 2. Identify if the current ServingGroup must continue using its recorded revision.
+// 3. Load the recorded Role configuration when required by partition or group rollout.
 // 4. Update memory caches and use `manageRoleReplicas` to add/remove out-of-sync Pods and Services for each role.
 func (c *ModelServingController) syncRoleReplicas(
 	ctx context.Context,
@@ -1012,6 +1014,8 @@ func (c *ModelServingController) syncRoleReplicas(
 		return fmt.Errorf("cannot get ServingGroup of modelServing: %s from map: %v", ms.GetName(), err)
 	}
 	partition, _, _ := c.getPartition(modelServingPartition(ms), modelServingReplicas(ms))
+	isServingGroupRollingUpdate := ms.Spec.RolloutStrategy == nil ||
+		ms.Spec.RolloutStrategy.Type == workloadv1alpha1.ServingGroupRollingUpdate
 	for _, servingGroup := range servingGroupList {
 		if c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroup.Name) == datastore.ServingGroupDeleting {
 			// Deleting ServingGroup will be recreated after the deletion is complete, so there is no need to scale the roles
@@ -1022,10 +1026,16 @@ func (c *ModelServingController) syncRoleReplicas(
 			return fmt.Errorf("cannot parse ordinal from ServingGroup %s", servingGroup.Name)
 		}
 		isPartitionProtected := partition > 0 && servingGroupOrdinal < partition
+		useRecordedRoles := isPartitionProtected
+		if isServingGroupRollingUpdate && !isPartitionProtected {
+			// Unknown history is also kept conservative: it must not authorize
+			// applying the target Role configuration inside an old group.
+			useRecordedRoles = c.compareServingGroupTemplate(ctx, ms, servingGroup, newRevision) != templateEquivalent
+		}
 
 		rolesToManage := ms.Spec.Template.Roles
 		revisionToUse := newRevision
-		if isPartitionProtected {
+		if useRecordedRoles {
 			if servingGroup.Revision != "" {
 				revisionToUse = c.revisionForServingGroup(ctx, ms, servingGroup)
 			} else if ms.Status.CurrentRevision != "" {
@@ -1037,7 +1047,10 @@ func (c *ModelServingController) syncRoleReplicas(
 				if err != nil {
 					continue
 				}
-				rolesToManage = mergeLatestRoleReplicas(oldRoles, ms.Spec.Template.Roles)
+				rolesToManage = oldRoles
+				if isPartitionProtected {
+					rolesToManage = mergeLatestRoleReplicas(oldRoles, ms.Spec.Template.Roles)
+				}
 			}
 		}
 
