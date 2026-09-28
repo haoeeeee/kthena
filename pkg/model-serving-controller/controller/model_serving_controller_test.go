@@ -3004,6 +3004,117 @@ func TestSyncRoleReplicasKeepsOutdatedServingGroupOnRecordedRoleConfiguration(t 
 	}
 }
 
+func TestSyncRoleReplicasPreservesObservedCountsInOutdatedServingGroup(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		oldPRoles int
+	}{
+		{name: "previously scaled to zero"},
+		{name: "fewer replicas than historical snapshot", oldPRoles: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			kubeClient := kubefake.NewSimpleClientset()
+			controller, err := NewModelServingController(
+				kubeClient,
+				kthenafake.NewSimpleClientset(),
+				volcanofake.NewSimpleClientset(),
+				apiextfake.NewSimpleClientset(),
+			)
+			require.NoError(t, err)
+
+			ms := &workloadv1alpha1.ModelServing{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-observed-role-count"},
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Replicas:        ptr.To[int32](2),
+					RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.ServingGroupRollingUpdate},
+					Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{
+						{
+							Name:     "p",
+							Replicas: ptr.To[int32](0),
+							EntryTemplate: workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "main", Image: "p:new"}},
+							}},
+						},
+						{
+							Name:     "d",
+							Replicas: ptr.To[int32](1),
+							EntryTemplate: workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "main", Image: "d:new"}},
+							}},
+						},
+					}},
+				},
+			}
+			oldRoles := []workloadv1alpha1.Role{
+				{
+					Name:           "p",
+					Replicas:       ptr.To[int32](2),
+					WorkerReplicas: 1,
+					EntryTemplate: workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "main", Image: "p:old"}},
+					}},
+					WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "main", Image: "p-worker:old"}},
+					}},
+				},
+				{
+					Name:           "d",
+					Replicas:       ptr.To[int32](1),
+					WorkerReplicas: 1,
+					EntryTemplate: workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "main", Image: "d:old"}},
+					}},
+					WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "main", Image: "d-worker:old"}},
+					}},
+				},
+			}
+			oldRevision := "revision-old"
+			newRevision := utils.ModelServingRevision(ms)
+			_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, oldRevision, oldRoles)
+			require.NoError(t, err)
+			_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, newRevision, ms.Spec.Template.Roles)
+			require.NoError(t, err)
+
+			key := utils.GetNamespaceName(ms)
+			oldGroup := utils.GenerateServingGroupName(ms.Name, 0)
+			newGroup := utils.GenerateServingGroupName(ms.Name, 1)
+			controller.store.AddServingGroup(key, 0, oldRevision)
+			controller.store.AddServingGroup(key, 1, newRevision)
+			for i := 0; i < tt.oldPRoles; i++ {
+				controller.store.AddRole(key, oldGroup, "p", utils.GenerateRoleID("p", i), oldRevision, utils.CalRoleTemplateHash(oldRoles[0]))
+			}
+
+			require.NoError(t, controller.syncRoleReplicas(context.Background(), ms, newRevision, nil))
+			for _, roleName := range []string{"p", "d"} {
+				roles, err := controller.store.GetRoleList(key, oldGroup, roleName)
+				require.NoError(t, err)
+				want := 0
+				if roleName == "p" {
+					want = tt.oldPRoles
+				}
+				assert.Len(t, roles, want, "old group must retain its observed Role count")
+			}
+			newDRoles, err := controller.store.GetRoleList(key, newGroup, "d")
+			require.NoError(t, err)
+			assert.Len(t, newDRoles, 1, "new group must use the latest Role replica count")
+
+			pods, err := kubeClient.CoreV1().Pods(ms.Namespace).List(context.Background(), metav1.ListOptions{})
+			require.NoError(t, err)
+			assert.Len(t, pods.Items, 2*tt.oldPRoles+1)
+			for _, pod := range pods.Items {
+				if pod.Labels[workloadv1alpha1.GroupNameLabelKey] == oldGroup {
+					assert.Equal(t, oldRevision, pod.Labels[workloadv1alpha1.RevisionLabelKey])
+				} else {
+					assert.Equal(t, newGroup, pod.Labels[workloadv1alpha1.GroupNameLabelKey])
+					assert.Equal(t, "d", pod.Labels[workloadv1alpha1.RoleLabelKey])
+					assert.Equal(t, newRevision, pod.Labels[workloadv1alpha1.RevisionLabelKey])
+				}
+			}
+		})
+	}
+}
+
 func TestManageRoleReplicas(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -3130,7 +3241,7 @@ func TestManageRoleReplicas(t *testing.T) {
 			}
 
 			require.NoError(t, controller.manageRoleReplicasPerGroup(
-				context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, revision, nil, true,
+				context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, revision, nil, true, false,
 			))
 
 			roles, err := controller.store.GetRoleList(utils.GetNamespaceName(ms), groupName, roleName)
@@ -3207,7 +3318,7 @@ func TestManageRoleReplicasRoleRecreateMissingPodsDeletesRole(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, controller.podsInformer.GetIndexer().Add(entryPod))
 
-	require.NoError(t, controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, role, 0, revision, nil, true))
+	require.NoError(t, controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, role, 0, revision, nil, true, false))
 	require.Equal(t, datastore.RoleDeleting, controller.store.GetRoleStatus(nsn, groupName, roleName, roleID))
 	h.expectQueuedKey(namespacedKey(ms.Namespace, ms.Name))
 }
@@ -3251,7 +3362,7 @@ func TestManageRoleReplicasRoleRecreateCreatingRoleCompletesPods(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, controller.podsInformer.GetIndexer().Add(entryPod))
 
-	require.NoError(t, controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, role, 0, revision, nil, true))
+	require.NoError(t, controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, role, 0, revision, nil, true, false))
 	require.Equal(t, datastore.RoleCreating, controller.store.GetRoleStatus(nsn, groupName, roleName, roleID))
 	pods, err := h.kubeClient.CoreV1().Pods(ms.Namespace).List(context.Background(), metav1.ListOptions{LabelSelector: labels.SelectorFromSet(map[string]string{
 		workloadv1alpha1.GroupNameLabelKey: groupName,
@@ -3336,7 +3447,7 @@ func TestManageRoleReplicasUsesMaxSurgeDuringRoleRollingUpdate(t *testing.T) {
 		controller.store.AddRole(key, groupName, "decode", utils.GenerateRoleID("decode", ordinal), "old-revision", "old-hash")
 	}
 
-	err = controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, "new-revision", nil, true)
+	err = controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, "new-revision", nil, true, false)
 	require.NoError(t, err)
 
 	roles, err := controller.store.GetRoleList(key, groupName, "decode")
@@ -3435,6 +3546,7 @@ func TestManageRoleReplicasCombinesMaxSurgeAndCoordinationGate(t *testing.T) {
 				"new-revision",
 				nil,
 				tt.allowTargetStart,
+				false,
 			)
 			require.NoError(t, err)
 

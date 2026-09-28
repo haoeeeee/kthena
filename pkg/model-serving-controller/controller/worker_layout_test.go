@@ -77,7 +77,7 @@ func TestWorkerLayoutKeepsUnselectedInstance(t *testing.T) {
 				client := c.kubeClientSet.(*kubefake.Clientset)
 				client.ClearActions()
 				ctx := c.withRevisionHistory(context.Background(), ms)
-				require.NoError(t, c.manageRoleReplicasPerGroup(ctx, ms, "layout-0", ms.Spec.Template.Roles[0], 0, utils.ModelServingRevision(ms), nil, true))
+				require.NoError(t, c.manageRoleReplicasPerGroup(ctx, ms, "layout-0", ms.Spec.Template.Roles[0], 0, utils.ModelServingRevision(ms), nil, true, false))
 				for _, a := range client.Actions() {
 					if a.GetResource().Resource == "pods" {
 						require.NotContains(t, []string{"create", "delete", "delete-collection"}, a.GetVerb())
@@ -100,7 +100,7 @@ func TestWorkerLayoutRecoversMissingOrdinalWithOldTemplate(t *testing.T) {
 	extra.Name = "layout-0-prefill-0-9"
 	extra.UID = "extra"
 	require.NoError(t, c.podsInformer.GetIndexer().Add(extra))
-	require.NoError(t, c.manageRoleReplicasPerGroup(context.Background(), ms, "layout-0", ms.Spec.Template.Roles[0], 0, utils.ModelServingRevision(ms), nil, true))
+	require.NoError(t, c.manageRoleReplicasPerGroup(context.Background(), ms, "layout-0", ms.Spec.Template.Roles[0], 0, utils.ModelServingRevision(ms), nil, true, false))
 	restored, err := c.kubeClientSet.CoreV1().Pods(ms.Namespace).Get(context.Background(), pods[1].Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Equal(t, "legacy", utils.ObjectRevision(restored))

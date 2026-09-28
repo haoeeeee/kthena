@@ -1054,10 +1054,11 @@ func (c *ModelServingController) syncRoleReplicas(
 			}
 		}
 
+		preserveObservedReplicas := isServingGroupRollingUpdate && useRecordedRoles && !isPartitionProtected
 		for _, targetRole := range rolesToManage {
 			if err := c.manageRoleReplicasPerGroup(
 				ctx, ms, servingGroup.Name, targetRole, servingGroupOrdinal, revisionToUse, chain,
-				rolloutPolicy.allowTargetStart(servingGroup.Name, targetRole.Name),
+				rolloutPolicy.allowTargetStart(servingGroup.Name, targetRole.Name), preserveObservedReplicas,
 			); err != nil {
 				if isRevisionResolutionError(err) {
 					continue
@@ -1319,6 +1320,7 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(
 	newRevision string,
 	chain *plugins.Chain,
 	allowTargetStart bool,
+	preserveObservedReplicas bool,
 ) error {
 	// TODO: add podGroup update after gang scheduler finished
 	// Get all replicas of a role from storage, for example, prefill-0, prefill-1...
@@ -1328,6 +1330,12 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(
 	}
 
 	expectedCount := roleReplicas(targetRole)
+	if preserveObservedReplicas {
+		// Replica counts are not part of the template revision. Preserve the
+		// observed count while this old group awaits replacement, rather than
+		// resurrecting replicas from a stale historical snapshot.
+		expectedCount = len(roleList)
+	}
 	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate &&
 		c.hasUpdateableOutdatedRole(ctx, ms, groupName, targetRole, roleList) {
 		maxSurge, err := utils.GetMaxSurgeForRole(targetRole)
