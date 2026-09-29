@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -136,16 +137,22 @@ func validateRoleCoordination(ms *workloadv1alpha1.ModelServing) field.ErrorList
 	return allErrs
 }
 
-// validateRoleCoordinationUpdate rejects updates whose dependency graph cannot
-// produce target-version capacity from the stable Role population. It is
-// intentionally update-only: the old Role templates and replica counts define
-// both the old request path and the replacement population.
+// validateRoleCoordinationUpdate keeps the coordination policy immutable after
+// ModelServing creation and checks that changed dependencies can start target
+// capacity while preserving the old request path.
 func validateRoleCoordinationUpdate(
 	oldMS, newMS *workloadv1alpha1.ModelServing,
 ) field.ErrorList {
 	var allErrs field.ErrorList
+	if oldMS == nil {
+		return allErrs
+	}
+	if !apiequality.Semantic.DeepEqual(roleCoordination(oldMS), roleCoordination(newMS)) {
+		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec", "rolloutStrategy", "roleCoordination"),
+			"roleCoordination is immutable after ModelServing creation"))
+	}
 	coordination := roleCoordination(newMS)
-	if oldMS == nil || coordination == nil {
+	if coordination == nil {
 		return allErrs
 	}
 

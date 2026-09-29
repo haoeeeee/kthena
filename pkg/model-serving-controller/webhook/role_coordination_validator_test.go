@@ -290,4 +290,79 @@ func TestValidateRoleCoordinationUpdateCapacity(t *testing.T) {
 
 		assert.Empty(t, validateRoleCoordinationUpdate(oldMS, newMS))
 	})
+
+	t.Run("configured coordination settings are immutable", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			mutate func(*workloadv1alpha1.ModelServing)
+		}{
+			{
+				name: "maxSkew",
+				mutate: func(ms *workloadv1alpha1.ModelServing) {
+					value := intstr.FromString("20%")
+					ms.Spec.RolloutStrategy.RoleCoordination.MaxSkew = &value
+				},
+			},
+			{
+				name: "dependencies",
+				mutate: func(ms *workloadv1alpha1.ModelServing) {
+					ms.Spec.RolloutStrategy.RoleCoordination.Dependencies = []workloadv1alpha1.RoleRolloutDependency{
+						{Role: "a", DependsOn: []string{"c"}},
+					}
+				},
+			},
+			{
+				name: "participating Roles",
+				mutate: func(ms *workloadv1alpha1.ModelServing) {
+					ms.Spec.RolloutStrategy.RoleCoordination.Roles = []string{"a", "b"}
+				},
+			},
+			{
+				name: "remove coordination",
+				mutate: func(ms *workloadv1alpha1.ModelServing) {
+					ms.Spec.RolloutStrategy.RoleCoordination = nil
+				},
+			},
+		}
+		for _, phase := range []string{"in progress", "complete"} {
+			for _, tt := range tests {
+				t.Run(phase+"/"+tt.name, func(t *testing.T) {
+					oldMS := modelServing("new", 2)
+					if phase == "in progress" {
+						activeRollout(oldMS)
+					} else {
+						oldMS.Generation = 2
+						oldMS.Status.ObservedGeneration = 2
+						oldMS.Status.Conditions = []metav1.Condition{{
+							Type:   string(workloadv1alpha1.ModelServingCoordinatedRoleRolloutBlocked),
+							Reason: "RolloutComplete",
+						}}
+					}
+					newMS := oldMS.DeepCopy()
+					tt.mutate(newMS)
+					errs := validateRoleCoordinationUpdate(oldMS, newMS)
+					require.NotEmpty(t, errs)
+					assert.Contains(t, errs.ToAggregate().Error(), "roleCoordination is immutable after ModelServing creation")
+				})
+			}
+		}
+	})
+
+	t.Run("coordination cannot be configured for the first time on update", func(t *testing.T) {
+		oldMS := modelServing("new", 2)
+		oldMS.Spec.RolloutStrategy.RoleCoordination = nil
+		newMS := oldMS.DeepCopy()
+		newMS.Spec.RolloutStrategy.RoleCoordination = modelServing("new", 2).Spec.RolloutStrategy.RoleCoordination
+		errs := validateRoleCoordinationUpdate(oldMS, newMS)
+		require.NotEmpty(t, errs)
+		assert.Contains(t, errs.ToAggregate().Error(), "roleCoordination is immutable after ModelServing creation")
+	})
+
+	t.Run("Role template can change without changing coordination settings", func(t *testing.T) {
+		oldMS := modelServing("new", 2)
+		activeRollout(oldMS)
+		newMS := oldMS.DeepCopy()
+		newMS.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "newer"
+		assert.Empty(t, validateRoleCoordinationUpdate(oldMS, newMS))
+	})
 }
