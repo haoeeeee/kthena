@@ -62,8 +62,12 @@ func validateRoleCoordination(ms *workloadv1alpha1.ModelServing) field.ErrorList
 	}
 
 	roleNames := make(map[string]struct{}, len(ms.Spec.Template.Roles))
-	for _, role := range ms.Spec.Template.Roles {
+	roleByName := make(map[string]workloadv1alpha1.Role, len(ms.Spec.Template.Roles))
+	roleIndexByName := make(map[string]int, len(ms.Spec.Template.Roles))
+	for i, role := range ms.Spec.Template.Roles {
 		roleNames[role.Name] = struct{}{}
+		roleByName[role.Name] = role
+		roleIndexByName[role.Name] = i
 	}
 
 	selectedRoles := make(map[string]struct{}, len(roleNames))
@@ -132,7 +136,54 @@ func validateRoleCoordination(ms *workloadv1alpha1.ModelServing) field.ErrorList
 	if roleDependencyGraphHasCycle(graph, selectedRoles) {
 		allErrs = append(allErrs, field.Invalid(dependenciesPath, coordination.Dependencies, "dependency graph must be acyclic"))
 	}
+	allErrs = append(allErrs, validateDependencyPartitions(coordination, selectedRoles, roleByName, roleIndexByName)...)
 
+	return allErrs
+}
+
+// validateDependencyPartitions ensures that an old caller intentionally kept
+// by partition always has old dependency capacity to call. Direct-edge
+// validation naturally propagates the requirement through a dependency chain.
+func validateDependencyPartitions(
+	coordination *workloadv1alpha1.RoleCoordination,
+	selectedRoles map[string]struct{},
+	roleByName map[string]workloadv1alpha1.Role,
+	roleIndexByName map[string]int,
+) field.ErrorList {
+	var allErrs field.ErrorList
+	rolesPath := field.NewPath("spec", "template", "roles")
+	for _, dependency := range coordination.Dependencies {
+		caller, callerExists := roleByName[dependency.Role]
+		if !callerExists {
+			continue
+		}
+		if _, selected := selectedRoles[dependency.Role]; !selected {
+			continue
+		}
+		callerPartition, err := resolvedRolePartition(caller)
+		if err != nil || callerPartition == 0 {
+			continue
+		}
+		for _, dependencyRoleName := range dependency.DependsOn {
+			dependencyRole, dependencyExists := roleByName[dependencyRoleName]
+			if !dependencyExists {
+				continue
+			}
+			if _, selected := selectedRoles[dependencyRoleName]; !selected {
+				continue
+			}
+			dependencyPartition, err := resolvedRolePartition(dependencyRole)
+			if err != nil || dependencyPartition > 0 {
+				continue
+			}
+			allErrs = append(allErrs, field.Invalid(
+				rolesPath.Index(roleIndexByName[dependencyRoleName]).Child("partition"),
+				dependencyRole.Partition,
+				fmt.Sprintf("dependency Role %q must retain at least one old replica because dependent Role %q has partition %d; set its partition to at least 1 or set the dependent Role partition to 0",
+					dependencyRoleName, dependency.Role, callerPartition),
+			))
+		}
+	}
 	return allErrs
 }
 

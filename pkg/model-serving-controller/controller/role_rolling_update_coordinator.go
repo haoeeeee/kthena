@@ -45,8 +45,11 @@ type coordinatedRoleState struct {
 	startedCount  int
 	readyCount    int
 	targetState   targetVersionState
-	hasOldVersion bool
-	inProgress    bool
+	// hasUpdateableOld deliberately excludes old replicas below userPartition:
+	// those replicas are the user's completed rollout target, not callers that
+	// should keep a dependency's last old replica alive.
+	hasUpdateableOld bool
+	inProgress       bool
 }
 
 type targetVersionState uint8
@@ -357,7 +360,7 @@ func (c *ModelServingController) resolveRoleRolloutState(
 	hasTargetWork := false
 	hasTargetReady := false
 	remainingOldToUpdate := 0
-	hasOldVersion := false
+	hasUpdateableOld := false
 	for _, role := range roleList {
 		_, ordinal := utils.GetParentNameAndOrdinal(role.Name)
 		if ordinal < 0 {
@@ -367,9 +370,11 @@ func (c *ModelServingController) resolveRoleRolloutState(
 		observedHash, resolved := c.resolveRoleTemplateHashForComparison(ms, servingGroup, roleSpec.Name, role)
 		oldVersion := !resolved || observedHash != expectedHash
 		if oldVersion {
-			hasOldVersion = true
-			if role.Status != datastore.RoleDeleting && inStableRange {
-				remainingOldToUpdate++
+			if inStableRange {
+				hasUpdateableOld = true
+				if role.Status != datastore.RoleDeleting {
+					remainingOldToUpdate++
+				}
 			}
 			continue
 		}
@@ -391,15 +396,9 @@ func (c *ModelServingController) resolveRoleRolloutState(
 		if ordinal < 0 {
 			continue
 		}
-		if hash == "" || hash != expectedHash {
-			hasOldVersion = true
+		if (hash == "" || hash != expectedHash) && ordinal >= partition && ordinal < stableEnd {
+			hasUpdateableOld = true
 		}
-	}
-	// A user partition preserves old-version stable slots. Keep the old-version
-	// request path present even if a protected Role is temporarily absent while
-	// its old template is being recovered.
-	if templateChanged && min(partition, stableEnd) > 0 {
-		hasOldVersion = true
 	}
 
 	startedCount := totalToUpdate - min(totalToUpdate, remainingOldToUpdate)
@@ -412,14 +411,14 @@ func (c *ModelServingController) resolveRoleRolloutState(
 	}
 
 	return coordinatedRoleState{
-		roleName:      roleSpec.Name,
-		userPartition: partition,
-		totalToUpdate: totalToUpdate,
-		startedCount:  startedCount,
-		readyCount:    readyCount,
-		targetState:   targetState,
-		hasOldVersion: hasOldVersion,
-		inProgress:    templateChanged && totalToUpdate > 0 && readyCount < totalToUpdate,
+		roleName:         roleSpec.Name,
+		userPartition:    partition,
+		totalToUpdate:    totalToUpdate,
+		startedCount:     startedCount,
+		readyCount:       readyCount,
+		targetState:      targetState,
+		hasUpdateableOld: hasUpdateableOld,
+		inProgress:       templateChanged && totalToUpdate > 0 && readyCount < totalToUpdate,
 	}
 }
 
@@ -573,6 +572,7 @@ func calculateRoleRolloutLimits(
 	}
 
 	baseline := slowestReadyProgress(states)
+	retainedTails := retainedDependencyTails(stateByName, dependents)
 	progressingRoleCount := 0
 	for i := range states {
 		if states[i].inProgress && states[i].totalToUpdate > 0 {
@@ -611,6 +611,10 @@ func calculateRoleRolloutLimits(
 			allowedStarted := state.totalToUpdate
 			if progressingRoleCount > 1 {
 				allowedStarted = allowedStartedReplicas(*state, baseline, maxSkewPercent)
+				if allowedStarted < state.totalToUpdate && state.startedCount >= allowedStarted &&
+					maxSkewBlockedOnlyByRetainedDependencies(state.roleName, states, baseline, dependencies, retainedTails) {
+					allowedStarted = state.totalToUpdate
+				}
 			}
 			// userPartition is already included in totalToUpdate, so this is the
 			// final proportional boundary rather than an independent partition to
@@ -629,7 +633,7 @@ func calculateRoleRolloutLimits(
 		// Keep one old dependency while a direct old-version caller remains.
 		// A user partition of at least one already provides this boundary.
 		oldDependents := oldDirectDependents(state.roleName, stateByName, dependents)
-		if state.hasOldVersion && state.userPartition == 0 && len(oldDependents) > 0 {
+		if state.hasUpdateableOld && state.userPartition == 0 && len(oldDependents) > 0 {
 			limits.retainOldReplica = true
 			retentionIsBinding := limits.effectivePartition == 0
 			limits.effectivePartition = max(limits.effectivePartition, 1)
@@ -686,6 +690,66 @@ func allowedStartedReplicas(state, baseline coordinatedRoleState, maxSkewPercent
 	return allowed
 }
 
+func retainedDependencyTails(
+	states map[string]*coordinatedRoleState,
+	dependents map[string][]string,
+) map[string]bool {
+	// A retained tail has completed every replacement except the one old
+	// replica held for an updateable old caller. Once its target capacity is
+	// Ready, that artificial tail must not make the caller wait on maxSkew
+	// forever.
+	retained := make(map[string]bool)
+	for roleName, state := range states {
+		if state == nil || !state.inProgress || state.userPartition != 0 || !state.hasUpdateableOld ||
+			state.totalToUpdate <= 0 || state.targetState != targetReady ||
+			state.startedCount != state.readyCount || state.startedCount != state.totalToUpdate-1 {
+			continue
+		}
+		if len(oldDirectDependents(roleName, states, dependents)) > 0 {
+			retained[roleName] = true
+		}
+	}
+	return retained
+}
+
+func maxSkewBlockedOnlyByRetainedDependencies(
+	roleName string,
+	states []coordinatedRoleState,
+	baseline coordinatedRoleState,
+	dependencies map[string][]string,
+	retainedTails map[string]bool,
+) bool {
+	// The exception is deliberately narrow: every Role defining the slowest
+	// progress must be a retained dependency of this Role. An unrelated slow
+	// Role, or dependency work that is not Ready, keeps the normal maxSkew gate.
+	dependencyClosure := make(map[string]bool)
+	var visit func(string)
+	visit = func(current string) {
+		for _, dependency := range dependencies[current] {
+			if dependencyClosure[dependency] {
+				continue
+			}
+			dependencyClosure[dependency] = true
+			visit(dependency)
+		}
+	}
+	visit(roleName)
+
+	foundSlowest := false
+	for i := range states {
+		state := &states[i]
+		if !state.inProgress || state.totalToUpdate <= 0 ||
+			int64(state.readyCount)*int64(baseline.totalToUpdate) != int64(baseline.readyCount)*int64(state.totalToUpdate) {
+			continue
+		}
+		foundSlowest = true
+		if !dependencyClosure[state.roleName] || !retainedTails[state.roleName] {
+			return false
+		}
+	}
+	return foundSlowest
+}
+
 func oldDirectDependents(
 	roleName string,
 	states map[string]*coordinatedRoleState,
@@ -694,7 +758,7 @@ func oldDirectDependents(
 	var oldDependents []string
 	for _, dependentRole := range dependents[roleName] {
 		dependent := states[dependentRole]
-		if dependent != nil && dependent.hasOldVersion {
+		if dependent != nil && dependent.hasUpdateableOld {
 			oldDependents = append(oldDependents, dependentRole)
 		}
 	}

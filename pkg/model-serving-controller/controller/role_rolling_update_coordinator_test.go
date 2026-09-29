@@ -130,7 +130,7 @@ func TestResolveRoleRolloutStateUsesPartitionAndReservesStartedSlots(t *testing.
 	assert.Equal(t, 2, state.startedCount)
 	assert.Equal(t, 1, state.readyCount)
 	assert.Equal(t, targetReady, state.targetState)
-	assert.True(t, state.hasOldVersion)
+	assert.False(t, state.hasUpdateableOld)
 }
 
 func TestResolveRoleRolloutStateUsesExactRolloutOrdinalRange(t *testing.T) {
@@ -158,7 +158,7 @@ func TestResolveRoleRolloutStateUsesExactRolloutOrdinalRange(t *testing.T) {
 	assert.Equal(t, 2, state.totalToUpdate)
 	assert.Equal(t, 1, state.startedCount)
 	assert.Equal(t, 1, state.readyCount)
-	assert.True(t, state.hasOldVersion)
+	assert.True(t, state.hasUpdateableOld)
 }
 
 func TestResolveRoleRolloutStateReconstructsTerminatingOldReplica(t *testing.T) {
@@ -185,7 +185,7 @@ func TestResolveRoleRolloutStateReconstructsTerminatingOldReplica(t *testing.T) 
 	assert.Equal(t, 2, state.totalToUpdate)
 	assert.Equal(t, 2, state.startedCount)
 	assert.Equal(t, 1, state.readyCount)
-	assert.True(t, state.hasOldVersion)
+	assert.True(t, state.hasUpdateableOld)
 }
 
 func TestTerminatingRoleReplicasReadsPodInformerAfterRestart(t *testing.T) {
@@ -381,7 +381,7 @@ func TestResolveRoleRolloutStateRetainsMissingPartitionProtectedOldSlot(t *testi
 	assert.Equal(t, 1, state.totalToUpdate)
 	assert.Equal(t, 1, state.startedCount)
 	assert.Equal(t, 1, state.readyCount)
-	assert.True(t, state.hasOldVersion)
+	assert.False(t, state.hasUpdateableOld)
 }
 
 func TestResolveRoleRolloutPolicyAppliesDependencyAndSkew(t *testing.T) {
@@ -632,8 +632,8 @@ func TestCalculateRoleRolloutLimitsUsesUserPartitionAsCompletionFloor(t *testing
 		{Role: "a", DependsOn: []string{"b"}},
 	}
 	states := []coordinatedRoleState{
-		{roleName: "a", userPartition: 1, totalToUpdate: 3, startedCount: 2, readyCount: 2, targetState: targetReady, hasOldVersion: true, inProgress: true},
-		{roleName: "b", userPartition: 2, totalToUpdate: 2, startedCount: 1, readyCount: 1, targetState: targetReady, hasOldVersion: true, inProgress: true},
+		{roleName: "a", userPartition: 1, totalToUpdate: 3, startedCount: 2, readyCount: 2, targetState: targetReady, hasUpdateableOld: true, inProgress: true},
+		{roleName: "b", userPartition: 2, totalToUpdate: 2, startedCount: 1, readyCount: 1, targetState: targetReady, hasUpdateableOld: true, inProgress: true},
 	}
 
 	decision, err := calculateRoleRolloutLimits(states, coordination)
@@ -642,11 +642,110 @@ func TestCalculateRoleRolloutLimitsUsesUserPartitionAsCompletionFloor(t *testing
 
 	states[0].readyCount = states[0].totalToUpdate
 	states[0].startedCount = states[0].totalToUpdate
-	states[0].hasOldVersion = false
+	states[0].hasUpdateableOld = false
 	states[0].inProgress = false
 	decision, err = calculateRoleRolloutLimits(states, coordination)
 	require.NoError(t, err)
 	assert.Equal(t, 2, decision.roles["b"].effectivePartition)
+}
+
+func TestCalculateRoleRolloutLimitsIgnoresPartitionProtectedOldDependents(t *testing.T) {
+	coordination := coordinationForTest("20%")
+	coordination.Dependencies = []workloadv1alpha1.RoleRolloutDependency{
+		{Role: "p", DependsOn: []string{"d"}},
+	}
+	states := []coordinatedRoleState{
+		{
+			roleName:         "p",
+			userPartition:    2,
+			totalToUpdate:    2,
+			startedCount:     2,
+			readyCount:       2,
+			targetState:      targetReady,
+			hasUpdateableOld: false,
+		},
+		{
+			roleName:         "d",
+			totalToUpdate:    4,
+			startedCount:     3,
+			readyCount:       3,
+			targetState:      targetReady,
+			hasUpdateableOld: true,
+			inProgress:       true,
+		},
+	}
+
+	decision, err := calculateRoleRolloutLimits(states, coordination)
+	require.NoError(t, err)
+	assert.Zero(t, decision.roles["d"].effectivePartition)
+	assert.Equal(t, 1, decision.roles["d"].remainingDeletions)
+	assert.False(t, decision.roles["d"].retainOldReplica)
+}
+
+func TestCalculateRoleRolloutLimitsReleasesMaxSkewDependencyTail(t *testing.T) {
+	coordination := coordinationForTest("10%")
+	coordination.Dependencies = []workloadv1alpha1.RoleRolloutDependency{
+		{Role: "p", DependsOn: []string{"d"}},
+	}
+	states := []coordinatedRoleState{
+		{
+			roleName:         "p",
+			totalToUpdate:    8,
+			startedCount:     7,
+			readyCount:       7,
+			targetState:      targetReady,
+			hasUpdateableOld: true,
+			inProgress:       true,
+		},
+		{
+			roleName:         "d",
+			totalToUpdate:    4,
+			startedCount:     3,
+			readyCount:       3,
+			targetState:      targetReady,
+			hasUpdateableOld: true,
+			inProgress:       true,
+		},
+	}
+
+	decision, err := calculateRoleRolloutLimits(states, coordination)
+	require.NoError(t, err)
+	assert.Zero(t, decision.roles["p"].effectivePartition)
+	assert.Equal(t, 1, decision.roles["p"].remainingDeletions)
+	assert.Equal(t, 1, decision.roles["d"].effectivePartition)
+	assert.True(t, decision.roles["d"].retainOldReplica)
+}
+
+func TestCalculateRoleRolloutLimitsDoesNotReleaseUnsafeDependencyTail(t *testing.T) {
+	coordination := coordinationForTest("10%")
+	coordination.Dependencies = []workloadv1alpha1.RoleRolloutDependency{
+		{Role: "p", DependsOn: []string{"d"}},
+	}
+
+	t.Run("dependency still has target work waiting for Ready", func(t *testing.T) {
+		states := []coordinatedRoleState{
+			{roleName: "p", totalToUpdate: 8, startedCount: 7, readyCount: 7, targetState: targetReady, hasUpdateableOld: true, inProgress: true},
+			{roleName: "d", totalToUpdate: 4, startedCount: 3, readyCount: 2, targetState: targetReady, hasUpdateableOld: true, inProgress: true},
+		}
+
+		decision, err := calculateRoleRolloutLimits(states, coordination)
+		require.NoError(t, err)
+		assert.Zero(t, decision.roles["p"].remainingDeletions)
+		assert.NotZero(t, decision.roles["p"].effectivePartition)
+	})
+
+	t.Run("an unrelated slow Role still enforces maxSkew", func(t *testing.T) {
+		states := []coordinatedRoleState{
+			{roleName: "p", totalToUpdate: 8, startedCount: 7, readyCount: 7, targetState: targetReady, hasUpdateableOld: true, inProgress: true},
+			{roleName: "d", totalToUpdate: 4, startedCount: 3, readyCount: 3, targetState: targetReady, hasUpdateableOld: true, inProgress: true},
+			{roleName: "q", totalToUpdate: 4, startedCount: 3, readyCount: 3, targetState: targetReady, hasUpdateableOld: true, inProgress: true},
+		}
+
+		decision, err := calculateRoleRolloutLimits(states, coordination)
+		require.NoError(t, err)
+		assert.Zero(t, decision.roles["p"].remainingDeletions)
+		assert.Equal(t, 1, decision.roles["p"].effectivePartition)
+	})
 }
 
 func TestCalculateRoleRolloutLimitsDoesNotBypassMaxSkewAtCompletion(t *testing.T) {
@@ -746,13 +845,13 @@ func newCoordinatedRoleStateForTest(roleName string, total, ready, inFlight int)
 		targetState = targetStarted
 	}
 	return coordinatedRoleState{
-		roleName:      roleName,
-		totalToUpdate: total,
-		startedCount:  started,
-		readyCount:    ready,
-		targetState:   targetState,
-		hasOldVersion: ready < total,
-		inProgress:    total > 0 && ready < total,
+		roleName:         roleName,
+		totalToUpdate:    total,
+		startedCount:     started,
+		readyCount:       ready,
+		targetState:      targetState,
+		hasUpdateableOld: started < total,
+		inProgress:       total > 0 && ready < total,
 	}
 }
 

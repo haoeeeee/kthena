@@ -110,6 +110,32 @@ func TestValidateRoleCoordination(t *testing.T) {
 			},
 			expectedSubstring: "at least two Roles",
 		},
+		{
+			name: "partitioned caller requires partitioned dependency",
+			mutate: func(ms *workloadv1alpha1.ModelServing) {
+				partition := intstr.FromInt(1)
+				ms.Spec.Template.Roles[0].Partition = &partition
+			},
+			expectedSubstring: "dependency Role \"b\" must retain at least one old replica because dependent Role \"a\" has partition 1",
+		},
+		{
+			name: "partition requirement propagates through dependency chain",
+			mutate: func(ms *workloadv1alpha1.ModelServing) {
+				partition := intstr.FromInt(1)
+				ms.Spec.Template.Roles[0].Partition = &partition
+				ms.Spec.Template.Roles[1].Partition = &partition
+			},
+			expectedSubstring: "dependency Role \"c\" must retain at least one old replica because dependent Role \"b\" has partition 1",
+		},
+		{
+			name: "aligned dependency partitions are accepted",
+			mutate: func(ms *workloadv1alpha1.ModelServing) {
+				partition := intstr.FromInt(1)
+				for i := range ms.Spec.Template.Roles {
+					ms.Spec.Template.Roles[i].Partition = &partition
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
