@@ -47,47 +47,41 @@ Controller 版本一致。
 
 #### ServingGroup 级扩缩容
 
-以下配置根据 Pod 指标修改 `llama-serving.spec.replicas`：
+以下配置以 `vllm:num_requests_waiting` 为指标，修改
+`vllm-modelserving.spec.replicas`：
 
 ```yaml
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: AutoscalingPolicy
 metadata:
-  name: llama-scaling-policy
+  name: vllm-servinggroup-scaling-policy
   namespace: default
 spec:
   metrics:
-    - name: queue_depth
-      targetValue: "10"
+    - name: "vllm:num_requests_waiting"
+      targetValue: "100"
   tolerancePercent: 10
   behavior:
     scaleUp:
       stablePolicy:
         period: 30s
         stabilizationWindow: 1m
-        instances: 2
-        percent: 100
-        selectPolicy: Or
       panicPolicy:
         period: 5s
-        percent: 200
-        panicThresholdPercent: 200
-        panicModeHold: 1m
+        panicThresholdPercent: 150
+        panicModeHold: 5m
     scaleDown:
       period: 1m
       stabilizationWindow: 5m
-      instances: 1
-      percent: 100
-      selectPolicy: Or
   homogeneousTarget:
-    minReplicas: 1
-    maxReplicas: 10
+    minReplicas: 2
+    maxReplicas: 8
     target:
       targetRef:
         kind: ModelServing
-        name: llama-serving
+        name: vllm-modelserving
       metricSources:
-        queue_depth:
+        "vllm:num_requests_waiting":
           pod:
             name: vllm:num_requests_waiting
             uri: /metrics
@@ -96,14 +90,14 @@ spec:
 
 #### Role 级扩缩容
 
-以下配置根据 Pod 指标修改 `pd-serving` 中 `decode` Role 的
-`replicas`：
+以下配置以 `vllm:num_requests_waiting` 为指标，修改
+`vllm-modelserving` 中 `decode` Role 的 `replicas`：
 
 ```yaml
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: AutoscalingPolicy
 metadata:
-  name: decode-scaling-policy
+  name: vllm-decode-scaling-policy
   namespace: default
 spec:
   tolerancePercent: 10
@@ -114,24 +108,24 @@ spec:
         stabilizationWindow: 1m
       panicPolicy:
         period: 5s
-        panicThresholdPercent: 200
-        panicModeHold: 1m
+        panicThresholdPercent: 150
+        panicModeHold: 5m
     scaleDown:
       period: 1m
       stabilizationWindow: 5m
   disaggregatedTarget:
     targetRef:
       kind: ModelServing
-      name: pd-serving
+      name: vllm-modelserving
     roles:
       decode:
-        minReplicas: 1
+        minReplicas: 2
         maxReplicas: 8
         metrics:
-          - name: decode_queue
-            targetValue: "10"
+          - name: "vllm:num_requests_waiting"
+            targetValue: "100"
         metricSources:
-          decode_queue:
+          "vllm:num_requests_waiting":
             pod:
               name: vllm:num_requests_waiting
               uri: /metrics
