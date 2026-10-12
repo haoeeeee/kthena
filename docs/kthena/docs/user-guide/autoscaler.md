@@ -2,14 +2,24 @@
 
 ## Overview
 
-The Kthena Autoscaler dynamically adjusts serving instances based on real-time workload metrics to ensure optimal performance and resource utilization. It supports two distinct configuration modes:
+The Kthena Autoscaler dynamically adjusts serving instances based on real-time workload metrics to ensure optimal performance and resource utilization. It supports three target modes:
 
 - **Homogeneous Target**: Manages serving instances with identical configurations, ensuring stable performance while optimizing resource utilization
 - **Heterogeneous Target**: Optimizes across multiple instance types with different resource requirements and capabilities, achieving cost-efficiency through intelligent scheduling algorithms
+- **Disaggregated Target**: Scales one or two roles inside a `ModelServing` independently, with an optional replica-ratio constraint between two roles
 
-Both modes use the same core autoscaling mechanisms but differ in their resource targeting and management approaches.
+All three modes use the same scaling behavior controls but differ in their target granularity and recommendation logic.
 
 ## Configuration Guide
+
+:::info Migrating from an earlier Kthena version
+
+Earlier versions used both `AutoscalingPolicy` and
+`AutoscalingPolicyBinding`. Current versions use a single
+`AutoscalingPolicy`. See [Autoscaler API Migration](./autoscaler-api-migration.md)
+for before-and-after examples and migration steps.
+
+:::
 
 The autoscaler is configured through a single custom resource:
 
@@ -54,11 +64,13 @@ An `AutoscalingPolicy` declares exactly one scaling target directly in its `spec
 spec:
   # ... metrics, tolerancePercent, behavior ...
 
-  # Select EITHER homogeneousTarget OR heterogeneousTarget mode, not both
+  # Select exactly one target mode
   homogeneousTarget:
     # Homogeneous Target mode configuration
   heterogeneousTarget:
     # Heterogeneous Target mode configuration
+  disaggregatedTarget:
+    # Role-level target configuration
 ```
 
 #### Homogeneous Target Mode
@@ -71,7 +83,7 @@ Configures autoscaling for a single instance type:
     - **name**: For `ModelServing`, use the serving name, e.g. `example-model-serving`
   - **metricSources**: Map of metric name to its collection source (`Pod` or `Prometheus`). The map keys must match the metric names declared in `spec.metrics`.
 - **minReplicas**: Minimum number of instances to maintain, ensuring baseline availability
-  - Must be greater than or equal to 1
+  - Must be greater than or equal to 0
   - Sets a floor on scaling operations to prevent scaling down below this threshold
 - **maxReplicas**: Maximum number of instances allowed, controlling resource consumption
   - Must be greater than or equal to 1
@@ -104,6 +116,19 @@ Configures autoscaling across multiple instance types with cost optimization:
     - Higher values represent more expensive instance types
 
 The heterogeneous mode's optimization algorithm automatically determines the optimal combination of instance types to balance performance requirements against cost constraints, always respecting the defined minReplicas and maxReplicas boundaries for each instance type.
+
+#### Disaggregated Target Mode
+
+Configures autoscaling for one or two roles in a single `ModelServing`:
+
+- **targetRef**: References the `ModelServing` that contains the roles
+- **roles**: Maps each target role name to its scaling configuration
+  - **minReplicas** and **maxReplicas** bound the role's `replicas`
+  - **metrics** defines role-specific scaling signals; when omitted, the role inherits top-level `spec.metrics`
+  - **metricSources** defines how each effective metric is collected
+- **ratioConstraint**: Optionally constrains the replica ratio between two roles
+
+A role with equal, non-zero `minReplicas` and `maxReplicas` is fixed at that size and does not require metrics. When `ratioConstraint` is configured, both referenced roles must be present in `roles`.
 
 ### Configuration Examples
 
@@ -205,6 +230,50 @@ spec:
       cost: 30
 ```
 
+#### Role Target Example
+
+This example scales only the `decode` role in a `ModelServing`:
+
+```yaml showLineNumbers
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: AutoscalingPolicy
+metadata:
+  name: decode-scaling-policy
+spec:
+  tolerancePercent: 10
+  behavior:
+    scaleUp:
+      stablePolicy:
+        stabilizationWindow: 1m
+        period: 30s
+      panicPolicy:
+        period: 5s
+        panicThresholdPercent: 200
+        panicModeHold: 1m
+    scaleDown:
+      stabilizationWindow: 5m
+      period: 1m
+  disaggregatedTarget:
+    targetRef:
+      kind: ModelServing
+      name: example-model-serving
+    roles:
+      decode:
+        minReplicas: 1
+        maxReplicas: 8
+        metrics:
+          - name: decode_queue
+            targetValue: "10"
+        metricSources:
+          decode_queue:
+            pod:
+              name: vllm:num_requests_waiting
+              uri: /metrics
+              port: 8000
+```
+
+The controller updates the `replicas` field of the `decode` entry in `ModelServing.spec.template.roles[]`; it does not update `ModelServing.spec.replicas`.
+
 ## Monitoring and Verification
 
 This section describes how to monitor and verify that your autoscaling configurations are working correctly.
@@ -272,9 +341,10 @@ By following these monitoring and verification practices, you can ensure your au
 
 The Kthena Autoscaler provides powerful, flexible autoscaling capabilities for your serving workloads:
 
-- **Dual Modes**: Choose between homogeneous scaling (single instance type) or heterogeneous optimization (multiple instance types)
+- **Three Target Modes**: Choose whole-ModelServing, heterogeneous multi-ModelServing, or role-level scaling
 - **Precise Control**: Fine-tune scaling behavior with panic thresholds, stabilization windows, and tolerance ranges
 - **Cost Optimization**: Automatically balance performance and cost across different instance types
+- **Role-Level Scaling**: Scale one or two roles independently and optionally constrain their replica ratio
 - **Single-Resource UX**: Define the strategy, metrics, behavior, and target in one `AutoscalingPolicy`
 - **Custom Metrics**: Configure custom metric sources for specialized monitoring needs
 

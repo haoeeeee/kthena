@@ -52,6 +52,11 @@ const sidebars: SidebarsConfig = {
             id: 'user-guide/model-deployment',
           },
           items: [
+            {
+              type: 'doc',
+              label: 'ModelServing API',
+              id: 'user-guide/modelserving-api',
+            },
             'user-guide/lws-integration',
             'user-guide/modelserving-plugin-framework',
           ],
@@ -61,6 +66,16 @@ const sidebars: SidebarsConfig = {
           type: 'doc',
           label: 'Autoscaler',
           id: 'user-guide/autoscaler',
+        },
+        {
+          type: 'doc',
+          label: 'Autoscaler API Migration',
+          id: 'user-guide/autoscaler-api-migration',
+        },
+        {
+          type: 'doc',
+          label: 'Autoscaler Upgrade Guide',
+          id: 'user-guide/autoscaler-cr-cutover',
         },
         {
           type: 'category',
