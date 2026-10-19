@@ -444,6 +444,8 @@ spec:
     restartGracePeriodSeconds: 60
 ```
 
+完整的恢复策略、故障处理行为和配置示例参见[推理负载故障快速恢复](./modelserving-fault-recovery.md)。
+
 ## Gang 调度
 
 `gangPolicy.minRoleReplicas` 表示一个 ServingGroup 至少需要同时调度多少个指定 Role 实例。

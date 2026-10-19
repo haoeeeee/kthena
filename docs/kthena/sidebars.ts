@@ -57,6 +57,11 @@ const sidebars: SidebarsConfig = {
               label: 'ModelServing API',
               id: 'user-guide/modelserving-api',
             },
+            {
+              type: 'doc',
+              label: 'ModelServing Fault Recovery',
+              id: 'user-guide/modelserving-fault-recovery',
+            },
             'user-guide/lws-integration',
             'user-guide/modelserving-plugin-framework',
           ],
