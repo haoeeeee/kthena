@@ -119,15 +119,8 @@ func (c *ModelRouteController) processNextWorkItem() bool {
 		return true
 	}
 
-	if err := c.syncHandler(key); err != nil {
-		if c.workqueue.NumRequeues(key) < maxRetries {
-			klog.V(2).Infof("error syncing modelRoute %q: %s, requeuing", key, err.Error())
-			c.workqueue.AddRateLimited(key)
-			return true
-		}
-		klog.V(2).Infof("giving up on syncing modelRoute %q after %d retries: %s", key, maxRetries, err)
-		c.workqueue.Forget(obj)
-	}
+	err := c.syncHandler(key)
+	retryOrForget(c.workqueue, "modelRoute", key, err, klog.V(2).Infof)
 	return true
 }
 
@@ -155,7 +148,7 @@ func (c *ModelRouteController) syncHandler(key string) error {
 }
 
 func (c *ModelRouteController) enqueueModelRoute(obj interface{}) {
-	key, err := cache.MetaNamespaceKeyFunc(obj)
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		utilruntime.HandleError(err)
 		return

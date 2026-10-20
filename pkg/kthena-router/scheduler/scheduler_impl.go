@@ -18,6 +18,7 @@ package scheduler
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -145,15 +146,46 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 			return err
 		}
 
+		var decodeCandidates []*datastore.PodInfo
+		var prefillCandidates []*datastore.PodInfo
+		// PD session sticky: pin a complete Prefill/Decode pair, then skip Score
+		// (same as aggregated sticky). Half a pair is never preferred.
+		// 1. Require both sticky names; otherwise fall through to normal scoring.
+		if ctx.StickyPodName != "" && ctx.StickyPrefillPodName != "" {
+			// 2. Sticky decode must still be in the filtered decode list.
+			stickyDecodeIndex := slices.IndexFunc(decodePods, func(pod *datastore.PodInfo) bool {
+				return pod != nil && pod.Pod != nil && pod.Pod.Name == ctx.StickyPodName
+			})
+			if stickyDecodeIndex >= 0 {
+				stickyDecode := decodePods[stickyDecodeIndex]
+				// 3. Load prefills in the same PD group as that decode, then Filter them.
+				stickyPrefillPods, stickyErr := s.store.GetPrefillPodsForDecodeGroup(
+					ctx.ModelServerName, stickyDecode.GetPodNamespacedName())
+				if stickyErr == nil {
+					stickyPrefillPods, stickyErr = s.RunFilterPlugins(stickyPrefillPods, ctx)
+				}
+				// 4. Sticky prefill must still be selectable in that group.
+				stickyPrefillIndex := slices.IndexFunc(stickyPrefillPods, func(pod *datastore.PodInfo) bool {
+					return pod != nil && pod.Pod != nil && pod.Pod.Name == ctx.StickyPrefillPodName
+				})
+				if stickyErr == nil && stickyPrefillIndex >= 0 {
+					// 5. Both sides OK: pin only this pair and return (no Score, no topN fill).
+					ctx.DecodePods = []*datastore.PodInfo{stickyDecode}
+					ctx.PrefillPods = []*datastore.PodInfo{stickyPrefillPods[stickyPrefillIndex]}
+					return nil
+				}
+			}
+			// 6. Sticky miss (decode gone, prefill filtered, or group mismatch):
+			// clear names and score new pairs normally.
+			ctx.StickyPodName = ""
+			ctx.StickyPrefillPodName = ""
+		}
+
 		klog.V(4).Info("Running score plugins for decode pod")
 		scores := s.RunScorePlugins(decodePods, ctx)
-
 		topNDecodePods := TopNPodInfos(scores, topN)
-		ctx.DecodePods = topNDecodePods
-		prefillPods := make([]*datastore.PodInfo, len(topNDecodePods))
-		validPairs := 0
 
-		for i, decodePod := range ctx.DecodePods {
+		for _, decodePod := range topNDecodePods {
 			decodePodName := decodePod.GetPodNamespacedName()
 			if decodePodName.Name == "" {
 				continue
@@ -179,11 +211,12 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 					"decode instance", decodePodName)
 				continue
 			}
-			prefillPods[i] = bestPrefillPod[0]
-			validPairs++
+			decodeCandidates = append(decodeCandidates, decodePod)
+			prefillCandidates = append(prefillCandidates, bestPrefillPod[0])
 		}
-		ctx.PrefillPods = prefillPods
-		if validPairs == 0 {
+		ctx.DecodePods = decodeCandidates
+		ctx.PrefillPods = prefillCandidates
+		if len(decodeCandidates) == 0 {
 			return fmt.Errorf("no valid prefill-decode pod pairs found")
 		}
 
@@ -193,6 +226,17 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 	pods, err := s.RunFilterPlugins(pods, ctx)
 	if err != nil {
 		return err
+	}
+
+	if ctx.StickyPodName != "" {
+		for _, p := range pods {
+			if p.Pod != nil && p.Pod.Name == ctx.StickyPodName {
+				// Sticky pod already passed filters; skip score plugins.
+				ctx.BestPods = []*datastore.PodInfo{p}
+				return nil
+			}
+		}
+		ctx.StickyPodName = ""
 	}
 
 	klog.V(4).Info("Running score plugins for PD aggregated pod")
@@ -224,6 +268,9 @@ func (s *SchedulerImpl) RunFilterPlugins(pods []*datastore.PodInfo, ctx *framewo
 
 func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framework.Context) map[*datastore.PodInfo]int {
 	res := make(map[*datastore.PodInfo]int, len(pods))
+	for _, pod := range pods {
+		res[pod] = 0
+	}
 	// Checked once: V(4) arguments are boxed before klog can discard them
 	logScores := klog.V(4).Enabled()
 	for _, scorePlugin := range s.scorePlugins {
@@ -247,10 +294,9 @@ func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framewor
 				}
 			}
 			if _, ok := res[k]; !ok {
-				res[k] = v * scorePlugin.weight
-			} else {
-				res[k] += v * scorePlugin.weight
+				continue
 			}
+			res[k] += v * scorePlugin.weight
 		}
 	}
 
@@ -273,7 +319,8 @@ func (s *SchedulerImpl) RunPostHooks(ctx *framework.Context, index int) {
 }
 
 func TopNPodInfos(m map[*datastore.PodInfo]int, n int) []*datastore.PodInfo {
-	var list []podInfoWithValue
+	// One entry per scored pod, so the length is known before the loop
+	list := make([]podInfoWithValue, 0, len(m))
 	for k, v := range m {
 		list = append(list, podInfoWithValue{pod: k, score: v})
 	}
@@ -282,11 +329,15 @@ func TopNPodInfos(m map[*datastore.PodInfo]int, n int) []*datastore.PodInfo {
 		return list[i].score > list[j].score
 	})
 
-	res := []*datastore.PodInfo{}
-	for i := range list {
-		if i >= n {
-			break
-		}
+	// Clamp first, make() panics on a negative capacity
+	if n > len(list) {
+		n = len(list)
+	}
+	if n < 0 {
+		n = 0
+	}
+	res := make([]*datastore.PodInfo, 0, n)
+	for i := 0; i < n; i++ {
 		res = append(res, list[i].pod)
 	}
 

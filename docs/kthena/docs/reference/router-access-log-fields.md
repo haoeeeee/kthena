@@ -23,6 +23,12 @@ The text representation is a single line with this shape:
 Fields in square brackets are omitted when no value is available. JSON uses
 the names in the tables below.
 
+A value containing a space, a quote or any control character is written as a
+quoted Go string, so one entry stays one parseable line and no escape sequence
+reaches a terminal. Values without those characters are written as-is. Error
+messages usually contain spaces, so `error` is normally quoted. Readers should
+unquote a value that starts with `"`.
+
 ## HTTP fields
 
 | Field | Type | Presence | Description | Example |

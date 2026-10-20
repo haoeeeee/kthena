@@ -1,4 +1,6 @@
-# Description: Template for DeepSeek R1 Distill Qwen 32B model deployment with vLLM backend
+# Description: [Deprecated in v1.1] Template for DeepSeek R1 Distill Qwen 32B model deployment with vLLM backend
+# ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute.
+# Removal is no earlier than v1.5.
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelBooster
 metadata:

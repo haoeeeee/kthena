@@ -17,9 +17,10 @@ limitations under the License.
 package plugins
 
 import (
+	"slices"
+
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
-	"istio.io/istio/pkg/slices"
 )
 
 const LoraAffinityPluginName = "lora-affinity"
@@ -41,7 +42,7 @@ func (l *LoraAffinity) Name() string {
 }
 
 func (l *LoraAffinity) Filter(ctx *framework.Context, pods []*datastore.PodInfo) []*datastore.PodInfo {
-	return slices.FilterInPlace(pods, func(info *datastore.PodInfo) bool {
-		return info.Contains(ctx.Model)
+	return slices.DeleteFunc(pods, func(info *datastore.PodInfo) bool {
+		return !info.Contains(ctx.Model)
 	})
 }

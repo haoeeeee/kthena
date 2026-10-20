@@ -13,7 +13,7 @@ We'll install a model from Hugging Face and perform inference using a simple cur
 No GPUs available? Follow the [GPU-Free Quick Start](./gpu-free-quick-start.md) to evaluate Kthena end to end with a mock inference backend on a CPU-only cluster.
 :::
 
-Kthena provides two ways to quickly deploy LLMs. We recommend starting with `ModelServing` for flexible, self-hosted deployments.
+For new deployments, use `ModelServing` together with `ModelServer` and `ModelRoute`. The deprecated ModelBooster example is retained below for existing users.
 
 ## Prerequisites
 
@@ -86,7 +86,11 @@ curl -v http://$ROUTER_IP:80/v1/chat/completions \
 
 ## ModelBooster
 
-Kthena ModelBooster is a Custom Resource Definitions(CRD) of Kthena that provides a simple way to deploy LLMs. It allows you to deploy LLMs with a single click.
+:::warning Deprecated example
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. For new deployments, follow the [ModelServing steps above](#modelserving). See the [deprecation details](../user-guide/model-deployment.md#modelbooster-deprecation) for existing deployments.
+:::
+
+The ModelBooster CRD creates and manages the underlying serving resources automatically. This example remains available for existing users during the deprecation period.
 
 **Step 1: Create a ModelBooster Resource**
 

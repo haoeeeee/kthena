@@ -24,6 +24,10 @@ import (
 )
 
 // ModelBoosterSpec defines the desired state of ModelBooster.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelBoosterSpec struct {
 	// Name is the name of the model. ModelBooster CR name is restricted by kubernetes, for example, can't contain uppercase letters.
 	// So we use this field to specify the ModelBooster name.
@@ -45,6 +49,10 @@ type ModelBoosterSpec struct {
 }
 
 // ModelBackend defines the configuration for a model backend.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelBackend struct {
 	// Name is the name of the backend. Can't duplicate with other ModelBackend name in the same ModelBooster CR.
 	// Note: update name will cause the old ModelServing deletion and a new ModelServing creation.
@@ -122,6 +130,10 @@ type ModelBackend struct {
 }
 
 // ModelBackendType defines the type of model backend.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 // +kubebuilder:validation:Enum=vLLM;vLLMDisaggregated
 type ModelBackendType string
 
@@ -139,6 +151,10 @@ const (
 )
 
 // ModelWorker defines the model worker configuration.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelWorker struct {
 	// Type is the type of the model worker.
 	// +kubebuilder:default=server
@@ -170,6 +186,10 @@ type ModelWorker struct {
 }
 
 // ModelWorkerType defines the type of model worker.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 // +kubebuilder:validation:Enum=server;prefill;decode;controller;coordinator
 type ModelWorkerType string
 
@@ -187,6 +207,10 @@ const (
 )
 
 // ModelStatus defines the observed state of ModelBooster.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelStatus struct {
 	// Conditions represents the latest available observations of the model's state.
 	// +listType=map
@@ -197,6 +221,11 @@ type ModelStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
+// ModelStatusConditionType defines a condition type reported by ModelBooster.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelStatusConditionType string
 
 const (
@@ -213,6 +242,10 @@ const (
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // ModelBooster is the Schema for the models API.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelBooster struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -224,6 +257,10 @@ type ModelBooster struct {
 // +kubebuilder:object:root=true
 
 // ModelBoosterList contains a list of ModelBooster.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelBoosterList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`

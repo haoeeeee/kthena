@@ -69,6 +69,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: REDIS_HOST
               valueFrom:
                 configMapKeyRef:
@@ -165,6 +169,42 @@ spec:
             mountPath: /etc/tls
             readOnly: true
           {{- end }}
+        {{- with .Values.kthenaRouter.tokenizerService }}
+        {{- if and .enabled (eq .mode "sidecar") }}
+        - name: kthena-tokenizer
+          image: "{{ .image.repository }}:{{ .image.tag }}"
+          imagePullPolicy: {{ .image.pullPolicy }}
+          env:
+            - name: TOKENIZER_PORT
+              value: {{ .port | quote }}
+            - name: MAX_TOKENIZERS
+              value: {{ .maxTokenizers | quote }}
+            {{- with .models }}
+            - name: MODEL_TOKENIZERS
+              value: {{ toJson . | quote }}
+            {{- end }}
+            {{- with .extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - containerPort: {{ .port }}
+              name: tokenizer
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources: {{- toYaml .resources | nindent 12 }}
+        {{- end }}
+        {{- end }}
       volumes:
         - name: scheduler-config
           configMap:
@@ -182,3 +222,7 @@ spec:
         {{- end }}
       serviceAccountName: kthena-router
       terminationGracePeriodSeconds: {{ .Values.kthenaRouter.terminationGracePeriodSeconds }}
+      {{- with .Values.kthenaRouter.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

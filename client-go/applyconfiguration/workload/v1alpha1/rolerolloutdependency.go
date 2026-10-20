@@ -21,7 +21,9 @@ package v1alpha1
 // RoleRolloutDependencyApplyConfiguration represents a declarative configuration of the RoleRolloutDependency type for use
 // with apply.
 type RoleRolloutDependencyApplyConfiguration struct {
-	Role      *string  `json:"role,omitempty"`
+	// Role is the dependent Role.
+	Role *string `json:"role,omitempty"`
+	// DependsOn lists the downstream Roles required by Role.
 	DependsOn []string `json:"dependsOn,omitempty"`
 }
 

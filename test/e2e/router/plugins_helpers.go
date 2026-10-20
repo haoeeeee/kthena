@@ -17,19 +17,22 @@ limitations under the License.
 package router
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	backendmetrics "github.com/volcano-sh/kthena/pkg/kthena-router/backend/metrics"
-	"github.com/volcano-sh/kthena/pkg/kthena-router/backend/vllm"
-	routerutils "github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 	plugincontext "github.com/volcano-sh/kthena/test/e2e/router/router-plugins/context"
 	"github.com/volcano-sh/kthena/test/e2e/utils"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -42,6 +45,12 @@ const (
 	gpuCacheUsageLoadWaitTimeout   = 90 * time.Second
 	gpuCacheUsageLoadConcurrency   = 2
 	gpuCacheUsageLoadMaxTokens     = 256
+	kvCacheFixtureDeploymentName   = "router-plugin-kvcache-mock"
+	kvCacheFixtureAppLabel         = kvCacheFixtureDeploymentName
+	kvCacheOwnershipWaitTimeout    = 90 * time.Second
+	kvCacheOwnershipPrefix         = "matrix:kv:block"
+	kvCacheRoutingRequestCount     = 200
+	mixedPluginDominantWeight      = 101 // one more than either plugin's maximum score
 )
 
 func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string) []corev1.Pod {
@@ -49,6 +58,70 @@ func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string
 	ready := utils.ListReadyPodsByLabel(t, kube, namespace, "app="+plugincontext.DeploymentName)
 	require.NotEmpty(t, ready, "no ready mock pods")
 	return ready
+}
+
+func setupKVCacheFixture(t *testing.T, kube kubernetes.Interface, namespace, redisNamespace string) []corev1.Pod {
+	t.Helper()
+	ctx := context.Background()
+	deployment := utils.LoadYAMLFromFile[appsv1.Deployment](filepath.Join(plugincontext.TestDataDir, "LLM-Mock-plugins-kvcache.yaml"))
+	deployment.Namespace = namespace
+	redisHostSet := false
+	for i := range deployment.Spec.Template.Spec.Containers {
+		container := &deployment.Spec.Template.Spec.Containers[i]
+		if container.Name != "kthena-runtime" {
+			continue
+		}
+		for j := range container.Env {
+			if container.Env[j].Name == "REDIS_HOST" {
+				container.Env[j].Value = fmt.Sprintf("redis-server.%s.svc.cluster.local", redisNamespace)
+				redisHostSet = true
+			}
+		}
+	}
+	require.True(t, redisHostSet, "KV-cache fixture Runtime needs REDIS_HOST")
+
+	_, err := kube.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
+	require.NoError(t, err, "create KV-cache fixture")
+	t.Cleanup(func() {
+		utils.DeleteDeploymentAndWait(t, kube, namespace, kvCacheFixtureDeploymentName, 2*time.Minute)
+	})
+
+	utils.WaitForDeploymentReady(t, ctx, kube, namespace, kvCacheFixtureDeploymentName, pluginMockReplicaCount, 5*time.Minute)
+	pods := utils.ListReadyPodsByLabel(t, kube, namespace, "app="+kvCacheFixtureAppLabel)
+	require.Len(t, pods, pluginMockReplicaCount, "KV-cache fixture needs %d mock pods", pluginMockReplicaCount)
+	return pods
+}
+
+func waitForKVCacheOwnership(t *testing.T, pod corev1.Pod, redisNamespace, model, prompt string) {
+	t.Helper()
+	localPort := utils.AllocateLocalPort(t)
+	pf, err := utils.SetupPortForward(redisNamespace, "redis-server", localPort, "6379")
+	require.NoError(t, err, "port-forward to Redis")
+	defer pf.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:" + localPort})
+	defer client.Close()
+
+	owner := pod.Name + "." + pod.Namespace
+	ownershipPattern := fmt.Sprintf("%s:%s@*", kvCacheOwnershipPrefix, model)
+	deadline := time.Now().Add(kvCacheOwnershipWaitTimeout)
+	for time.Now().Before(deadline) {
+		// Re-send while polling because ZMQ may drop an event before the subscriber is ready.
+		utils.DirectChatToPod(t, pod, model, prompt, 1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		iter := client.Scan(ctx, 0, ownershipPattern, 0).Iterator()
+		for iter.Next(ctx) {
+			exists, err := client.HExists(ctx, iter.Val(), owner).Result()
+			if err == nil && exists {
+				cancel()
+				return
+			}
+		}
+		cancel()
+		time.Sleep(time.Second)
+	}
+	require.FailNowf(t, "KV-cache ownership not found", "expected ownership for %s", owner)
 }
 
 func waitForSchedulerPluginInMetrics(t *testing.T, metricsURL, pluginName, pluginType string) {
@@ -68,6 +141,7 @@ func waitForSchedulerPluginInMetrics(t *testing.T, metricsURL, pluginName, plugi
 type routerPodMetricsSnapshot struct {
 	RequestWaitingNum float64
 	RequestRunningNum float64
+	GPUCacheUsage     float64
 	TPOT              float64
 	TTFT              float64
 }
@@ -88,6 +162,7 @@ func fetchRouterPodMetricsViaDebug(t *testing.T, debugBaseURL string, pod corev1
 		Metrics *struct {
 			RequestWaitingNum float64 `json:"requestWaitingNum"`
 			RequestRunningNum float64 `json:"requestRunningNum"`
+			GPUCacheUsage     float64 `json:"gpuCacheUsage"`
 			TPOT              float64 `json:"tpot"`
 			TTFT              float64 `json:"ttft"`
 		} `json:"metrics"`
@@ -98,6 +173,7 @@ func fetchRouterPodMetricsViaDebug(t *testing.T, debugBaseURL string, pod corev1
 	return routerPodMetricsSnapshot{
 		RequestWaitingNum: parsed.Metrics.RequestWaitingNum,
 		RequestRunningNum: parsed.Metrics.RequestRunningNum,
+		GPUCacheUsage:     parsed.Metrics.GPUCacheUsage,
 		TPOT:              parsed.Metrics.TPOT,
 		TTFT:              parsed.Metrics.TTFT,
 	}, true
@@ -147,75 +223,36 @@ func waitForLeastLatencyMetricsSeparation(t *testing.T, kube kubernetes.Interfac
 		"router should observe non-zero latency metrics where slow pods are slower than all fast pods")
 }
 
-type mockPodMetricsPortForward struct {
-	pod     corev1.Pod
-	metrics string
-	close   func()
-}
-
-func setupMockPodMetricsPortForward(t *testing.T, pod corev1.Pod) mockPodMetricsPortForward {
+func waitForRouterGPUCacheSeparation(t *testing.T, kube kubernetes.Interface, kthenaNamespace string, hotPods, coldPods []corev1.Pod) {
 	t.Helper()
+	require.NotEmpty(t, hotPods)
+	require.NotEmpty(t, coldPods)
+
+	routerPod := utils.GetRouterPod(t, kube, kthenaNamespace)
 	localPort := utils.AllocateLocalPort(t)
-	pf, err := utils.SetupPortForwardToPod(pod.Namespace, pod.Name, localPort, "8000")
-	require.NoError(t, err, "port-forward to mock pod %s for /metrics", pod.Name)
-	return mockPodMetricsPortForward{
-		pod:     pod,
-		metrics: fmt.Sprintf("http://127.0.0.1:%s/metrics", localPort),
-		close:   func() { pf.Close() },
-	}
-}
+	pf, err := utils.SetupPortForwardToPod(routerPod.Namespace, routerPod.Name, localPort, utils.RouterDebugPort)
+	require.NoError(t, err, "port-forward to router debug API")
+	defer pf.Close()
 
-func fetchMockPodKVCacheUsage(metricsURL string) (float64, bool) {
-	allMetrics, err := backendmetrics.ParseMetricsURL(metricsURL)
-	if err != nil {
-		return 0, false
-	}
-	countMetrics := vllm.NewVllmEngine().GetCountMetricsInfo(allMetrics)
-	kvUsage, ok := countMetrics[routerutils.KVCacheUsage]
-	return kvUsage, ok
-}
-
-func waitForMockPodKVCacheSeparation(t *testing.T, busyPods []corev1.Pod, idlePod corev1.Pod) {
-	t.Helper()
-	require.NotEmpty(t, busyPods)
-
-	forwards := make([]mockPodMetricsPortForward, 0, len(busyPods)+1)
-	for _, pod := range busyPods {
-		forwards = append(forwards, setupMockPodMetricsPortForward(t, pod))
-	}
-	forwards = append(forwards, setupMockPodMetricsPortForward(t, idlePod))
-	defer func() {
-		for _, forward := range forwards {
-			forward.close()
-		}
-	}()
+	debugBaseURL := fmt.Sprintf("http://127.0.0.1:%s", localPort)
 
 	require.Eventually(t, func() bool {
-		allBusyHot := true
-		for _, forward := range forwards[:len(busyPods)] {
-			kvUsage, ok := fetchMockPodKVCacheUsage(forward.metrics)
-			if !ok || kvUsage < gpuCacheUsageBusyMin {
-				allBusyHot = false
-				break
+		for _, pod := range hotPods {
+			metrics, ok := fetchRouterPodMetricsViaDebug(t, debugBaseURL, pod)
+			if !ok || metrics.GPUCacheUsage < gpuCacheUsageBusyMin {
+				return false
 			}
 		}
-		idleForward := forwards[len(forwards)-1]
-		idleUsage, okIdle := fetchMockPodKVCacheUsage(idleForward.metrics)
-		if !okIdle {
-			return false
-		}
-		idleCool := idleUsage < gpuCacheUsageIdleMax
-		if allBusyHot && idleCool {
-			for _, forward := range forwards[:len(busyPods)] {
-				kvUsage, _ := fetchMockPodKVCacheUsage(forward.metrics)
-				t.Logf("gpu-usage load ready: busy %s kv_cache=%.3f (mock /metrics)", forward.pod.Name, kvUsage)
+		for _, pod := range coldPods {
+			metrics, ok := fetchRouterPodMetricsViaDebug(t, debugBaseURL, pod)
+			if !ok || metrics.GPUCacheUsage >= gpuCacheUsageIdleMax {
+				return false
 			}
-			t.Logf("gpu-usage load ready: idle %s kv_cache=%.3f (mock /metrics)", idleForward.pod.Name, idleUsage)
 		}
-		return allBusyHot && idleCool
+		return true
 	}, gpuCacheUsageLoadWaitTimeout, 2*time.Second,
-		"all busy pods should report kv_cache_usage_perc >= %.2f and idle pod %s should report < %.2f on mock /metrics",
-		gpuCacheUsageBusyMin, idlePod.Name, gpuCacheUsageIdleMax)
+		"router should observe hot pods with gpu cache usage >= %.2f and cold pods with usage < %.2f",
+		gpuCacheUsageBusyMin, gpuCacheUsageIdleMax)
 }
 
 func waitForLeastRequestLoadSeparation(t *testing.T, kube kubernetes.Interface, kthenaNamespace string, busyPods []corev1.Pod, idlePod corev1.Pod, maxWaitingRequests int) {
@@ -261,6 +298,25 @@ func waitForLeastRequestLoadSeparation(t *testing.T, kube kubernetes.Interface, 
 }
 
 const (
+	schedulerKVCacheAware = `scheduler:
+  pluginConfig:
+  - name: kvcache-aware
+    args:
+      blockSizeToHash: 8
+      maxBlocksToMatch: 128
+  - name: least-request
+    args:
+      maxWaitingRequests: 10
+  plugins:
+    Filter:
+      enabled: []
+    Score:
+      enabled:
+        - name: kvcache-aware
+          weight: 1
+        - name: least-request
+          weight: 1`
+
 	schedulerOnlyPrefixCache = `scheduler:
   pluginConfig:
   - name: prefix-cache
@@ -335,3 +391,21 @@ const (
         - name: gpu-usage
           weight: 1`
 )
+
+func schedulerKVCacheAndGPUUsage(kvCacheWeight, gpuUsageWeight int) string {
+	return fmt.Sprintf(`scheduler:
+  pluginConfig:
+  - name: kvcache-aware
+    args:
+      blockSizeToHash: 8
+      maxBlocksToMatch: 128
+  plugins:
+    Filter:
+      enabled: []
+    Score:
+      enabled:
+        - name: kvcache-aware
+          weight: %d
+        - name: gpu-usage
+          weight: %d`, kvCacheWeight, gpuUsageWeight)
+}

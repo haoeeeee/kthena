@@ -24,10 +24,30 @@ import (
 
 // RolloutStrategyApplyConfiguration represents a declarative configuration of the RolloutStrategy type for use
 // with apply.
+//
+// RolloutStrategy defines the strategy that the ModelServing controller
+// will use to perform replica updates.
 type RolloutStrategyApplyConfiguration struct {
-	Type                       *workloadv1alpha1.RolloutStrategyType         `json:"type,omitempty"`
+	// Type selects the granularity of rolling updates. Supported values are
+	// ServingGroupRollingUpdate and RoleRollingUpdate. It defaults to
+	// ServingGroupRollingUpdate.
+	//
+	// ServingGroupRollingUpdate uses rolloutStrategy.rollingUpdateConfiguration;
+	// rolling update settings on individual Roles do not take effect.
+	// RoleRollingUpdate uses the rolling update configuration on each Role;
+	// rolloutStrategy.rollingUpdateConfiguration must not be set.
+	// Kthena performs RoleRollingUpdate across all ServingGroups at the same time.
+	// Therefore, we recommend using it only in scenarios with a single ServingGroup.
+	Type *workloadv1alpha1.RolloutStrategyType `json:"type,omitempty"`
+	// RollingUpdateConfiguration configures ServingGroupRollingUpdate.
+	// It must not be set when type is RoleRollingUpdate; configure maxUnavailable
+	// maxSurge, and partition on each Role instead.
 	RollingUpdateConfiguration *RollingUpdateConfigurationApplyConfiguration `json:"rollingUpdateConfiguration,omitempty"`
-	RoleCoordination           *RoleCoordinationApplyConfiguration           `json:"roleCoordination,omitempty"`
+	// RoleCoordination defines the cross-Role coordination parameters to be used
+	// when type is RoleRollingUpdate.
+	RoleCoordination *RoleCoordinationApplyConfiguration `json:"roleCoordination,omitempty"`
+	// EvictionStrategy defines the protection policy during node eviction.
+	EvictionStrategy *EvictionStrategySpecApplyConfiguration `json:"evictionStrategy,omitempty"`
 }
 
 // RolloutStrategyApplyConfiguration constructs a declarative configuration of the RolloutStrategy type for use with
@@ -57,5 +77,13 @@ func (b *RolloutStrategyApplyConfiguration) WithRollingUpdateConfiguration(value
 // If called multiple times, the RoleCoordination field is set to the value of the last call.
 func (b *RolloutStrategyApplyConfiguration) WithRoleCoordination(value *RoleCoordinationApplyConfiguration) *RolloutStrategyApplyConfiguration {
 	b.RoleCoordination = value
+	return b
+}
+
+// WithEvictionStrategy sets the EvictionStrategy field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the EvictionStrategy field is set to the value of the last call.
+func (b *RolloutStrategyApplyConfiguration) WithEvictionStrategy(value *EvictionStrategySpecApplyConfiguration) *RolloutStrategyApplyConfiguration {
+	b.EvictionStrategy = value
 	return b
 }

@@ -30,10 +30,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -92,8 +92,8 @@ func (m *MockStore) DeletePod(podName types.NamespacedName) error {
 	return args.Error(0)
 }
 
-func (m *MockStore) MatchModelTarget(modelName string, request *http.Request, gatewayKey string) (datastore.ModelTarget, bool, *aiv1alpha1.ModelRoute, error) {
-	return datastore.ModelTarget{}, false, nil, nil
+func (m *MockStore) MatchModelTarget(modelName string, request *http.Request, gatewayKey string) (datastore.ModelTarget, bool, *aiv1alpha1.ModelRoute, *aiv1alpha1.Rule, error) {
+	return datastore.ModelTarget{}, false, nil, nil, nil
 }
 
 func (m *MockStore) AddOrUpdateModelRoute(mr *aiv1alpha1.ModelRoute) error {

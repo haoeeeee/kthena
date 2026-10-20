@@ -144,6 +144,25 @@ func (l *accessLoggerImpl) formatJSON(entry *AccessLogEntry) (string, error) {
 	return string(data), nil
 }
 
+// writeTextField appends " key=value" to line, skipping empty values. A value
+// holding a space, a quote or any control character is quoted, so one entry
+// stays one parseable line and escape sequences cannot reach a terminal.
+func writeTextField(line *strings.Builder, key, value string) {
+	if value == "" {
+		return
+	}
+	if needsQuoting(value) {
+		fmt.Fprintf(line, " %s=%q", key, value)
+		return
+	}
+	fmt.Fprintf(line, " %s=%s", key, value)
+}
+
+func needsQuoting(value string) bool {
+	return strings.ContainsAny(value, " \"") ||
+		strings.ContainsFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f })
+}
+
 // formatText formats the entry as structured text
 func (l *accessLoggerImpl) formatText(entry *AccessLogEntry) (string, error) {
 	// Format: [timestamp] "METHOD /path PROTOCOL" status_code [error=type:message]
@@ -155,60 +174,36 @@ func (l *accessLoggerImpl) formatText(entry *AccessLogEntry) (string, error) {
 	var line strings.Builder
 
 	// Basic request line with status code
-	fmt.Fprintf(&line, `[%s] "%s %s %s" %d`,
-		timestamp, entry.Method, entry.Path, entry.Protocol,
+	fmt.Fprintf(&line, "[%s] %q %d",
+		timestamp, entry.Method+" "+entry.Path+" "+entry.Protocol,
 		entry.StatusCode)
 
 	// Add error information immediately after status code
 	if entry.Error != nil {
-		fmt.Fprintf(&line, " error=%s:%s", entry.Error.Type, entry.Error.Message)
+		writeTextField(&line, "error", entry.Error.Type+":"+entry.Error.Message)
 	}
 
 	// Add AI-specific fields
-	if entry.ModelName != "" {
-		fmt.Fprintf(&line, " model_name=%s", entry.ModelName)
-	}
-	if entry.ModelRoute != "" {
-		fmt.Fprintf(&line, " model_route=%s", entry.ModelRoute)
-	}
-	if entry.ModelServer != "" {
-		fmt.Fprintf(&line, " model_server=%s", entry.ModelServer)
-	}
-	if entry.SelectedPod != "" {
-		fmt.Fprintf(&line, " selected_pod=%s", entry.SelectedPod)
-	}
-	if entry.RequestID != "" {
-		fmt.Fprintf(&line, " request_id=%s", entry.RequestID)
-	}
-	if entry.BackendType != "" {
-		fmt.Fprintf(&line, " backend_type=%s", entry.BackendType)
-	}
-	if entry.BackendName != "" {
-		fmt.Fprintf(&line, " backend_name=%s", entry.BackendName)
-	}
-	if entry.UpstreamModel != "" {
-		fmt.Fprintf(&line, " upstream_model=%s", entry.UpstreamModel)
-	}
+	writeTextField(&line, "model_name", entry.ModelName)
+	writeTextField(&line, "model_route", entry.ModelRoute)
+	writeTextField(&line, "model_server", entry.ModelServer)
+	writeTextField(&line, "selected_pod", entry.SelectedPod)
+	writeTextField(&line, "request_id", entry.RequestID)
+	writeTextField(&line, "backend_type", entry.BackendType)
+	writeTextField(&line, "backend_name", entry.BackendName)
+	writeTextField(&line, "upstream_model", entry.UpstreamModel)
 	if entry.UpstreamStatusCode > 0 {
 		fmt.Fprintf(&line, " upstream_status_code=%d", entry.UpstreamStatusCode)
 	}
 	if entry.UpstreamAttempts > 0 {
 		fmt.Fprintf(&line, " upstream_attempts=%d", entry.UpstreamAttempts)
 	}
-	if entry.ErrorOrigin != "" {
-		fmt.Fprintf(&line, " error_origin=%s", entry.ErrorOrigin)
-	}
+	writeTextField(&line, "error_origin", entry.ErrorOrigin)
 
 	// Add Gateway API / Inference Extension fields (if present)
-	if entry.Gateway != "" {
-		fmt.Fprintf(&line, " gateway=%s", entry.Gateway)
-	}
-	if entry.HTTPRoute != "" {
-		fmt.Fprintf(&line, " http_route=%s", entry.HTTPRoute)
-	}
-	if entry.InferencePool != "" {
-		fmt.Fprintf(&line, " inference_pool=%s", entry.InferencePool)
-	}
+	writeTextField(&line, "gateway", entry.Gateway)
+	writeTextField(&line, "http_route", entry.HTTPRoute)
+	writeTextField(&line, "inference_pool", entry.InferencePool)
 
 	// Add token information
 	if entry.InputTokens > 0 || entry.OutputTokens > 0 {

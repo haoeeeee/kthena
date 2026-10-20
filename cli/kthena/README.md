@@ -2,6 +2,8 @@
 
 `kthena` is a command-line interface tool for managing kthena AI inference workloads in Kubernetes clusters.
 
+> **ModelBooster deprecation:** ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. ModelBooster commands and templates remain available for existing users. For new deployments, follow the [ModelServing quick start](../../docs/kthena/docs/getting-started/quick-start.md#modelserving).
+
 ## Architecture Diagrams
 
 ### Use Case Diagram

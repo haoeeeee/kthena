@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -122,7 +123,7 @@ class TestDownloadModel(unittest.TestCase):
         )
         mock_popen.assert_called_once()
 
-    def test_s3_download_missing_credentials(self):
+    def test_s3_download_rejects_partial_static_credentials(self):
         for access_key, secret_key in [(None, "fake_sk"), ("fake_ak", None)]:
             downloader = S3Downloader(
                 model_uri=self.source,
@@ -134,7 +135,28 @@ class TestDownloadModel(unittest.TestCase):
             with self.assertRaises(ValueError) as context:
                 downloader.download(self.output_dir)
 
-            self.assertIn("Missing credentials", str(context.exception))
+            self.assertIn("must be provided together", str(context.exception))
+
+    @patch.object(S3Downloader, "_execute_command")
+    def test_s3_download_uses_default_credential_chain(self, mock_execute):
+        downloader = S3Downloader(model_uri=self.source)
+        credential_env = {
+            "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/kthena-downloader",
+            "AWS_WEB_IDENTITY_TOKEN_FILE": "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+        }
+
+        with patch.dict(os.environ, credential_env, clear=True):
+            downloader.download(self.output_dir)
+
+        mock_execute.assert_called_once()
+        _, env = mock_execute.call_args.args
+        self.assertEqual(env["AWS_ROLE_ARN"], credential_env["AWS_ROLE_ARN"])
+        self.assertEqual(
+            env["AWS_WEB_IDENTITY_TOKEN_FILE"],
+            credential_env["AWS_WEB_IDENTITY_TOKEN_FILE"],
+        )
+        self.assertNotIn("AWS_ACCESS_KEY_ID", env)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
 
     def test_get_s3_downloader(self):
         downloader = get_downloader(self.source, self.credentials)

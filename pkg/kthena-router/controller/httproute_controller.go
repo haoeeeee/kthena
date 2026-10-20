@@ -158,15 +158,8 @@ func (c *HTTPRouteController) processNextWorkItem() bool {
 		return true
 	}
 
-	if err := c.syncHandler(key); err != nil {
-		if c.workqueue.NumRequeues(key) < maxRetries {
-			klog.Errorf("error syncing httproute %q: %s, requeuing", key, err.Error())
-			c.workqueue.AddRateLimited(key)
-			return true
-		}
-		klog.Errorf("giving up on syncing httproute %q after %d retries: %s", key, maxRetries, err)
-		c.workqueue.Forget(obj)
-	}
+	err := c.syncHandler(key)
+	retryOrForget(c.workqueue, "httproute", key, err, klog.Errorf)
 	return true
 }
 
@@ -230,7 +223,7 @@ func (c *HTTPRouteController) syncHandler(key string) error {
 }
 
 func (c *HTTPRouteController) enqueueHTTPRoute(obj interface{}) {
-	key, err := cache.MetaNamespaceKeyFunc(obj)
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		utilruntime.HandleError(err)
 		return

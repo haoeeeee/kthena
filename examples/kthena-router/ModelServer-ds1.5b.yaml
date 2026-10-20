@@ -13,3 +13,10 @@ spec:
   inferenceEngine: "vLLM"
   trafficPolicy:
     timeout: 10s
+    # Per-ModelServer upstream connection pool. Omit to use the shared default
+    # pool (maxIdle 100, per-host 64, unlimited, idleTimeout 90s).
+    connectionPool:
+      maxIdleConnections: 100
+      maxIdleConnectionsPerHost: 64
+      maxConnectionsPerHost: 0   # 0 means unlimited
+      idleTimeout: 90s

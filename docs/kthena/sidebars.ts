@@ -76,10 +76,14 @@ const sidebars: SidebarsConfig = {
           label: 'Router',
           items: [
             'user-guide/router-routing',
+            'user-guide/external-model-provider',
             'user-guide/config-router',
+            'user-guide/standalone-router',
             'user-guide/kvcache-aware',
+            'user-guide/tokenizer-service',
             'user-guide/fairness-scheduling',
             'user-guide/session-boost',
+            'user-guide/session-sticky',
             'user-guide/rate-limit',
             "user-guide/gateway-api-support",
             'user-guide/gateway-inference-extension-support',
@@ -108,6 +112,11 @@ const sidebars: SidebarsConfig = {
           ],
         },
       ],
+    },
+    {
+      type: 'category',
+      label: 'Ecosystem',
+      items: ['ecosystem/dynamo-on-kthena', 'ecosystem/llm-d-router-with-kthena'],
     },
     {
       type: 'category',

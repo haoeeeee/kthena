@@ -63,6 +63,14 @@ type ModelServingSpec struct {
 	// +kubebuilder:validation:Enum={ServingGroupRecreate,RoleRecreate,None}
 	// +optional
 	RecoveryPolicy RecoveryPolicy `json:"recoveryPolicy,omitempty"`
+
+	// RevisionHistoryLimit is the maximum number of non-live revisions to retain.
+	// Revisions still referenced by the ModelServing or its workloads do not count
+	// toward this limit.
+	// +optional
+	// +kubebuilder:default=10
+	// +kubebuilder:validation:Minimum=0
+	RevisionHistoryLimit *int32 `json:"revisionHistoryLimit,omitempty"`
 }
 
 type RecoveryPolicy string
@@ -150,7 +158,7 @@ type RolloutStrategy struct {
 
 	// RollingUpdateConfiguration configures ServingGroupRollingUpdate.
 	// It must not be set when type is RoleRollingUpdate; configure maxUnavailable
-	// and partition on each Role instead.
+	// maxSurge, and partition on each Role instead.
 	// +optional
 	RollingUpdateConfiguration *RollingUpdateConfiguration `json:"rollingUpdateConfiguration,omitempty"`
 
@@ -158,6 +166,43 @@ type RolloutStrategy struct {
 	// when type is RoleRollingUpdate.
 	// +optional
 	RoleCoordination *RoleCoordination `json:"roleCoordination,omitempty"`
+
+	// EvictionStrategy defines the protection policy during node eviction.
+	// +optional
+	EvictionStrategy *EvictionStrategySpec `json:"evictionStrategy,omitempty"`
+}
+
+// ProtectionLevelType defines the level of protection during eviction.
+type ProtectionLevelType string
+
+const (
+	// ProtectionLevelServingGroup guarantees that the number of ready ServingGroups is not below the threshold.
+	ProtectionLevelServingGroup ProtectionLevelType = "ServingGroup"
+	// ProtectionLevelRole guarantees that the number of ready instances for each role is not below the threshold.
+	ProtectionLevelRole ProtectionLevelType = "Role"
+)
+
+// EvictionStrategySpec defines the protection policy during node eviction.
+type EvictionStrategySpec struct {
+	// ProtectionLevel defines the protection level: ServingGroup or Role.
+	// - ServingGroup: guarantees that the number of ready ServingGroups is not below the threshold.
+	// - Role: guarantees that the number of ready instances for each role is not below the threshold.
+	//
+	// +kubebuilder:default=ServingGroup
+	// +kubebuilder:validation:Enum={ServingGroup,Role}
+	ProtectionLevel ProtectionLevelType `json:"protectionLevel"`
+
+	// MinAvailable defines the minimum number of available ServingGroup instances.
+	// It is used only when protectionLevel is ServingGroup.
+	// It can be an absolute number (ex: 3) or a percentage of total instances (ex: 80%).
+	MinAvailable *intstr.IntOrString `json:"minAvailable,omitempty"`
+
+	// RoleMinAvailable defines role-specific minimum available role instances.
+	// It is used only when protectionLevel is Role. Map keys must match names in spec.template.roles.
+	// If a role is absent from this map, it is not protected by the eviction budget.
+	// Values can be absolute numbers (ex: 3) or percentages of total role instances (ex: 80%).
+	// +optional
+	RoleMinAvailable map[string]intstr.IntOrString `json:"roleMinAvailable,omitempty"`
 }
 
 // RolloutStrategyType defines the strategy to use to update replicas.
@@ -182,10 +227,20 @@ type RollingUpdateConfiguration struct {
 	// 5) or a percentage (for example, 10%). A percentage is calculated from
 	// ModelServing replicas for ServingGroupRollingUpdate and from the
 	// corresponding Role's replicas for RoleRollingUpdate, then rounded down.
-	// The value must not resolve to 0. Defaults to 1.
+	// It may resolve to 0 only when MaxSurge resolves above 0. Defaults to 1.
 	// +kubebuilder:validation:XIntOrString
 	// +kubebuilder:default=1
 	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
+
+	// MaxSurge is the maximum number of resources that may be created above
+	// the desired replica count during an update. It can be an absolute number
+	// (for example, 1) or a percentage (for example, 25%). A percentage is
+	// calculated from ModelServing replicas for ServingGroupRollingUpdate and
+	// from the corresponding Role's replicas for RoleRollingUpdate, then rounded
+	// up. It defaults to 0.
+	// +kubebuilder:validation:XIntOrString
+	// +optional
+	MaxSurge *intstr.IntOrString `json:"maxSurge,omitempty"`
 
 	// Partition protects the first N existing replicas in ascending ordinal order
 	// from updates. The remaining replicas are eligible for rolling update.
@@ -199,7 +254,7 @@ type RollingUpdateConfiguration struct {
 }
 
 // RoleCoordination enables proportional rolling updates across selected Roles
-// in each ServingGroup.
+// in each ServingGroup. Its presence and policy are immutable after creation.
 type RoleCoordination struct {
 	// Roles selects the Roles participating in coordinated rolling update. An
 	// empty list selects every Role in spec.template.roles.
@@ -208,13 +263,16 @@ type RoleCoordination struct {
 	Roles []string `json:"roles,omitempty"`
 
 	// MaxSkew is the maximum percentage-point difference allowed between the
-	// normalized rolling progress of participating Roles. Only percentage values,
+	// target-version Ready ratios of participating Roles, using their entire formal
+	// replica count, including partition-protected capacity. Only percentage values,
 	// for example "10%", are accepted.
 	// +kubebuilder:validation:XIntOrString
 	MaxSkew *intstr.IntOrString `json:"maxSkew"`
 
-	// Dependencies defines rollout startup dependencies. If Role A depends on B,
-	// compatible target-version dependencies must be Ready before A first starts.
+	// Dependencies defines rollout startup dependencies. A graph root waits for
+	// target-version Ready capacity throughout its dependency closure before its
+	// first target start. Internal Roles may start together; old dependency
+	// capacity is retained while old callers remain.
 	// +optional
 	// +listType=map
 	// +listMapKey=role
@@ -283,6 +341,10 @@ type ModelServingStatus struct {
 	// the current ModelServing spec.
 	// +optional
 	UpdateRevision string `json:"updateRevision,omitempty"`
+
+	// CollisionCount tracks hash collisions for ControllerRevision names.
+	// +optional
+	CollisionCount *int32 `json:"collisionCount,omitempty"`
 
 	// Conditions track the condition of the ModelServing.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

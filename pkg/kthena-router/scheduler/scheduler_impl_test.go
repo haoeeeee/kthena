@@ -88,11 +88,21 @@ func TestTopNPodInfos(t *testing.T) {
 			n:        0,
 			expected: 0,
 		},
+		{
+			name: "negative n returns empty slice",
+			scores: map[*datastore.PodInfo]int{
+				createTestPodInfo("pod1"): 100,
+			},
+			n:        -1,
+			expected: 0,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := TopNPodInfos(tt.scores, tt.n)
+			// Callers branch on BestPods != nil, so an empty result must not be nil
+			assert.NotNil(t, result)
 			assert.Equal(t, tt.expected, len(result))
 		})
 	}
@@ -251,6 +261,169 @@ func TestSchedulePDGroup(t *testing.T) {
 	}
 }
 
+func TestSchedulePDGroupStickyPair(t *testing.T) {
+	type stickyCase struct {
+		name                string
+		stickyDecode        string
+		stickyPrefill       string
+		overloadDecode      string // RequestWaitingNum above filter threshold
+		overloadPrefill     string
+		deletePrefill       string // remove from store before Schedule
+		wantDecode          string
+		wantPrefill         string
+		wantStickyCleared   bool
+		wantSingleCandidate bool
+	}
+
+	tests := []stickyCase{
+		{
+			name:                "complete sticky pair pins and skips score",
+			stickyDecode:        "decode-b",
+			stickyPrefill:       "prefill-b",
+			wantDecode:          "decode-b",
+			wantPrefill:         "prefill-b",
+			wantSingleCandidate: true,
+		},
+		{
+			name:              "sticky decode only still selectable does not prefer half pair",
+			stickyDecode:      "decode-b",
+			stickyPrefill:     "prefill-b",
+			overloadPrefill:   "prefill-b",
+			wantDecode:        "decode-a",
+			wantPrefill:       "prefill-a",
+			wantStickyCleared: true,
+		},
+		{
+			name:              "sticky prefill only still selectable does not prefer half pair",
+			stickyDecode:      "decode-b",
+			stickyPrefill:     "prefill-b",
+			overloadDecode:    "decode-b",
+			wantDecode:        "decode-a",
+			wantPrefill:       "prefill-a",
+			wantStickyCleared: true,
+		},
+		{
+			name:              "sticky prefill deleted clears pin and scores remaining pair",
+			stickyDecode:      "decode-b",
+			stickyPrefill:     "prefill-b",
+			deletePrefill:     "prefill-b",
+			wantDecode:        "decode-a",
+			wantPrefill:       "prefill-a",
+			wantStickyCleared: true,
+		},
+		{
+			name:              "only sticky decode name is ignored for PD pin",
+			stickyDecode:      "decode-b",
+			wantDecode:        "",
+			wantPrefill:       "",
+			wantStickyCleared: false, // PD sticky block not entered
+		},
+		{
+			name:              "only sticky prefill name is ignored for PD pin",
+			stickyPrefill:     "prefill-b",
+			wantDecode:        "",
+			wantPrefill:       "",
+			wantStickyCleared: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := datastore.New()
+			modelServerName := types.NamespacedName{Namespace: "default", Name: "test-model-server"}
+			modelServer := &aiv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: modelServerName.Name, Namespace: modelServerName.Namespace},
+				Spec: aiv1alpha1.ModelServerSpec{
+					WorkloadSelector: &aiv1alpha1.WorkloadSelector{
+						PDGroup: &aiv1alpha1.PDGroup{
+							GroupKey:      "pd-group",
+							DecodeLabels:  map[string]string{"role": "decode"},
+							PrefillLabels: map[string]string{"role": "prefill"},
+						},
+					},
+				},
+			}
+			require.NoError(t, store.AddOrUpdateModelServer(modelServer, nil))
+
+			for _, pod := range []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "decode-a", Namespace: "default",
+						Labels: map[string]string{"pd-group": "group-a", "role": "decode"}},
+					Status: corev1.PodStatus{PodIP: "10.0.0.1"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "prefill-a", Namespace: "default",
+						Labels: map[string]string{"pd-group": "group-a", "role": "prefill"}},
+					Status: corev1.PodStatus{PodIP: "10.0.0.2"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "decode-b", Namespace: "default",
+						Labels: map[string]string{"pd-group": "group-b", "role": "decode"}},
+					Status: corev1.PodStatus{PodIP: "10.0.0.3"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "prefill-b", Namespace: "default",
+						Labels: map[string]string{"pd-group": "group-b", "role": "prefill"}},
+					Status: corev1.PodStatus{PodIP: "10.0.0.4"},
+				},
+			} {
+				require.NoError(t, store.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{modelServer}))
+			}
+
+			if tt.deletePrefill != "" {
+				require.NoError(t, store.DeletePod(types.NamespacedName{
+					Namespace: "default", Name: tt.deletePrefill,
+				}))
+			}
+
+			pods, err := store.GetPodsByModelServer(modelServerName)
+			require.NoError(t, err)
+			for _, pod := range pods {
+				if pod.Pod == nil {
+					continue
+				}
+				if pod.Pod.Name == tt.overloadDecode || pod.Pod.Name == tt.overloadPrefill {
+					pod.RequestWaitingNum = 20
+				}
+			}
+
+			scheduler := NewScheduler(store, nil).(*SchedulerImpl)
+			ctx := &framework.Context{
+				Prompt:               &common.ChatMessage{},
+				ModelServerName:      modelServerName,
+				PDGroup:              modelServer.Spec.WorkloadSelector.PDGroup,
+				StickyPodName:        tt.stickyDecode,
+				StickyPrefillPodName: tt.stickyPrefill,
+			}
+			require.NoError(t, scheduler.Schedule(ctx, pods))
+			require.NotEmpty(t, ctx.DecodePods)
+			require.NotEmpty(t, ctx.PrefillPods)
+			require.NotNil(t, ctx.DecodePods[0].Pod)
+			require.NotNil(t, ctx.PrefillPods[0].Pod)
+
+			if tt.wantSingleCandidate {
+				require.Len(t, ctx.DecodePods, 1)
+				require.Len(t, ctx.PrefillPods, 1)
+			}
+			if tt.wantDecode != "" {
+				require.Equal(t, tt.wantDecode, ctx.DecodePods[0].Pod.Name)
+				require.Equal(t, tt.wantPrefill, ctx.PrefillPods[0].Pod.Name)
+			} else {
+				// Incomplete sticky hint must not early-return a single pinned pair.
+				// Both groups remain valid, so normal scoring should keep both candidates.
+				require.GreaterOrEqual(t, len(ctx.DecodePods), 2,
+					"incomplete sticky hint must not pin; expect normal topN candidates")
+				require.Equal(t, tt.stickyDecode, ctx.StickyPodName)
+				require.Equal(t, tt.stickyPrefill, ctx.StickyPrefillPodName)
+			}
+			if tt.wantStickyCleared {
+				require.Empty(t, ctx.StickyPodName)
+				require.Empty(t, ctx.StickyPrefillPodName)
+			}
+		})
+	}
+}
+
 // TestScheduleNonPDGroupWithEmptyScores tests non-PD scheduling with empty scores
 func TestScheduleNonPDGroupWithEmptyScores(t *testing.T) {
 	store := datastore.New()
@@ -305,6 +478,91 @@ func TestRunScorePluginsEdgeCases(t *testing.T) {
 			assert.Equal(t, 0, len(result))
 		})
 	}
+}
+
+// partialScorer returns only the scores it holds, like kvcache-aware does:
+// nil on a cold cache, and only the pods with cache hits otherwise.
+type partialScorer struct {
+	scores map[*datastore.PodInfo]int
+}
+
+func (p *partialScorer) Name() string { return "partial-scorer" }
+
+func (p *partialScorer) Score(_ *framework.Context, _ []*datastore.PodInfo) map[*datastore.PodInfo]int {
+	return p.scores
+}
+
+// TestRunScorePluginsKeepsUnscoredPods checks that a pod unscored by every plugin remains a candidate with score 0.
+func TestRunScorePluginsKeepsUnscoredPods(t *testing.T) {
+	podA := createTestPodInfo("pod-a")
+	podB := createTestPodInfo("pod-b")
+	filteredOut := createTestPodInfo("pod-filtered-out")
+	pods := []*datastore.PodInfo{podA, podB}
+
+	tests := []struct {
+		name     string
+		plugins  []*scorePlugin
+		expected map[*datastore.PodInfo]int
+	}{
+		{
+			name:     "no score plugins",
+			plugins:  nil,
+			expected: map[*datastore.PodInfo]int{podA: 0, podB: 0},
+		},
+		{
+			name:     "plugin returns nil",
+			plugins:  []*scorePlugin{{plugin: &partialScorer{}, weight: 1}},
+			expected: map[*datastore.PodInfo]int{podA: 0, podB: 0},
+		},
+		{
+			name: "plugin scores one pod",
+			plugins: []*scorePlugin{{
+				plugin: &partialScorer{scores: map[*datastore.PodInfo]int{podA: 100}},
+				weight: 2,
+			}},
+			expected: map[*datastore.PodInfo]int{podA: 200, podB: 0},
+		},
+		{
+			name: "plugin scores a pod that is not a candidate",
+			plugins: []*scorePlugin{{
+				plugin: &partialScorer{scores: map[*datastore.PodInfo]int{podA: 100, filteredOut: 100}},
+				weight: 1,
+			}},
+			expected: map[*datastore.PodInfo]int{podA: 100, podB: 0},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheduler := &SchedulerImpl{store: datastore.New(), scorePlugins: tt.plugins}
+			ctx := &framework.Context{
+				Prompt:          &common.ChatMessage{},
+				ModelServerName: types.NamespacedName{Namespace: "default", Name: "test"},
+			}
+
+			assert.Equal(t, tt.expected, scheduler.RunScorePlugins(pods, ctx))
+		})
+	}
+}
+
+// TestScheduleWhenScorePluginReturnsNoScores checks that Schedule still picks
+// the filtered pods when the only score plugin returns nothing.
+func TestScheduleWhenScorePluginReturnsNoScores(t *testing.T) {
+	podA := createTestPodInfo("pod-a")
+	podB := createTestPodInfo("pod-b")
+
+	scheduler := &SchedulerImpl{
+		store:        datastore.New(),
+		scorePlugins: []*scorePlugin{{plugin: &partialScorer{}, weight: 1}},
+	}
+	ctx := &framework.Context{
+		Prompt:          &common.ChatMessage{Text: "hello"},
+		Model:           "test-model",
+		ModelServerName: types.NamespacedName{Namespace: "default", Name: "test"},
+	}
+
+	require.NoError(t, scheduler.Schedule(ctx, []*datastore.PodInfo{podA, podB}))
+	assert.ElementsMatch(t, []*datastore.PodInfo{podA, podB}, ctx.BestPods)
 }
 
 // Helper function to create test PodInfo
@@ -396,5 +654,33 @@ func BenchmarkRunScorePlugins(b *testing.B) {
 				_ = scheduler.RunScorePlugins(pods, ctx)
 			}
 		})
+	}
+}
+
+// Helper function to build a scored pod map
+func benchScores(n int) map[*datastore.PodInfo]int {
+	m := make(map[*datastore.PodInfo]int, n)
+	for i := 0; i < n; i++ {
+		p := &datastore.PodInfo{Pod: &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pod-%d", i), Namespace: "default"},
+		}}
+		m[p] = (i * 7) % 101
+	}
+	return m
+}
+
+// BenchmarkTopNPodInfos measures top-N selection at the pod counts and topN values the scheduler uses.
+func BenchmarkTopNPodInfos(b *testing.B) {
+	for _, pods := range []int{8, 32, 128} {
+		for _, n := range []int{1, 5} {
+			b.Run(fmt.Sprintf("pods=%d/topN=%d", pods, n), func(b *testing.B) {
+				m := benchScores(pods)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_ = TopNPodInfos(m, n)
+				}
+			})
+		}
 	}
 }

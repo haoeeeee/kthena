@@ -15,6 +15,8 @@
 #      examples/redis/redis-standalone.yaml, or use the manifest referenced in the
 #      user guide. Update LMCACHE_REMOTE_URL below to match its address.
 #   2. A vLLM image that bundles LMCache (the image below already includes it).
+# ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute.
+# Removal is no earlier than v1.5.
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelBooster
 metadata:

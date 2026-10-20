@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -32,11 +33,11 @@ import (
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -221,7 +222,10 @@ type Store interface {
 	DeletePod(podName types.NamespacedName) error
 
 	// New methods for routing functionality
-	MatchModelTarget(modelName string, request *http.Request, gatewayKey string) (ModelTarget, bool, *aiv1alpha1.ModelRoute, error)
+	// MatchModelTarget matches a ModelRoute and selects a destination by rule
+	// weights. The matched rule is returned alongside the route, or nil when no
+	// ModelRoute matched.
+	MatchModelTarget(modelName string, request *http.Request, gatewayKey string) (ModelTarget, bool, *aiv1alpha1.ModelRoute, *aiv1alpha1.Rule, error)
 
 	// Model routing methods
 	AddOrUpdateModelRoute(mr *aiv1alpha1.ModelRoute) error
@@ -421,7 +425,8 @@ type store struct {
 	httpRoutes     map[string]*gatewayv1.HTTPRoute // key: namespace/name, value: *gatewayv1.HTTPRoute
 	gatewayRoutes  map[string]sets.Set[string]     // key: gateway key (namespace/name), value: set of HTTPRoute keys
 	// New fields for callback management
-	callbacks map[string][]CallbackFunc
+	callbacksMu sync.RWMutex
+	callbacks   map[string][]CallbackFunc
 
 	// initialSynced is used to indicate whether all the resources has been processed and storred into this store.
 	initialSynced *atomic.Bool
@@ -897,18 +902,43 @@ func (s *store) AddOrUpdateModelServer(ms *aiv1alpha1.ModelServer, pods sets.Set
 	if value, ok := s.modelServer.Load(name); !ok {
 		modelServerObj = newModelServer(ms)
 		// New object — no concurrent access yet, safe to write without lock
-		if len(pods) != 0 {
+		if pods != nil {
 			modelServerObj.pods = pods
 		}
+		// Pods handled before this ModelServer was added are already in s.pods
+		// but were never categorized. The lock is uncontended here; it is taken
+		// because categorizePodForPDGroupLocked requires it.
+		modelServerObj.mutex.Lock()
+		for podName := range modelServerObj.pods {
+			if value, ok := s.pods.Load(podName); ok {
+				modelServerObj.categorizePodForPDGroupLocked(podName, value.(*PodInfo).GetPodLabels())
+			}
+		}
+		modelServerObj.mutex.Unlock()
 	} else {
 		modelServerObj = value.(*modelServer)
 		// Existing object — concurrent readers may access modelServer and pods,
 		// so we must hold the lock to prevent data races.
 		modelServerObj.mutex.Lock()
+		selectorChanged := !reflect.DeepEqual(modelServerObj.modelServer.Spec.WorkloadSelector, ms.Spec.WorkloadSelector)
 		modelServerObj.modelServer = ms
-		if len(pods) != 0 {
-			// do not operate s.pods here, which are done within pod handler
+		if pods != nil {
+			// A non-nil set is an explicit replacement, so an empty set clears the
+			// previous pods instead of being ignored; callers pass nil to leave the
+			// pod set untouched. Do not operate s.pods here, which are done within
+			// pod handler.
 			modelServerObj.pods = pods
+		}
+		if selectorChanged {
+			// Publish the new configuration and classification indexes together.
+			clear(modelServerObj.pdGroups)
+			clear(modelServerObj.decodePodGroups)
+			clear(modelServerObj.prefillPodGroups)
+			for podName := range modelServerObj.pods {
+				if value, ok := s.pods.Load(podName); ok {
+					modelServerObj.categorizePodForPDGroupLocked(podName, value.(*PodInfo).GetPodLabels())
+				}
+			}
 		}
 		modelServerObj.mutex.Unlock()
 	}
@@ -930,6 +960,11 @@ func (s *store) DeleteModelServer(ms types.NamespacedName) error {
 			podInfo.RemoveModelServer(ms)
 			if podInfo.GetModelServerCount() == 0 {
 				s.pods.Delete(podName)
+				// Dispatched after the removal, as DeletePod does.
+				s.triggerCallbacks("Pod", EventData{
+					EventType: EventDelete,
+					Pod:       podName,
+				})
 			}
 		} else {
 			klog.Warningf("pod %s not found", podName)
@@ -1099,17 +1134,20 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 		oldPodInfo := value.(*PodInfo)
 		oldModelServers := oldPodInfo.GetModelServers()
 		// Handle the case where the pod no longer belongs to some model servers
-		oldPodLabels := oldPodInfo.GetPodLabels()
 		for msName := range oldModelServers.Difference(newModelServers) {
 			if value, ok := s.modelServer.Load(msName); ok {
 				ms := value.(*modelServer)
 				ms.deletePod(podName)
 				// Remove from PDGroup categorizations
-				ms.removePodFromPDGroups(podName, oldPodLabels)
+				ms.removePodFromPDGroups(podName)
 			}
 		}
 
 		oldPodInfo.UpdatePod(pod, engine, newModelServers)
+		s.triggerCallbacks("Pod", EventData{
+			EventType: EventUpdate,
+			Pod:       podName,
+		})
 		return nil
 	}
 
@@ -1121,6 +1159,10 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 		models:      sets.New[string](),
 	}
 	s.pods.Store(podName, newPodInfo)
+	s.triggerCallbacks("Pod", EventData{
+		EventType: EventAdd,
+		Pod:       podName,
+	})
 	s.updatePodMetrics(newPodInfo)
 	s.updatePodModels(newPodInfo)
 
@@ -1168,13 +1210,12 @@ func (s *store) DeletePod(podName types.NamespacedName) error {
 	if value, ok := s.pods.Load(podName); ok {
 		pod := value.(*PodInfo)
 		modelServers := pod.GetModelServers()
-		podLabels := pod.GetPodLabels()
 		for modelServerName := range modelServers {
 			if value, ok := s.modelServer.Load(modelServerName); ok {
 				ms := value.(*modelServer)
 				ms.deletePod(podName)
 				// Remove from PDGroup categorizations
-				ms.removePodFromPDGroups(podName, podLabels)
+				ms.removePodFromPDGroups(podName)
 			} else {
 				klog.V(4).Infof("model server %s not found for pod %s, maybe already deleted", modelServerName, podName)
 			}
@@ -1346,7 +1387,7 @@ func (s *store) removeModelRouteFromIndexesLocked(namespacedName string) (string
 
 				if routeSet, exists := s.gatewayModelRoutes[gatewayKey]; exists {
 					routeSet.Delete(namespacedName)
-					if routeSet.IsEmpty() {
+					if routeSet.Len() == 0 {
 						delete(s.gatewayModelRoutes, gatewayKey)
 					}
 				}
@@ -1401,7 +1442,23 @@ func (s *store) DeleteModelRoute(namespacedName string) error {
 	return nil
 }
 
-func (s *store) MatchModelTarget(model string, req *http.Request, gatewayKey string) (ModelTarget, bool, *aiv1alpha1.ModelRoute, error) {
+func (s *store) MatchModelTarget(model string, req *http.Request, gatewayKey string) (ModelTarget, bool, *aiv1alpha1.ModelRoute, *aiv1alpha1.Rule, error) {
+	mr, rule, isLora, err := s.matchModelRoute(model, req, gatewayKey)
+	if err != nil {
+		return ModelTarget{}, false, nil, nil, err
+	}
+	dst, err := s.selectDestination(rule.TargetModels)
+	if err != nil {
+		return ModelTarget{}, false, nil, nil, err
+	}
+	target, err := modelTargetFromDestination(mr.Namespace, dst)
+	if err != nil {
+		return ModelTarget{}, false, nil, nil, err
+	}
+	return target, isLora, mr, rule, nil
+}
+
+func (s *store) matchModelRoute(model string, req *http.Request, gatewayKey string) (*aiv1alpha1.ModelRoute, *aiv1alpha1.Rule, bool, error) {
 	s.routeMutex.RLock()
 	defer s.routeMutex.RUnlock()
 
@@ -1417,7 +1474,7 @@ func (s *store) MatchModelTarget(model string, req *http.Request, gatewayKey str
 		// Try to find routes by lora name
 		loraRoutes, ok := s.loraRoutes[model]
 		if !ok {
-			return ModelTarget{}, false, nil, fmt.Errorf("not found route rules for model %s", model)
+			return nil, nil, false, fmt.Errorf("not found route rules for model %s", model)
 		}
 		candidateRoutes = loraRoutes
 		isLora = true
@@ -1446,23 +1503,17 @@ func (s *store) MatchModelTarget(model string, req *http.Request, gatewayKey str
 		if err != nil {
 			continue // Try next ModelRoute
 		}
-
-		dst, err := s.selectDestination(rule.TargetModels)
-		if err != nil {
-			continue // Try next ModelRoute
+		if rule == nil || len(rule.TargetModels) == 0 {
+			continue
 		}
-
-		// Found a matching ModelRoute
-		target, err := modelTargetFromDestination(mr.Namespace, dst)
-		if err != nil {
-			klog.Warningf("failed to resolve target for ModelRoute %s/%s: %v", mr.Namespace, mr.Name, err)
-			continue // Try next ModelRoute
+		if _, err := toWeightedSlice(rule.TargetModels); err != nil {
+			continue
 		}
-		return target, isLora, mr, nil
+		return mr, rule, isLora, nil
 	}
 
 	// No matching ModelRoute found
-	return ModelTarget{}, false, nil, fmt.Errorf("no matching ModelRoute found for model %s", model)
+	return nil, nil, false, fmt.Errorf("no matching ModelRoute found for model %s", model)
 }
 
 func modelTargetFromDestination(namespace string, target *aiv1alpha1.TargetModel) (ModelTarget, error) {
@@ -1782,14 +1833,20 @@ func (s *store) updatePodModels(podInfo *PodInfo) {
 }
 
 func (s *store) getPodWorkloadPort(podInfo *PodInfo) uint32 {
-	modelServers := podInfo.GetModelServers()
-	for msName := range modelServers {
+	var fallback int32
+	for msName := range podInfo.GetModelServers() {
 		if msValue, ok := s.modelServer.Load(msName); ok {
 			ms := msValue.(*modelServer).getModelServer()
 			if ms != nil && ms.Spec.WorkloadPort.Port > 0 {
-				return uint32(ms.Spec.WorkloadPort.Port)
+				fallback = ms.Spec.WorkloadPort.Port
+				break
 			}
 		}
+	}
+	// Statically configured endpoints may carry their own port, which overrides
+	// `spec.workloadPort.port` and is the only port when the latter is unset.
+	if port := utils.EndpointPort(podInfo.GetPod(), fallback); port > 0 {
+		return uint32(port)
 	}
 	return 0
 }
@@ -1835,20 +1892,19 @@ func updateHistogramMetrics(podinfo *PodInfo, histogramMetrics map[string]*dto.H
 }
 
 // RegisterCallback registers a callback function for a specific resource
-// Note this can only be called during bootstrapping.
 func (s *store) RegisterCallback(kind string, callback CallbackFunc) {
-	if _, exists := s.callbacks[kind]; !exists {
-		s.callbacks[kind] = make([]CallbackFunc, 0)
-	}
+	s.callbacksMu.Lock()
+	defer s.callbacksMu.Unlock()
 	s.callbacks[kind] = append(s.callbacks[kind], callback)
 }
 
 // triggerCallbacks executes all registered callbacks for a specific event type
 func (s *store) triggerCallbacks(kind string, data EventData) {
-	if callbacks, exists := s.callbacks[kind]; exists {
-		for _, callback := range callbacks {
-			go callback(data)
-		}
+	s.callbacksMu.RLock()
+	callbacks := s.callbacks[kind]
+	s.callbacksMu.RUnlock()
+	for _, callback := range callbacks {
+		go callback(data)
 	}
 }
 
@@ -1907,7 +1963,7 @@ func (p *PodInfo) Contains(model string) bool {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
-	return p.models != nil && p.models.Contains(model)
+	return p.models != nil && p.models.Has(model)
 }
 
 // UpdateModels updates the models set with a new list of models
@@ -1964,7 +2020,7 @@ func (p *PodInfo) HasModelServer(ms types.NamespacedName) bool {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
-	return p.modelServer != nil && p.modelServer.Contains(ms)
+	return p.modelServer != nil && p.modelServer.Has(ms)
 }
 
 // GetModelServerCount returns the number of model servers
@@ -2393,7 +2449,7 @@ func (s *store) AddOrUpdateHTTPRoute(httpRoute *gatewayv1.HTTPRoute) error {
 
 				if routeSet, exists := s.gatewayRoutes[gatewayKey]; exists {
 					routeSet.Delete(key)
-					if routeSet.IsEmpty() {
+					if routeSet.Len() == 0 {
 						delete(s.gatewayRoutes, gatewayKey)
 					}
 				}
@@ -2436,7 +2492,7 @@ func (s *store) DeleteHTTPRoute(key string) error {
 		// Remove from gateway routes mapping
 		for gatewayKey, routeSet := range s.gatewayRoutes {
 			routeSet.Delete(key)
-			if routeSet.IsEmpty() {
+			if routeSet.Len() == 0 {
 				delete(s.gatewayRoutes, gatewayKey)
 			}
 		}

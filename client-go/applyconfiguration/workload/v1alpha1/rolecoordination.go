@@ -24,9 +24,22 @@ import (
 
 // RoleCoordinationApplyConfiguration represents a declarative configuration of the RoleCoordination type for use
 // with apply.
+//
+// RoleCoordination enables proportional rolling updates across selected Roles
+// in each ServingGroup. Its presence and policy are immutable after creation.
 type RoleCoordinationApplyConfiguration struct {
-	Roles        []string                                  `json:"roles,omitempty"`
-	MaxSkew      *intstr.IntOrString                       `json:"maxSkew,omitempty"`
+	// Roles selects the Roles participating in coordinated rolling update. An
+	// empty list selects every Role in spec.template.roles.
+	Roles []string `json:"roles,omitempty"`
+	// MaxSkew is the maximum percentage-point difference allowed between the
+	// target-version Ready ratios of participating Roles, using their entire formal
+	// replica count, including partition-protected capacity. Only percentage values,
+	// for example "10%", are accepted.
+	MaxSkew *intstr.IntOrString `json:"maxSkew,omitempty"`
+	// Dependencies defines rollout startup dependencies. A graph root waits for
+	// target-version Ready capacity throughout its dependency closure before its
+	// first target start. Internal Roles may start together; old dependency
+	// capacity is retained while old callers remain.
 	Dependencies []RoleRolloutDependencyApplyConfiguration `json:"dependencies,omitempty"`
 }
 

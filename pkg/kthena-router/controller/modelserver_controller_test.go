@@ -35,6 +35,7 @@ import (
 	kthenafake "github.com/volcano-sh/kthena/client-go/clientset/versioned/fake"
 	informersv1alpha1 "github.com/volcano-sh/kthena/client-go/informers/externalversions"
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
@@ -74,6 +75,7 @@ func TestModelServerController_ModelServerLifecycle(t *testing.T) {
 		kthenaInformerFactory,
 		kubeInformerFactory,
 		store,
+		common.NewTransportRegistry(),
 	)
 	require.NoError(t, err)
 	modelServerIndexer := kthenaInformerFactory.Networking().V1alpha1().ModelServers().Informer().GetIndexer()
@@ -276,6 +278,7 @@ func TestModelServerController_PodLifecycle(t *testing.T) {
 		kthenaInformerFactory,
 		kubeInformerFactory,
 		store,
+		common.NewTransportRegistry(),
 	)
 	require.NoError(t, err)
 
@@ -493,6 +496,7 @@ func TestModelServerController_ErrorHandling(t *testing.T) {
 		kthenaInformerFactory,
 		kubeInformerFactory,
 		store,
+		common.NewTransportRegistry(),
 	)
 	require.NoError(t, err)
 
@@ -538,6 +542,7 @@ func TestModelServerController_WorkQueueProcessing(t *testing.T) {
 		kthenaInformerFactory,
 		kubeInformerFactory,
 		store,
+		common.NewTransportRegistry(),
 	)
 	require.NoError(t, err)
 
@@ -614,6 +619,7 @@ func TestModelServerController_PodSelectionLogic(t *testing.T) {
 		kthenaInformerFactory,
 		kubeInformerFactory,
 		store,
+		common.NewTransportRegistry(),
 	)
 	require.NoError(t, err)
 
@@ -803,6 +809,7 @@ func TestModelServerController_ComprehensiveLifecycleTest(t *testing.T) {
 		kthenaInformerFactory,
 		kubeInformerFactory,
 		store,
+		common.NewTransportRegistry(),
 	)
 	require.NoError(t, err)
 
@@ -980,6 +987,7 @@ func TestModelServerController_SharedPods(t *testing.T) {
 		kthenaInformerFactory,
 		kubeInformerFactory,
 		store,
+		common.NewTransportRegistry(),
 	)
 	require.NoError(t, err)
 
@@ -1070,6 +1078,84 @@ func TestModelServerController_SharedPods(t *testing.T) {
 }
 
 // Helper functions for testing
+
+// TestModelServerController_TransportRegistry verifies the controller drives
+// the per-ModelServer transport registry on add/update/delete.
+func TestModelServerController_TransportRegistry(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	kthenaClient := kthenafake.NewSimpleClientset()
+
+	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	kthenaInformerFactory := informersv1alpha1.NewSharedInformerFactory(kthenaClient, 0)
+
+	store := newStoreWithMockBackend()
+	registry := common.NewTransportRegistry()
+	controller, err := NewModelServerController(
+		kthenaInformerFactory,
+		kubeInformerFactory,
+		store,
+		registry,
+	)
+	require.NoError(t, err)
+
+	modelServerIndexer := kthenaInformerFactory.Networking().V1alpha1().ModelServers().Informer().GetIndexer()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	kthenaInformerFactory.Start(stop)
+	kubeInformerFactory.Start(stop)
+	waitForCacheSync(t, 5*time.Second, controller.modelServerSynced, controller.podSynced)
+
+	perHost := int32(128)
+	msName := types.NamespacedName{Namespace: "default", Name: "ms-connpool"}
+	ms := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ms-connpool"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			InferenceEngine: aiv1alpha1.VLLM,
+			WorkloadSelector: &aiv1alpha1.WorkloadSelector{
+				MatchLabels: map[string]string{"app": "ms-connpool"},
+			},
+			TrafficPolicy: &aiv1alpha1.TrafficPolicy{
+				ConnectionPool: &aiv1alpha1.ConnectionPool{
+					MaxIdleConnectionsPerHost: &perHost,
+				},
+			},
+		},
+	}
+
+	// Add: registry should create a transport matching the config.
+	require.NoError(t, modelServerIndexer.Add(ms.DeepCopy()))
+	require.NoError(t, controller.syncModelServerHandler("default/ms-connpool"))
+	got := registry.Get(msName)
+	require.NotNil(t, got)
+	assert.Equal(t, 128, got.MaxIdleConnsPerHost)
+
+	// Update with a new per-host value: registry should rebuild.
+	newPerHost := int32(32)
+	updated := ms.DeepCopy()
+	updated.Spec.TrafficPolicy.ConnectionPool.MaxIdleConnectionsPerHost = &newPerHost
+	require.NoError(t, modelServerIndexer.Update(updated.DeepCopy()))
+	require.NoError(t, controller.syncModelServerHandler("default/ms-connpool"))
+	got = registry.Get(msName)
+	require.NotNil(t, got)
+	assert.Equal(t, 32, got.MaxIdleConnsPerHost)
+
+	// Update that drops trafficPolicy: registry keeps an isolated default pool
+	// (issue #1734 — omitting connectionPool still isolates the ModelServer).
+	updated2 := ms.DeepCopy()
+	updated2.Spec.TrafficPolicy = nil
+	require.NoError(t, modelServerIndexer.Update(updated2.DeepCopy()))
+	require.NoError(t, controller.syncModelServerHandler("default/ms-connpool"))
+	got = registry.Get(msName)
+	require.NotNil(t, got, "omitted connectionPool must still yield an isolated default transport")
+	assert.Equal(t, common.DefaultPoolConfig().MaxIdleConnsPerHost, got.MaxIdleConnsPerHost)
+
+	// Delete: registry entry removed, store also cleared.
+	require.NoError(t, modelServerIndexer.Delete(ms.DeepCopy()))
+	require.NoError(t, controller.syncModelServerHandler("default/ms-connpool"))
+	assert.Nil(t, registry.Get(msName))
+	assert.Nil(t, store.GetModelServer(msName))
+}
 
 // waitForCacheSync waits for the informer caches to sync with a timeout
 func waitForCacheSync(t *testing.T, timeout time.Duration, cacheSyncWaiters ...cache.InformerSynced) bool {

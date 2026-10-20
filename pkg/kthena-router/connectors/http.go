@@ -18,6 +18,7 @@ package connectors
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/klog/v2"
@@ -43,25 +44,26 @@ func (h *HTTPConnector) Name() string {
 }
 
 // prefill executes prefill request
-func (h *HTTPConnector) prefill(req *http.Request, prefillAddr string) error {
+func (h *HTTPConnector) prefill(req *http.Request, prefillAddr string, timeout time.Duration, rt http.RoundTripper) error {
 	req.URL.Host = prefillAddr
 	req.URL.Scheme = "http"
 
 	klog.V(4).Infof("Sending prefill request to %s", prefillAddr)
-	return prefillerProxy(nil, req)
+	return prefillerProxy(req, timeout, rt)
 }
 
 // decode executes decode request and streams response
-func (h *HTTPConnector) decode(c *gin.Context, req *http.Request, decodeAddr string) (int, error) {
+func (h *HTTPConnector) decode(c *gin.Context, req *http.Request, decodeAddr string, timeout time.Duration, rt http.RoundTripper) (int, error) {
 	req.URL.Host = decodeAddr
 	req.URL.Scheme = "http"
 
 	klog.V(4).Infof("Sending decode request to %s", decodeAddr)
-	return decoderProxy(c, req)
+	return decoderProxy(c, req, timeout, rt)
 }
 
 // Proxy executes the complete prefill-decode flow for HTTP connector
-func (h *HTTPConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *OnFlightHooks) (int, error) {
+func (h *HTTPConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, timeout time.Duration, hooks *OnFlightHooks) (int, error) {
+	rt := upstreamRoundTripper(c)
 	// Get metrics recorder from context
 	var metricsRecorder *metrics.RequestMetricsRecorder
 	if recorder, exists := c.Get("metricsRecorder"); exists {
@@ -74,7 +76,7 @@ func (h *HTTPConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, pr
 	h.decodeRequest = BuildDecodeRequest(c, c.Request, decodeBody)
 
 	prefillBody := cloneReqBody(reqBody)
-	h.prefillRequest = buildPrefillRequest(c.Request, prefillBody)
+	h.prefillRequest = buildPrefillRequest(c, c.Request, prefillBody)
 
 	// --- Prefill phase ---
 	if metricsRecorder != nil {
@@ -85,7 +87,7 @@ func (h *HTTPConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, pr
 		hooks.IncrPrefill()
 	}
 
-	err := h.prefill(h.prefillRequest, prefillAddr)
+	err := h.prefill(h.prefillRequest, prefillAddr, timeout, rt)
 
 	if hooks != nil && hooks.DecrPrefill != nil {
 		hooks.DecrPrefill()
@@ -112,7 +114,7 @@ func (h *HTTPConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, pr
 		hooks.IncrDecode()
 	}
 
-	result, decodeErr := h.decode(c, h.decodeRequest, decodeAddr)
+	result, decodeErr := h.decode(c, h.decodeRequest, decodeAddr, timeout, rt)
 
 	if hooks != nil && hooks.DecrDecode != nil {
 		hooks.DecrDecode()

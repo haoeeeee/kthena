@@ -72,18 +72,18 @@ func TestModelRouteController_Lifecycle(t *testing.T) {
 			t.Fatal("Failed to sync caches within timeout")
 		}
 
-		found := waitForObjectInCache(t, 2*time.Second, func() bool {
+		found := waitForObjectInCache(t, 5*time.Second, func() bool {
 			_, err := controller.modelRouteLister.ModelRoutes("default").Get("test-modelroute")
 			return err == nil
 		})
-		assert.True(t, found, "ModelRoute should be in cache")
+		require.True(t, found, "ModelRoute should be in cache")
 
 		key := "default/test-modelroute"
 		err = controller.syncHandler(key)
 		assert.NoError(t, err)
 
 		storedRoute := store.GetModelRoute("default/test-modelroute")
-		assert.NotNil(t, storedRoute)
+		require.NotNil(t, storedRoute)
 		assert.Equal(t, "test-model", storedRoute.Spec.ModelName)
 	})
 
@@ -92,7 +92,7 @@ func TestModelRouteController_Lifecycle(t *testing.T) {
 	t.Run("ModelRouteUpdate", func(t *testing.T) {
 		existing, err := kthenaClient.NetworkingV1alpha1().ModelRoutes("default").Get(
 			context.Background(), "test-modelroute", metav1.GetOptions{})
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		updated := existing.DeepCopy()
 		updated.Spec.Rules = []*aiv1alpha1.Rule{
@@ -108,17 +108,17 @@ func TestModelRouteController_Lifecycle(t *testing.T) {
 			context.Background(), updated, metav1.UpdateOptions{})
 		assert.NoError(t, err)
 
-		found := waitForObjectInCache(t, 2*time.Second, func() bool {
+		found := waitForObjectInCache(t, 5*time.Second, func() bool {
 			mr, err := controller.modelRouteLister.ModelRoutes("default").Get("test-modelroute")
 			return err == nil && len(mr.Spec.Rules) > 0 && mr.Spec.Rules[0].Name == "rule-updated"
 		})
-		assert.True(t, found, "ModelRoute update should be reflected in cache")
+		require.True(t, found, "ModelRoute update should be reflected in cache")
 
 		err = controller.syncHandler("default/test-modelroute")
 		assert.NoError(t, err)
 
 		storedRoute := store.GetModelRoute("default/test-modelroute")
-		assert.NotNil(t, storedRoute)
+		require.NotNil(t, storedRoute)
 		assert.Equal(t, "updated-server", storedRoute.Spec.Rules[0].TargetModels[0].ModelServerName)
 	})
 
@@ -129,7 +129,7 @@ func TestModelRouteController_Lifecycle(t *testing.T) {
 			context.Background(), "test-modelroute", metav1.DeleteOptions{})
 		assert.NoError(t, err)
 
-		found := waitForObjectInCache(t, 2*time.Second, func() bool {
+		found := waitForObjectInCache(t, 5*time.Second, func() bool {
 			_, err := controller.modelRouteLister.ModelRoutes("default").Get("test-modelroute")
 			return err != nil
 		})

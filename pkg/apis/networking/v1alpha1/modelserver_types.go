@@ -33,13 +33,33 @@ type ModelServerSpec struct {
 	InferenceEngine InferenceEngine `json:"inferenceEngine"`
 	// WorkloadSelector is used to match the model serving instances.
 	// Currently, they must be pods within the same namespace as modelServer object.
+	// `workloadSelector.matchLabels` and `endpoints` are mutually exclusive ways of
+	// declaring the serving instances, so exactly one of them must be used.
+	// `workloadSelector.pdGroup` does not select instances; it only assigns them
+	// prefill and decode roles, and therefore is the sole `workloadSelector` field
+	// that may also be combined with `endpoints`.
 	//
-	// +kubebuilder:validation:Required
-	WorkloadSelector *WorkloadSelector `json:"workloadSelector"`
+	// +optional
+	WorkloadSelector *WorkloadSelector `json:"workloadSelector,omitempty"`
+
+	// Endpoints is a static list of model serving instances. It is intended for
+	// deployments where the serving instances are not discoverable as pods of the
+	// cluster the router runs in, for example when the router reads its
+	// configuration from local files instead of the Kubernetes API server.
+	// `endpoints` and `workloadSelector.matchLabels` are mutually exclusive;
+	// exactly one of them must be specified.
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=1024
+	Endpoints []Endpoint `json:"endpoints,omitempty"`
 
 	// WorkloadPort defines the port and protocol configuration for the model server.
-	// +kubebuilder:validation:Required
-	WorkloadPort WorkloadPort `json:"workloadPort"`
+	// It may be omitted only when every entry in `endpoints` declares its own
+	// `port`; endpoints without an explicit `port` fall back to `workloadPort.port`.
+	// +optional
+	WorkloadPort WorkloadPort `json:"workloadPort,omitempty"`
 
 	// Traffic Policy for accessing the model server instance.
 	// +optional
@@ -86,6 +106,40 @@ type PDGroup struct {
 	DecodeLabels map[string]string `json:"decodeLabels"`
 }
 
+// Endpoint describes a single statically configured model serving instance.
+type Endpoint struct {
+	// Name uniquely identifies the endpoint within the ModelServer. Together with
+	// the ModelServer name it forms the instance identity in the router, for
+	// example in metrics and debug output.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Name string `json:"name"`
+
+	// Address is the IP address or DNS name of the model serving instance.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MaxLength=253
+	Address string `json:"address"`
+
+	// Port is the port the model serving instance listens on. It defaults to
+	// `spec.workloadPort.port` when unset.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port *int32 `json:"port,omitempty"`
+
+	// Labels are attached to the endpoint. They do not select serving instances;
+	// they are only matched against `workloadSelector.pdGroup` to assign the
+	// endpoint a prefill or decode role, `pdGroup` being the sole
+	// `workloadSelector` field that may be combined with `endpoints`.
+	//
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
 // WorkloadPort defines the port and protocol configuration for the model server.
 type WorkloadPort struct {
 	// The port of the model server. The number must be between 1 and 65535.
@@ -120,18 +174,91 @@ type KVConnectorSpec struct {
 	Type KVConnectorType `json:"type,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.sessionSticky) || self.sessionSticky == null || size(self.sessionSticky.sources) > 0", message="sessionSticky.sources must be non-empty when sessionSticky is set"
 type TrafficPolicy struct {
 	// Timeout bounds how long the router waits for the backend to start responding,
 	// covering connection setup, sending the request and waiting for the response
-	// headers. It does not bound the response body, so a streamed response may run
-	// longer. By default, there is no timeout.
+	// headers. It does not bound inference response bodies, so a streamed response
+	// may run longer. Connector setup exchanges may use the timeout for their
+	// complete response. By default, there is no timeout.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 	// The retry policy for the inference request.
 	// +optional
 	Retry *Retry `json:"retry,omitempty"`
+	// ConnectionPool configures the upstream HTTP connection pool used when
+	// forwarding to this ModelServer's pods. When omitted, a shared default
+	// pool is used. Each ModelServer that sets this gets its own isolated pool.
+	// +optional
+	ConnectionPool *ConnectionPool `json:"connectionPool,omitempty"`
+
+	// SessionSticky pins requests with the same extracted session key to the same
+	// backend Pod of this ModelServer for a TTL. Nil or omitted disables session
+	// affinity for this ModelServer. It does not override ModelRoute weighted
+	// selection among ModelServers.
+	// +optional
+	SessionSticky *SessionSticky `json:"sessionSticky,omitempty"`
 
 	// TODO: add LoadBalancer policy
+}
+
+// ConnectionPool configures the HTTP connection pool for a ModelServer.
+type ConnectionPool struct {
+	// MaxIdleConnections is the total idle connections across all endpoints.
+	// Defaults to 100 when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxIdleConnections *int32 `json:"maxIdleConnections,omitempty"`
+	// MaxIdleConnectionsPerHost is the idle connections per pod/endpoint.
+	// Defaults to 64 when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxIdleConnectionsPerHost *int32 `json:"maxIdleConnectionsPerHost,omitempty"`
+	// MaxConnectionsPerHost limits dialing, active and idle connections per host.
+	// 0 means unlimited. Defaults to 0 when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxConnectionsPerHost *int32 `json:"maxConnectionsPerHost,omitempty"`
+	// IdleTimeout is how long an idle connection stays open before closing.
+	// Defaults to 90s when omitted.
+	// +optional
+	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
+}
+
+// SessionSticky configures per-ModelServer session key extraction and binding TTL.
+// The backing store (memory vs Redis) is configured in the router process, not here.
+type SessionSticky struct {
+	// SessionAffinitySeconds is binding TTL in seconds.
+	// Once the session has been idle for more than the specified duration, the session becomes invalid.
+	// When unset, the default is 300 (5 minutes).
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	SessionAffinitySeconds *int32 `json:"sessionAffinitySeconds,omitempty"`
+	// Sources are evaluated in order; the first non-empty extracted value is the session key.
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Sources []SessionKeySource `json:"sources,omitempty"`
+}
+
+// SessionKeySourceType identifies how a session key fragment is read.
+// +kubebuilder:validation:Enum=Header;Query;Cookie;JWTClaim
+type SessionKeySourceType string
+
+const (
+	SessionKeySourceHeader   SessionKeySourceType = "Header"
+	SessionKeySourceQuery    SessionKeySourceType = "Query"
+	SessionKeySourceCookie   SessionKeySourceType = "Cookie"
+	SessionKeySourceJWTClaim SessionKeySourceType = "JWTClaim"
+)
+
+// SessionKeySource defines one session key extraction rule.
+type SessionKeySource struct {
+	// +kubebuilder:validation:Required
+	Type SessionKeySourceType `json:"type"`
+	// Name is the header name, query key, cookie name, or JWT claim name.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
 }
 
 type Retry struct {

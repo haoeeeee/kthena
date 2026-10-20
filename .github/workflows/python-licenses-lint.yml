@@ -7,6 +7,8 @@ on:
       - release-*
     paths:
       - "python/**"
+      - "config/python-licenses-lint.ini"
+      - ".github/workflows/python-licenses-lint.yml"
 
 jobs:
   python-licenses-lint:

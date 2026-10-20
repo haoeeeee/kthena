@@ -166,22 +166,22 @@ func (autoscaler *DisaggregatedAutoscaler) Scale(ctx context.Context, podLister 
 
 		// Metric sources are role-scoped before each collection so pod scraping is
 		// automatically filtered to pods carrying the current role label.
-		unreadyInstancesCount, readyInstancesMetrics, externalMetrics, err := collector.UpdateMetrics(ctx, podLister, metricSourcesForRole(roleName, roleParam.MetricSources))
+		unreadyInstancesCountByMetric, readyInstancesMetrics, externalMetrics, err := collector.UpdateMetrics(ctx, podLister, metricSourcesForRole(roleName, roleParam.MetricSources))
 		if err != nil {
 			return nil, fmt.Errorf("update metrics for role %s: %w", roleName, err)
 		}
 
 		scaleResult := scaleOneTarget(scaleOneTargetInput{
-			Status:                status,
-			Behavior:              &policy.Spec.Behavior,
-			MinReplicas:           roleParam.MinReplicas,
-			MaxReplicas:           roleParam.MaxReplicas,
-			CurrentReplicas:       current,
-			TolerancePercent:      policy.Spec.TolerancePercent,
-			MetricTargets:         collector.MetricTargets,
-			UnreadyInstancesCount: unreadyInstancesCount,
-			ReadyInstancesMetrics: readyInstancesMetrics,
-			ExternalMetrics:       externalMetrics,
+			Status:                        status,
+			Behavior:                      &policy.Spec.Behavior,
+			MinReplicas:                   roleParam.MinReplicas,
+			MaxReplicas:                   roleParam.MaxReplicas,
+			CurrentReplicas:               current,
+			TolerancePercent:              policy.Spec.TolerancePercent,
+			MetricTargets:                 collector.MetricTargets,
+			UnreadyInstancesCountByMetric: unreadyInstancesCountByMetric,
+			ReadyInstancesMetrics:         readyInstancesMetrics,
+			ExternalMetrics:               externalMetrics,
 		})
 		if scaleResult.Skip {
 			klog.InfoS("skip disaggregated scaling because role metrics are unavailable", "role", roleName)

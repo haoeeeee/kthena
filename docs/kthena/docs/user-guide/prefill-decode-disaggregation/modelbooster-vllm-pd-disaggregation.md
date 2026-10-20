@@ -1,5 +1,9 @@
 # Prefill-Decode Disaggregation with ModelBooster (vLLM, LMCache & NIXL)
 
+:::warning Deprecated examples
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. For new deployments, follow the [ModelServing guide for vLLM, NIXL and LMCache](./modelserving-vllm-pd-disaggregation.md). These ModelBooster examples are retained for existing users; see the [deprecation details](../model-deployment.md#modelbooster-deprecation).
+:::
+
 This page describes how to deploy prefill-decode disaggregated inference with a
 single `ModelBooster` resource on a GPU cluster, using either KV connector
 supported by [vLLM](https://github.com/vllm-project/vllm):

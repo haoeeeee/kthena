@@ -73,8 +73,8 @@ class S3Downloader(ModelDownloader):
     def download(self, output_dir: str):
         logger.info(f"Syncing: {self.model_uri} to {output_dir}")
 
-        if not self.access_key or not self.secret_key:
-            raise ValueError("Missing credentials")
+        if bool(self.access_key) != bool(self.secret_key):
+            raise ValueError("access_key and secret_key must be provided together")
 
         os.makedirs(output_dir, exist_ok=True)
         bucket_name, bucket_path = parse_bucket_from_model_url(self.model_uri, "s3")

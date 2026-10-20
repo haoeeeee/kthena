@@ -30,6 +30,104 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// TestSchedulerPluginKVCacheAware verifies cache hits prefer the owning replica and misses do not pin to one replica.
+func TestSchedulerPluginKVCacheAware(t *testing.T) {
+	ctx := context.Background()
+	redisCleanup := ensureRedis(t, testCtx.KubeClient, kthenaNamespace)
+	t.Cleanup(redisCleanup)
+
+	pods := setupKVCacheFixture(t, testCtx.KubeClient, testNamespace, kthenaNamespace)
+	_ = utils.CreateModelServerFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelServer-plugins-kvcache.yaml")
+
+	chatURL, metricsURL, restoreCfg := utils.ApplySchedulerConfig(t, testCtx.KubeClient, testCtx.KthenaClient, kthenaNamespace, testNamespace, schedulerKVCacheAware, kvCacheFixtureDeploymentName, plugincontext.ModelName)
+	t.Cleanup(restoreCfg)
+
+	route := utils.CreateModelRouteFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelRoute-plugins-kvcache.yaml")
+	prompt := "kthena kvcache routing test"
+	warmedPod := pods[0]
+	waitForKVCacheOwnership(t, warmedPod, kthenaNamespace, route.Spec.ModelName, prompt)
+
+	hitSince := metav1.NewTime(time.Now())
+	utils.SendRouterChatRequests(t, chatURL, route.Spec.ModelName, prompt, kvCacheRoutingRequestCount)
+	time.Sleep(2 * time.Second)
+
+	warmedCount := utils.CountSelectedPodInRouterLogs(t, testCtx.KubeClient, kthenaNamespace, warmedPod.Name, hitSince)
+	hitRouted := utils.CountSelectedPodsInRouterLogs(t, testCtx.KubeClient, kthenaNamespace, hitSince, pods)
+	t.Logf("kvcache-aware hit: warmed pod %s selected %d/%d (of %d log lines)", warmedPod.Name, warmedCount, kvCacheRoutingRequestCount, hitRouted)
+	require.GreaterOrEqual(t, hitRouted, kvCacheRoutingRequestCount/2, "expected access logs for cache-hit requests")
+	require.GreaterOrEqual(t, float64(warmedCount)/float64(hitRouted), 0.9)
+
+	missSince := metav1.NewTime(time.Now())
+	for i := 0; i < kvCacheRoutingRequestCount; i++ {
+		// Keep each miss prompt unique so routed requests do not warm later probes.
+		missPrompt := fmt.Sprintf("miss-%03d kvcache probe", i)
+		utils.SendRouterChatRequests(t, chatURL, route.Spec.ModelName, missPrompt, 1)
+	}
+	time.Sleep(2 * time.Second)
+
+	maxMissCount := 0
+	missRouted := 0
+	for _, pod := range pods {
+		selectedCount := utils.CountSelectedPodInRouterLogs(t, testCtx.KubeClient, kthenaNamespace, pod.Name, missSince)
+		missRouted += selectedCount
+		if selectedCount > maxMissCount {
+			maxMissCount = selectedCount
+		}
+	}
+	t.Logf("kvcache-aware miss: dominant pod selected %d/%d (of %d log lines)", maxMissCount, kvCacheRoutingRequestCount, missRouted)
+	require.GreaterOrEqual(t, missRouted, kvCacheRoutingRequestCount/2, "expected access logs for cache-miss requests")
+	require.Less(t, float64(maxMissCount)/float64(missRouted), 0.9)
+
+	waitForSchedulerPluginInMetrics(t, metricsURL, plugins.KVCacheAwarePluginName, "score")
+}
+
+// TestSchedulerPluginMixedWeights verifies plugin weights decide the winner when score plugins disagree.
+func TestSchedulerPluginMixedWeights(t *testing.T) {
+	ctx := context.Background()
+	redisCleanup := ensureRedis(t, testCtx.KubeClient, kthenaNamespace)
+	t.Cleanup(redisCleanup)
+
+	pods := setupKVCacheFixture(t, testCtx.KubeClient, testNamespace, kthenaNamespace)
+	_ = utils.CreateModelServerFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelServer-plugins-kvcache.yaml")
+	route := utils.CreateModelRouteFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelRoute-plugins-kvcache.yaml")
+	prompt := "kthena kvcache routing test"
+	warmedPod := pods[0]
+	otherHotPod := pods[1]
+	coldPod := pods[2]
+	hotPods := []corev1.Pod{warmedPod, otherHotPod}
+	coldPods := []corev1.Pod{coldPod}
+	waitForKVCacheOwnership(t, warmedPod, kthenaNamespace, route.Spec.ModelName, prompt)
+	stopWarmedLoad := utils.StartSustainedLongRequestsToPod(t, warmedPod, route.Spec.ModelName, prompt, gpuCacheUsageLoadConcurrency, gpuCacheUsageLoadMaxTokens)
+	t.Cleanup(stopWarmedLoad)
+	stopOtherLoad := utils.StartSustainedLongRequestsToPod(t, otherHotPod, route.Spec.ModelName, "unrelated gpu load prompt", gpuCacheUsageLoadConcurrency, gpuCacheUsageLoadMaxTokens)
+	t.Cleanup(stopOtherLoad)
+	messages := []utils.ChatMessage{utils.NewChatMessage("user", prompt)}
+
+	t.Run("kvcache weight wins", func(t *testing.T) {
+		schedulerConfig := schedulerKVCacheAndGPUUsage(mixedPluginDominantWeight, 1)
+		chatURL, metricsURL, restoreCfg := utils.ApplySchedulerConfig(t, testCtx.KubeClient, testCtx.KthenaClient, kthenaNamespace, testNamespace, schedulerConfig, kvCacheFixtureDeploymentName, plugincontext.ModelName)
+		t.Cleanup(restoreCfg)
+		waitForRouterGPUCacheSeparation(t, testCtx.KubeClient, kthenaNamespace, hotPods, coldPods)
+
+		selectedPod := utils.SelectedPodAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, chatURL, route.Spec.ModelName, messages, nil)
+		require.Equal(t, warmedPod.Name, selectedPod)
+		waitForSchedulerPluginInMetrics(t, metricsURL, plugins.KVCacheAwarePluginName, "score")
+		waitForSchedulerPluginInMetrics(t, metricsURL, plugins.GPUCacheUsagePluginName, "score")
+	})
+
+	t.Run("gpu usage weight wins", func(t *testing.T) {
+		schedulerConfig := schedulerKVCacheAndGPUUsage(1, mixedPluginDominantWeight)
+		chatURL, metricsURL, restoreCfg := utils.ApplySchedulerConfig(t, testCtx.KubeClient, testCtx.KthenaClient, kthenaNamespace, testNamespace, schedulerConfig, kvCacheFixtureDeploymentName, plugincontext.ModelName)
+		t.Cleanup(restoreCfg)
+		waitForRouterGPUCacheSeparation(t, testCtx.KubeClient, kthenaNamespace, hotPods, coldPods)
+
+		selectedPod := utils.SelectedPodAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, chatURL, route.Spec.ModelName, messages, nil)
+		require.Equal(t, coldPod.Name, selectedPod)
+		waitForSchedulerPluginInMetrics(t, metricsURL, plugins.KVCacheAwarePluginName, "score")
+		waitForSchedulerPluginInMetrics(t, metricsURL, plugins.GPUCacheUsagePluginName, "score")
+	})
+}
+
 // TestSchedulerPluginPrefixCache verifies repeated prompts stick to one pod after warmup.
 func TestSchedulerPluginPrefixCache(t *testing.T) {
 	ctx := context.Background()
@@ -129,8 +227,7 @@ func TestSchedulerPluginGPUCacheUsage(t *testing.T) {
 			gpuCacheUsageLoadConcurrency, gpuCacheUsageLoadMaxTokens)
 		t.Cleanup(stopLoad)
 	}
-	waitForMockPodKVCacheSeparation(t, busyPods, idlePod)
-	time.Sleep(3 * time.Second) // allow router to scrape updated mock metrics before probe traffic
+	waitForRouterGPUCacheSeparation(t, testCtx.KubeClient, kthenaNamespace, busyPods, []corev1.Pod{idlePod})
 
 	since := metav1.NewTime(time.Now())
 	utils.SendRouterChatRequests(t, chatURL, model, "kthena-router-plugin-e2e-fixed-prompt-gpu-usage-route", 200)

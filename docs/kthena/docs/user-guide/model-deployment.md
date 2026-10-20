@@ -1,15 +1,27 @@
 # Model Deployment
 
+## ModelBooster deprecation
+
+:::warning Deprecated in v1.1
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5.
+:::
+
+For new deployments, create and manage `ModelServing`, `ModelServer`, and `ModelRoute` directly. Start with the [ModelServing quick start](../getting-started/quick-start.md#modelserving) or the complete [vLLM prefill-decode guide](./prefill-decode-disaggregation/modelserving-vllm-pd-disaggregation.md). Configure autoscaling separately when needed; see the [autoscaling guide](./autoscaler.md).
+
+ModelBooster remains available and its controller remains enabled by default in v1.1. The ModelBooster examples below are retained for existing users. Deprecation does not require deleting existing resources: deleting a ModelBooster can also delete its generated resources through Kubernetes owner references.
+
+The earliest removal version is a lower bound, not a scheduled removal date. Follow [the deprecation tracking issue](https://github.com/volcano-sh/kthena/issues/1706) for migration work and future disabling and removal milestones; see [the original discussion](https://github.com/volcano-sh/kthena/issues/1679) for the rationale.
+
 ## ModelBooster vs ModelServing Deployment Approaches
 
-Kthena provides two approaches for deploying LLM inference workloads: the **ModelBooster approach** and the **ModelServing approach**. This section compares both approaches to help you choose the right one for your use case.
+Kthena recommends the **ModelServing approach** for new LLM inference workloads. The **ModelBooster approach** is deprecated and remains documented for existing users.
 
 ### Deployment Approach Comparison
 
 | Deployment Method | Manually Created CRDs                 | Automatically Managed Components      | Use Case                                     |
 |-------------------|---------------------------------------|---------------------------------------|----------------------------------------------|
-| **ModelBooster**  | ModelBooster                          | ModelServing, ModelServer, ModelRoute | Simplified deployment, automated management  |
-| **ModelServing**  | ModelServing, ModelServer, ModelRoute | Pod Management                        | Fine-grained control, complex configurations |
+| **ModelBooster (deprecated)** | ModelBooster                          | ModelServing, ModelServer, ModelRoute | Existing ModelBooster deployments             |
+| **ModelServing**  | ModelServing, ModelServer, ModelRoute | Pod Management                        | Recommended for new deployments               |
 
 ### ModelBooster Approach
 
@@ -62,12 +74,12 @@ Kthena provides two approaches for deploying LLM inference workloads: the **Mode
 
 ### Selection Guidance
 
-- **Recommended: Use ModelBooster Approach** - Suitable for most deployment scenarios, providing simple deployment and high automation with hardware optimization
-- **Use ModelServing Approach** - Only when fine-grained control or special hardware-specific configurations are required
+- **Recommended: Use ModelServing Approach** - Manage `ModelServing`, `ModelServer`, and `ModelRoute` directly for new deployments.
+- **ModelBooster Approach (deprecated)** - Retained for existing deployments during the deprecation period.
 
 ## Model Booster Examples
 
-Below are examples of ModelBooster configurations for different deployment scenarios.
+The following deprecated ModelBooster examples are retained for existing users. For new deployments, use the [ModelServing quick start](../getting-started/quick-start.md#modelserving).
 
 ### Aggregated Deployment
 

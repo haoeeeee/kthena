@@ -28,7 +28,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 
+	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 )
@@ -789,4 +791,43 @@ func BenchmarkModelPrefixStore_FindAndAdd(b *testing.B) {
 		}
 		wg.Wait()
 	}
+}
+
+type noopPodRuntimeInspector struct{}
+
+func (noopPodRuntimeInspector) GetPodMetrics(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+	return nil, nil
+}
+
+func (noopPodRuntimeInspector) GetPodModels(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
+	return nil, nil
+}
+
+func TestPrefixCacheReleasedWhenLastModelServerDeleted(t *testing.T) {
+	ds := datastore.New(datastore.WithPodRuntimeInspector(noopPodRuntimeInspector{}))
+	prefixStore := NewModelPrefixStore(ds, 100, 5)
+
+	msName := types.NamespacedName{Namespace: "default", Name: "ms1"}
+	podName := types.NamespacedName{Namespace: "default", Name: "pod1"}
+	ms := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: msName.Namespace, Name: msName.Name},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: podName.Namespace, Name: podName.Name},
+	}
+
+	assert.NoError(t, ds.AddOrUpdateModelServer(ms, sets.New(podName)))
+	assert.NoError(t, ds.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+
+	podInfo := ds.GetPodInfo(podName)
+	assert.NotNil(t, podInfo)
+
+	prefixStore.Add("model-a", []uint64{1, 2, 3}, podInfo)
+	assert.Equal(t, float64(3), prefixStore.EntryCount())
+
+	assert.NoError(t, ds.DeleteModelServer(msName))
+	assert.Nil(t, ds.GetPodInfo(podName), "pod leaves the datastore with its last model server")
+
+	assert.Eventually(t, func() bool { return prefixStore.EntryCount() == 0 }, time.Second, 10*time.Millisecond,
+		"prefix cache should release a pod that left the datastore")
 }

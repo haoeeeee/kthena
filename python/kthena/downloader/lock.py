@@ -14,10 +14,7 @@
 
 import fcntl
 import os
-import threading
-import time
 from typing import Optional, IO
-import stat
 
 from kthena.downloader.logger import setup_logger
 
@@ -29,13 +26,9 @@ class LockError(Exception):
 
 
 class LockManager:
-    def __init__(self, lock_path: str, timeout: int = 15):
+    def __init__(self, lock_path: str):
         self.lock_path = lock_path
-        self.timeout = timeout
-        self.renew_interval = 5
-        self.stop_renew_event = threading.Event()
         self._lock_file: Optional[IO] = None
-        self._renew_thread: Optional[threading.Thread] = None
         self._is_locked = False
 
     def __enter__(self) -> 'LockManager':
@@ -56,21 +49,33 @@ class LockManager:
         try:
             lock_dir = os.path.dirname(self.lock_path)
             os.makedirs(lock_dir, exist_ok=True)
-            if os.path.exists(self.lock_path):
-                mtime = os.path.getmtime(self.lock_path)
-                if time.time() - mtime < self.timeout:
-                    logger.info(f"Lock file exists and is not expired: {self.lock_path}")
-                    return False
-            self._lock_file = open(self.lock_path, "w")
-            os.chmod(self.lock_path, stat.S_IRUSR | stat.S_IWUSR)
+            try:
+                fd = os.open(
+                    self.lock_path,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                    0o666,
+                )
+                created = True
+            except FileExistsError:
+                fd = os.open(self.lock_path, os.O_RDWR)
+                created = False
+            try:
+                # The lock contains no secrets, and the cache directory is already
+                # shared writable storage. Ignore the process umask so pods running
+                # as different UIDs can contend on the same persistent inode.
+                if created:
+                    os.fchmod(fd, 0o666)
+                self._lock_file = os.fdopen(fd, "r+")
+            except Exception:
+                os.close(fd)
+                raise
             fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._lock_file.write(f"{os.getpid()}\n")
-            self._lock_file.flush()
-            os.utime(self.lock_path, None)
             self._is_locked = True
-            self._start_renew_thread()
             logger.info(f"Lock acquired: {self.lock_path}")
             return True
+        except BlockingIOError:
+            self._cleanup()
+            return False
         except Exception as e:
             logger.error(f"Error acquiring lock: {e}")
             self._cleanup()
@@ -79,18 +84,8 @@ class LockManager:
     def release(self) -> None:
         if not self._is_locked:
             return
-        self.stop_renew()
-        if self._lock_file:
-            try:
-                fcntl.flock(self._lock_file, fcntl.LOCK_UN)
-                self._lock_file.close()
-                if os.path.exists(self.lock_path):
-                    os.remove(self.lock_path)
-                    logger.info(f"Lock released and file removed: {self.lock_path}")
-            except Exception as e:
-                logger.error(f"Error releasing lock: {e}")
-            finally:
-                self._cleanup()
+        self._cleanup()
+        logger.info(f"Lock released: {self.lock_path}")
 
     def _cleanup(self) -> None:
         if self._lock_file:
@@ -100,31 +95,3 @@ class LockManager:
                 logger.error(f"Error while closing lock file: {e}")
         self._lock_file = None
         self._is_locked = False
-
-    def _start_renew_thread(self) -> None:
-        self.stop_renew_event.clear()
-        self._renew_thread = threading.Thread(
-            target=self.renew,
-            args=(self.renew_interval,),
-            daemon=True
-        )
-        self._renew_thread.start()
-
-    def renew(self, interval: int = 15) -> None:
-        while not self.stop_renew_event.is_set():
-            if not self._is_locked:
-                break
-            if os.path.exists(self.lock_path):
-                try:
-                    os.utime(self.lock_path, None)
-                    logger.info(f"Lock renewed: {self.lock_path}")
-                except IOError as e:
-                    logger.error(f"IOError while renewing lock: {e}")
-            else:
-                logger.warning(f"Lock file does not exist, renew skipped: {self.lock_path}")
-            self.stop_renew_event.wait(interval)
-
-    def stop_renew(self) -> None:
-        self.stop_renew_event.set()
-        if self._renew_thread and self._renew_thread.is_alive():
-            self._renew_thread.join(timeout=1.0)

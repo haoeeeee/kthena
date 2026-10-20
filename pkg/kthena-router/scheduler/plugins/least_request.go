@@ -18,8 +18,8 @@ package plugins
 
 import (
 	"math"
+	"slices"
 
-	"istio.io/istio/pkg/slices"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
@@ -68,10 +68,10 @@ func (l *LeastRequest) Name() string {
 }
 
 func (l *LeastRequest) Filter(ctx *framework.Context, pods []*datastore.PodInfo) []*datastore.PodInfo {
-	return slices.FilterInPlace(pods, func(info *datastore.PodInfo) bool {
+	return slices.DeleteFunc(pods, func(info *datastore.PodInfo) bool {
 		// Filter on engine-reported waiting queue: catches backlog the router
 		// cannot observe (requests already inside the engine but not yet running).
-		return info.GetRequestWaitingNum() < float64(l.maxWaitingRequests)
+		return info.GetRequestWaitingNum() >= float64(l.maxWaitingRequests)
 	})
 }
 
@@ -103,7 +103,9 @@ func (l *LeastRequest) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		}
 	}
 
-	// Normalise to [0, 100]: the least-loaded pod gets 100.
+	// Normalise to [0, 100] against maxScore (truncate to int): when
+	// maxScore > 0, the most-loaded pod gets 0 and a pod with base 0 gets 100;
+	// when maxScore == 0, all pods get 100.
 	for i, info := range pods {
 		score := 100.0
 		if maxScore > 0 {

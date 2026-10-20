@@ -188,7 +188,76 @@ func TestAccessLogEntry_WithError(t *testing.T) {
 	config.Format = FormatText
 	output, err = logger.formatText(entry)
 	require.NoError(t, err)
-	assert.Contains(t, output, "error=timeout:Model inference timeout after 30s")
+	assert.Contains(t, output, `error="timeout:Model inference timeout after 30s"`)
+}
+
+func TestAccessLogEntry_ToTextQuotesUnsafeValues(t *testing.T) {
+	logger := &accessLoggerImpl{config: &AccessLoggerConfig{
+		Format:  FormatText,
+		Output:  "stdout",
+		Enabled: true,
+	}}
+
+	tests := []struct {
+		name     string
+		entry    *AccessLogEntry
+		expected string
+	}{
+		{
+			name:     "model name with a space",
+			entry:    &AccessLogEntry{ModelName: "my model"},
+			expected: `model_name="my model"`,
+		},
+		{
+			name:     "model name that would forge another field",
+			entry:    &AccessLogEntry{ModelName: "x status_code=200"},
+			expected: `model_name="x status_code=200"`,
+		},
+		{
+			name:     "model name with a line break",
+			entry:    &AccessLogEntry{ModelName: "a\nb"},
+			expected: `model_name="a\nb"`,
+		},
+		{
+			name:     "error message with spaces",
+			entry:    &AccessLogEntry{Error: &ErrorInfo{Type: "pod_discovery", Message: "no available pods"}},
+			expected: `error="pod_discovery:no available pods"`,
+		},
+		{
+			name:     "model name with an ANSI escape",
+			entry:    &AccessLogEntry{ModelName: "a\x1b[31mred"},
+			expected: `model_name="a\x1b[31mred"`,
+		},
+		{
+			name:     "model name with a form feed",
+			entry:    &AccessLogEntry{ModelName: "a\fb"},
+			expected: `model_name="a\fb"`,
+		},
+		{
+			name:     "model name with a NUL",
+			entry:    &AccessLogEntry{ModelName: "a\x00b"},
+			expected: `model_name="a\x00b"`,
+		},
+		{
+			name:     "path with a quote",
+			entry:    &AccessLogEntry{Method: "POST", Path: `/v1/"x`, Protocol: "HTTP/1.1"},
+			expected: `"POST /v1/\"x HTTP/1.1"`,
+		},
+		{
+			name:     "safe value stays unquoted",
+			entry:    &AccessLogEntry{ModelName: "llama2-7b"},
+			expected: `model_name=llama2-7b`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output, err := logger.formatText(tt.entry)
+			require.NoError(t, err)
+			assert.Contains(t, output, tt.expected)
+			assert.NotContains(t, output, "\n")
+		})
+	}
 }
 
 func TestAccessLogContext_Lifecycle(t *testing.T) {

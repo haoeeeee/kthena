@@ -19,8 +19,8 @@ package datastore
 import (
 	"sync"
 
-	"istio.io/istio/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 // PDGroupPods holds the categorized pods for a specific PD group value

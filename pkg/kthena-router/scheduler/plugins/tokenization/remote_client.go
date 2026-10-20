@@ -38,14 +38,17 @@ type httpClient struct {
 	baseURL string
 }
 
-func newHTTPClient(baseURL string) *httpClient {
+func newRetryableHTTPClient() *retryablehttp.Client {
 	retryClient := retryablehttp.NewClient()
 	retryClient.RetryMax = defaultMaxRetries
 	retryClient.RetryWaitMin = 1 * time.Second
 	retryClient.RetryWaitMax = 1 * time.Second
 	retryClient.HTTPClient.Timeout = defaultTimeout
 	retryClient.Logger = nil
+	return retryClient
+}
 
+func newHTTPClient(baseURL string, retryClient *retryablehttp.Client) *httpClient {
 	return &httpClient{
 		client:  retryClient,
 		baseURL: baseURL,

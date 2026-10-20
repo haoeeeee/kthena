@@ -37,10 +37,17 @@ const (
 	ControllerRevisionLabelKey = workloadv1alpha1.ModelServingNameLabelKey
 	// ControllerRevisionRevisionLabelKey is the label key for revision
 	ControllerRevisionRevisionLabelKey = workloadv1alpha1.RevisionLabelKey
+	// ControllerRevisionDataVersionAnnotation identifies the canonical revision
+	// data format introduced for stable revision history and rollback.
+	ControllerRevisionDataVersionAnnotation = "modelserving.volcano.sh/revision-data-version"
+	// ControllerRevisionDataVersionV1 is the current revision data format.
+	ControllerRevisionDataVersionV1 = "v1"
 )
 
-// CreateControllerRevision creates or retrieves a ControllerRevision for a specific revision.
-// In ModelServing, we typically have at most two revisions: CurrentRevision and UpdateRevision.
+// CreateControllerRevision maintains the legacy wrapped Role revision format
+// used by the current controller integration. New v1 revision paths must use
+// BuildRevisionData and RecordModelServingRevision so revision data remains
+// immutable.
 func CreateControllerRevision(ctx context.Context, client kubernetes.Interface, ms *workloadv1alpha1.ModelServing, revision string, templateData interface{}) (*appsv1.ControllerRevision, error) {
 	// Serialize template data
 	// Wrap data in a map to ensure it's a valid JSON object (Kubernetes requirement for RawExtension)
@@ -56,18 +63,11 @@ func CreateControllerRevision(ctx context.Context, client kubernetes.Interface, 
 	controllerRevisionName := GenerateControllerRevisionName(ms.Name, revision)
 	existing, err := client.AppsV1().ControllerRevisions(ms.Namespace).Get(ctx, controllerRevisionName, metav1.GetOptions{})
 	if err == nil {
-		// If already exists, check if data has changed
+		// A revision name identifies immutable historical template data. Never
+		// overwrite it: doing so would make stable ordinal recovery use a
+		// template different from the one referenced by live resources.
 		if string(existing.Data.Raw) != string(data) {
-			existing.Data = runtime.RawExtension{
-				Raw: data,
-			}
-			existing.Revision++
-			updated, updateErr := client.AppsV1().ControllerRevisions(ms.Namespace).Update(ctx, existing, metav1.UpdateOptions{})
-			if updateErr != nil {
-				return nil, fmt.Errorf("failed to update ControllerRevision: %v", updateErr)
-			}
-			klog.V(4).Infof("Updated ControllerRevision %s/%s with revision %s", ms.Namespace, controllerRevisionName, revision)
-			return updated, nil
+			return nil, fmt.Errorf("ControllerRevision %s/%s already exists with different template data", ms.Namespace, controllerRevisionName)
 		}
 		return existing, nil
 	} else if !apierrors.IsNotFound(err) {
@@ -128,7 +128,7 @@ func GetRolesFromControllerRevision(cr *appsv1.ControllerRevision) ([]workloadv1
 		return nil, fmt.Errorf("ControllerRevision or its data is nil")
 	}
 
-	// Try to unmarshal as wrapped data first
+	// Try to unmarshal as wrapped data first.
 	var wrapper map[string]json.RawMessage
 	if err := json.Unmarshal(cr.Data.Raw, &wrapper); err == nil {
 		if rawData, ok := wrapper["data"]; ok {
@@ -156,6 +156,7 @@ func CleanupOldControllerRevisions(
 	ctx context.Context,
 	client kubernetes.Interface,
 	ms *workloadv1alpha1.ModelServing,
+	referencedRevisions ...string,
 ) error {
 	// Get all ControllerRevisions for this ModelServing
 	selector := labels.SelectorFromSet(map[string]string{
@@ -177,14 +178,25 @@ func CleanupOldControllerRevisions(
 	if ms.Status.UpdateRevision != "" {
 		updateRevisionName = GenerateControllerRevisionName(ms.Name, ms.Status.UpdateRevision)
 	}
+	preservedRevisionNames := make(map[string]struct{}, len(referencedRevisions)+2)
+	if currentRevisionName != "" {
+		preservedRevisionNames[currentRevisionName] = struct{}{}
+	}
+	if updateRevisionName != "" {
+		preservedRevisionNames[updateRevisionName] = struct{}{}
+	}
+	for _, referencedRevision := range referencedRevisions {
+		if referencedRevision != "" {
+			preservedRevisionNames[GenerateControllerRevisionName(ms.Name, referencedRevision)] = struct{}{}
+		}
+	}
 
 	// Delete all revisions except CurrentRevision and UpdateRevision
 	deletedCount := 0
 	for i := range list.Items {
 		revision := &list.Items[i]
 		// Skip if this revision must be preserved
-		if (currentRevisionName != "" && revision.Name == currentRevisionName) ||
-			(updateRevisionName != "" && revision.Name == updateRevisionName) {
+		if _, preserved := preservedRevisionNames[revision.Name]; preserved {
 			continue
 		}
 

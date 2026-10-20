@@ -44,7 +44,7 @@ class ModelDownloader(ABC):
     def download_model(self, output_dir: str):
         os.makedirs(output_dir, exist_ok=True)
         lock_path = os.path.join(output_dir, ".lock")
-        self.lock_manager = LockManager(lock_path, timeout=15)
+        self.lock_manager = LockManager(lock_path)
         while True:
             try:
                 if self.lock_manager.try_acquire():

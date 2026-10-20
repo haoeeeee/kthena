@@ -15,6 +15,22 @@ The E2E tests use helm to install kthena into a Kind cluster and verify core fun
 | `gateway-api` | ModelRoute with Gateway API | `make test-e2e-gateway-api` |
 | `gateway-inference-extension` | HTTPRoute, InferencePool | `make test-e2e-gateway-inference-extension` |
 
+### Router Scheduler Plugin Coverage
+
+The scheduler plugin tests share the Router E2E setup, then apply a focused scheduler configuration and restart the Router for each test.
+When multiple Score plugins are enabled, the Router adds each plugin score multiplied by its configured weight. The mixed-weights test makes two plugins prefer different replicas and verifies both weight orderings.
+
+| Test | Signal | Main assertion |
+|------|--------|----------------|
+| KV-cache aware | Redis block ownership | A cache-hit prompt prefers the owning replica, while misses do not pin to one replica |
+| Prefix cache | Router prefix history | Repeated prompts prefer the replica with the matching prefix |
+| Least request | Waiting requests | Traffic avoids saturated replicas |
+| GPU usage | Backend KV-cache utilization | Traffic prefers the replica with lower cache utilization |
+| Least latency | Observed TTFT and TPOT | Traffic prefers the faster backend pool |
+| LoRA affinity | Loaded adapters | Traffic is filtered to a replica with the requested adapter |
+| Random | Random score | Traffic is distributed across ready replicas |
+| Mixed weights | KV-cache ownership and GPU usage | Changing the relative plugin weights changes the selected replica |
+
 ## Prerequisites
 
 - [Kind](https://kind.sigs.k8s.io/docs/user/quick-start/#installation) must be installed
@@ -52,6 +68,14 @@ Each category installs only the external CRDs it needs:
 | `gateway-api` | Gateway API |
 | `gateway-inference-extension` | Gateway API and Gateway API Inference Extension |
 | `all` | Gateway API, Gateway API Inference Extension, and LeaderWorkerSet |
+
+### Router External Provider Mock
+
+The Router category builds `kthena-external-provider-mock` from the repository and loads the image directly into Kind. The image is not pushed to a registry. It serves self-signed HTTPS endpoints for OpenAI Chat Completions, OpenAI Completions, OpenAI Responses, and Anthropic Messages, plus a cluster-local HTTP administration endpoint used only to inspect captured requests.
+
+These tests use fixed fake credentials and do not call real model-provider APIs. They verify protocol and opaque payload passthrough, model rewriting, streaming usage extraction, destination-specific metrics, structured access logs, upstream 429 handling, active-request gauges, and text-only local input-token accounting. In particular, non-text image and file content is forwarded but does not contribute to Router input-token estimates, rate limiting, or related scheduling observations.
+
+`make test-e2e-router` supplies `E2E_EXTERNAL_PROVIDER_MOCK_IMAGE` to the Go E2E package after building and loading that exact image. This is an internal image-reference variable, not a provider credential; users normally do not need to set it.
 
 ## Running the Tests
 
@@ -98,6 +122,7 @@ Replace `gateway-api` with the category that failed in CI.
 - `TEST_CATEGORY`: Specify which CRDs to install (used by setup.sh)
 - `HUB`: Docker image registry (default: `ghcr.io/volcano-sh`)
 - `TAG`: Docker image tag (default: `latest`)
+- `E2E_EXTERNAL_PROVIDER_MOCK_IMAGE`: Internal image reference supplied by `make test-e2e-router`; it is not an API key or other credential
 
 ## Local Testing Considerations
 

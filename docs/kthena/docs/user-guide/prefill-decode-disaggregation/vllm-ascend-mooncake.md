@@ -54,10 +54,13 @@ The prefill-decode disaggregation architecture consists of several key component
 
 ## Getting Started
 
-Deploy LLM inference engine with prefill-decode disaggregation using either the ModelBooster or ModelServing approach.
-Both configurations separate prefill and decode workloads for optimal NPU resource utilization on Huawei Ascend hardware.
+For new deployments, use the [ModelServing approach](#modelserving-approach-recommended) with `ModelServer` and `ModelRoute` to configure prefill-decode inference on Huawei Ascend hardware. The ModelBooster example below is retained for existing users.
 
-### ModelBooster Approach (Recommended)
+### ModelBooster Approach (Deprecated)
+
+:::warning Deprecated example
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. See the [deprecation details](../model-deployment.md#modelbooster-deprecation).
+:::
 
 The ModelBooster CRD provides a streamlined way to deploy disaggregated inference with built-in support for advanced
 features like KV cache transfer and specialized NPU hardware configurations optimized for Huawei Ascend processors.
@@ -115,10 +118,9 @@ deepseek-v2-lite-deepseek-v2-lite-0-prefill-0-0   2/2     Running    0          
 
 **Note:** ModelBooster creates a ModelServing resource named `{modelbooster-name}-{backend-name}`. The pods are labeled with `modelserving.volcano.sh/name={modelserving-name}`.
 
-### ModelServing Approach (Alternative)
+### ModelServing Approach (Recommended)
 
-For environments that require more granular control over the NPU deployment configuration, you can use the ModelServing
-approach with fine-tuned NPU resource specifications and Ascend-specific optimizations.
+Use the ModelServing approach for new deployments, with NPU resource specifications and Ascend-specific optimizations configured directly in the Pod templates.
 
 For a detailed comparison of the ModelServing approach's advantages, manually created components, and when to use it, see the [ModelServing Approach](../model-deployment.md#modelserving-approach) section in the ModelBooster documentation.
 
@@ -288,4 +290,3 @@ kubectl delete modelserving deepseek-v2-lite -n dev
 # 4. Clean up associated resources
 kubectl delete podgroup -l modelserving.volcano.sh/name=deepseek-v2-lite -n dev
 ```
-

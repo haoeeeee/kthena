@@ -120,8 +120,8 @@ spec:
                 command:
                   - sh
                   - -c
-                  - "bash /vllm-workspace/examples/online_serving/multi-node-serving.sh leader --ray_cluster_size=2; 
-                    python3 -m vllm.entrypoints.openai.api_server --port 8080 --model meta-llama/Llama-3.1-405B-Instruct --tensor-parallel-size 8 --pipeline_parallel_size 2"
+                  - "bash /vllm-workspace/examples/ray_serving/multi-node-serving.sh leader --ray_cluster_size=2 &&
+                    python3 -m vllm.entrypoints.openai.api_server --port 8080 --model meta-llama/Llama-3.1-405B-Instruct --tensor-parallel-size 8 --pipeline_parallel_size 2 --distributed-executor-backend ray"
                 resources:
                   limits:
                     nvidia.com/gpu: "8"
@@ -154,7 +154,7 @@ spec:
                 command:
                   - sh
                   - -c
-                  - "bash /vllm-workspace/examples/online_serving/multi-node-serving.sh worker --ray_address=$(ENTRY_ADDRESS)"
+                  - "bash /vllm-workspace/examples/ray_serving/multi-node-serving.sh worker --ray_address=$(ENTRY_ADDRESS)"
                 resources:
                   limits:
                     nvidia.com/gpu: "8"
@@ -248,12 +248,13 @@ The multi‑node example configures tensor parallelism and pipeline parallelism 
 command:
   - sh
   - -c
-  - "bash /vllm-workspace/examples/online_serving/multi-node-serving.sh leader --ray_cluster_size=2;
-    python3 -m vllm.entrypoints.openai.api_server --port 8080 --model meta-llama/Llama-3.1-405B-Instruct --tensor-parallel-size 8 --pipeline_parallel_size 2"
+  - "bash /vllm-workspace/examples/ray_serving/multi-node-serving.sh leader --ray_cluster_size=2 &&
+    python3 -m vllm.entrypoints.openai.api_server --port 8080 --model meta-llama/Llama-3.1-405B-Instruct --tensor-parallel-size 8 --pipeline_parallel_size 2 --distributed-executor-backend ray"
 ```
 
 - `--tensor-parallel-size 8`: Splits the model across 8 GPUs within each pod.
 - `--pipeline_parallel_size 2`: Splits the model across 2 pipeline stages (requires multiple pods).
+- `--distributed-executor-backend ray`: Uses the Ray cluster started by the bootstrap script for distributed execution.
 
 The Role `llama-405b` has `replicas: 2`, which creates two role replicas per ServingGroup. Each role replica contains one entry pod and one worker pod, so the example creates four pods per ServingGroup. Together with the parallelism settings, this enables distributed inference across multiple nodes.
 

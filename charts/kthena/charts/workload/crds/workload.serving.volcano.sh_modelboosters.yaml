@@ -25,7 +25,12 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: ModelBooster is the Schema for the models API.
+        description: |-
+          ModelBooster is the Schema for the models API.
+
+          Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+          Use ModelServing, ModelServer, and ModelRoute instead.
+          ModelBooster will be removed no earlier than Kthena v1.5.
         properties:
           apiVersion:
             description: |-
@@ -45,7 +50,12 @@ spec:
           metadata:
             type: object
           spec:
-            description: ModelBoosterSpec defines the desired state of ModelBooster.
+            description: |-
+              ModelBoosterSpec defines the desired state of ModelBooster.
+
+              Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+              Use ModelServing, ModelServer, and ModelRoute instead.
+              ModelBooster will be removed no earlier than Kthena v1.5.
             properties:
               backend:
                 description: |-
@@ -339,7 +349,12 @@ spec:
                     description: Workers is the list of workers associated with this
                       backend.
                     items:
-                      description: ModelWorker defines the model worker configuration.
+                      description: |-
+                        ModelWorker defines the model worker configuration.
+
+                        Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+                        Use ModelServing, ModelServer, and ModelRoute instead.
+                        ModelBooster will be removed no earlier than Kthena v1.5.
                       properties:
                         affinity:
                           description: Affinity specifies the affinity rules for scheduling
@@ -1369,9 +1384,10 @@ spec:
                               operator:
                                 description: |-
                                   Operator represents a key's relationship to the value.
-                                  Valid operators are Exists and Equal. Defaults to Equal.
+                                  Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
                                   Exists is equivalent to wildcard for value, so that a pod can
                                   tolerate all taints of a particular category.
+                                  Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
                                 type: string
                               tolerationSeconds:
                                 description: |-
@@ -1469,7 +1485,12 @@ spec:
             - backend
             type: object
           status:
-            description: ModelStatus defines the observed state of ModelBooster.
+            description: |-
+              ModelStatus defines the observed state of ModelBooster.
+
+              Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+              Use ModelServing, ModelServer, and ModelRoute instead.
+              ModelBooster will be removed no earlier than Kthena v1.5.
             properties:
               conditions:
                 description: Conditions represents the latest available observations

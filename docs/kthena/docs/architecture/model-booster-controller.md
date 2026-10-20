@@ -3,6 +3,10 @@ import modelBoosterControllerArchitecture from '../assets/diagrams/architecture/
 
 # Model Booster Controller
 
+:::warning Deprecated in v1.1
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. The controller remains enabled by default in v1.1. See the [deployment guidance](../user-guide/model-deployment.md#modelbooster-deprecation).
+:::
+
 ## Overview
 
 As an optional component of the Kthena project, the Model Booster Controller primarily provides users with a convenient deployment form - `ModelBooster`. Based on the `ModelBooster CR` (ModelBooster Custom Resource) information provided by users, this component can automatically configure and deploy the components required for inference services, such as router routing rules, inference engine instances, and dynamic scaling configurations.
@@ -38,7 +42,7 @@ Read the [Model Booster CR Examples](https://github.com/volcano-sh/kthena/tree/m
 
 ## Limitations
 
-The `ModelBooster` can only cover most inference service scenarios and will be continuously updated. Some scenarios are not yet supported and require manual configuration of relevant CRDs. 
+The deprecated `ModelBooster` API covers a subset of inference service scenarios. For new deployments, configure the replacement resources directly.
 
 Please note the following limitations when using the Model Booster:
 - Each `ModelBooster` can create only one `ModelRoute`.

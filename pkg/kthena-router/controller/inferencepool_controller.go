@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -47,7 +48,7 @@ func NewInferencePoolController(
 	dynamicInformerFactory dynamicinformer.DynamicSharedInformerFactory,
 	store datastore.Store,
 ) (*InferencePoolController, error) {
-	gvr := inferencev1.SchemeGroupVersion.WithResource("inferencepools")
+	gvr := schema.GroupVersion(inferencev1.GroupVersion).WithResource("inferencepools")
 	inferencePoolInformer := dynamicInformerFactory.ForResource(gvr).Informer()
 
 	controller := &InferencePoolController{
@@ -117,15 +118,8 @@ func (c *InferencePoolController) processNextWorkItem() bool {
 		return true
 	}
 
-	if err := c.syncHandler(key); err != nil {
-		if c.workqueue.NumRequeues(key) < maxRetries {
-			klog.Errorf("error syncing inferencepool %q: %s, requeuing", key, err.Error())
-			c.workqueue.AddRateLimited(key)
-			return true
-		}
-		klog.Errorf("giving up on syncing inferencepool %q after %d retries: %s", key, maxRetries, err)
-		c.workqueue.Forget(obj)
-	}
+	err := c.syncHandler(key)
+	retryOrForget(c.workqueue, "inferencepool", key, err, klog.Errorf)
 	return true
 }
 
@@ -159,7 +153,7 @@ func (c *InferencePoolController) syncHandler(key string) error {
 }
 
 func (c *InferencePoolController) enqueueInferencePool(obj interface{}) {
-	key, err := cache.MetaNamespaceKeyFunc(obj)
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		utilruntime.HandleError(err)
 		return

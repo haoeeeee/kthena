@@ -49,6 +49,18 @@ A Helm chart for deploying Kthena
 | networking.kthenaRouter.tls.dnsName | string | `"your-domain.com"` | DNS name to use for the certificate. |
 | networking.kthenaRouter.tls.enabled | bool | `false` | Enable TLS for Kthena Router server. |
 | networking.kthenaRouter.tls.secretName | string | `"kthena-router-tls"` | Secret name to store the certificate and key. |
+| networking.kthenaRouter.tokenizerService.enabled | bool | `false` | Enable the dedicated tokenizer service (vLLM renderers supervised by a Go control plane). |
+| networking.kthenaRouter.tokenizerService.extraEnv | list | `[]` | Extra environment variables for the tokenizer container (e.g. HF_TOKEN). |
+| networking.kthenaRouter.tokenizerService.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy for the tokenizer service. |
+| networking.kthenaRouter.tokenizerService.image.repository | string | `"ghcr.io/volcano-sh/kthena-tokenizer"` | Image repository for the tokenizer service. |
+| networking.kthenaRouter.tokenizerService.image.tag | string | `"latest"` | Image tag for the tokenizer service. |
+| networking.kthenaRouter.tokenizerService.maxTokenizers | int | `8` | Maximum number of concurrently loaded model tokenizers. |
+| networking.kthenaRouter.tokenizerService.mode | string | `"sidecar"` | Deployment mode: `sidecar` (runs in the router pod) or `standalone` (dedicated Deployment + Service). |
+| networking.kthenaRouter.tokenizerService.models | object | `{}` | Maps a served model name (`ModelServer.spec.model`) to its tokenizer source: a Hugging Face repository id or a mounted local path. Served names are engine-side aliases, so the source must be configured explicitly; unmapped models fall back to engine-side tokenization. |
+| networking.kthenaRouter.tokenizerService.port | int | `8100` | Port the tokenizer service listens on. |
+| networking.kthenaRouter.tokenizerService.resources | object | `{"limits":{"cpu":"2","memory":"4Gi"},"requests":{"cpu":"500m","memory":"1Gi"}}` | Resources for the tokenizer container. |
+| networking.kthenaRouter.tokenizerService.standalone.replicas | int | `1` | Number of tokenizer service replicas in standalone mode. |
+| networking.kthenaRouter.tolerations | list | `[]` | Tolerations for Kthena Router pods. |
 | networking.kthenaRouter.webhook.enabled | bool | `true` | Enable webhook for Kthena Router. |
 | networking.kthenaRouter.webhook.port | int | `8443` | Container port for Kthena Router webhook. |
 | networking.kthenaRouter.webhook.servicePort | int | `443` | Service port for Kthena Router webhook. |
@@ -59,12 +71,17 @@ A Helm chart for deploying Kthena
 | workload.controllerManager.debugPort | int | `0` | Debug server port for Controller Manager (set 0 to disable). |
 | workload.controllerManager.downloaderImage.repository | string | `"ghcr.io/volcano-sh/downloader"` | Image repository for the Downloader. |
 | workload.controllerManager.downloaderImage.tag | string | `"latest"` | Image tag for the Downloader. |
+| workload.controllerManager.evictionWebhook.enabled | bool | `false` | Enable pods/eviction protection webhook for ModelServing. |
+| workload.controllerManager.evictionWebhook.failurePolicy | string | `"Fail"` | Failure policy for the pods/eviction webhook. |
+| workload.controllerManager.evictionWebhook.timeoutSeconds | int | `5` | Timeout for the pods/eviction webhook. |
+| workload.controllerManager.evictionWebhook.trackerTTLSeconds | int | `60` | ConfigMap-backed disruption tracker TTL in seconds. |
 | workload.controllerManager.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy for the Controller Manager. |
 | workload.controllerManager.image.repository | string | `"ghcr.io/volcano-sh/kthena-controller-manager"` | Image repository for the Controller Manager. |
 | workload.controllerManager.image.tag | string | `"latest"` | Image tag for the Controller Manager. |
 | workload.controllerManager.replicas | int | `1` | Number of Controller Manager instances to run. |
 | workload.controllerManager.runtimeImage.repository | string | `"ghcr.io/volcano-sh/runtime"` | Image repository for the Runtime. |
 | workload.controllerManager.runtimeImage.tag | string | `"latest"` | Image tag for the Runtime. |
+| workload.controllerManager.tolerations | list | `[]` | Tolerations for Controller Manager pods. |
 | workload.controllerManager.webhook.enabled | bool | `true` | Enable webhook for the Controller Manager. |
 | workload.controllerManager.webhook.tls.certSecretName | string | `"kthena-controller-manager-webhook-certs"` | Secret name for storing webhook certificates. |
 | workload.controllerManager.webhook.tls.serviceName | string | `"kthena-controller-manager-webhook"` | Service name for the webhook. |

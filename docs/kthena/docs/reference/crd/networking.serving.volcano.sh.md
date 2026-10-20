@@ -33,6 +33,43 @@ _Appears in:_
 | `model` _string_ | Model is the name of the model or lora adapter to match.<br />If this field is not specified, any model or lora adapter will be matched. |  |  |
 
 
+#### ConnectionPool
+
+
+
+ConnectionPool configures the HTTP connection pool for a ModelServer.
+
+
+
+_Appears in:_
+- [TrafficPolicy](#trafficpolicy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `maxIdleConnections` _integer_ | MaxIdleConnections is the total idle connections across all endpoints.<br />Defaults to 100 when omitted. |  | Minimum: 0 <br /> |
+| `maxIdleConnectionsPerHost` _integer_ | MaxIdleConnectionsPerHost is the idle connections per pod/endpoint.<br />Defaults to 64 when omitted. |  | Minimum: 0 <br /> |
+| `maxConnectionsPerHost` _integer_ | MaxConnectionsPerHost limits dialing, active and idle connections per host.<br />0 means unlimited. Defaults to 0 when omitted. |  | Minimum: 0 <br /> |
+
+
+#### Endpoint
+
+
+
+Endpoint describes a single statically configured model serving instance.
+
+
+
+_Appears in:_
+- [ModelServerSpec](#modelserverspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name uniquely identifies the endpoint within the ModelServer. Together with<br />the ModelServer name it forms the instance identity in the router, for<br />example in metrics and debug output. |  | MaxLength: 253 <br />Pattern: `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` <br />Required: \{\} <br /> |
+| `address` _string_ | Address is the IP address or DNS name of the model serving instance. |  | MaxLength: 253 <br />Required: \{\} <br /> |
+| `port` _integer_ | Port is the port the model serving instance listens on. It defaults to<br />`spec.workloadPort.port` when unset. |  | Maximum: 65535 <br />Minimum: 1 <br /> |
+| `labels` _object (keys:string, values:string)_ | Labels are attached to the endpoint. They do not select serving instances;<br />they are only matched against `workloadSelector.pdGroup` to assign the<br />endpoint a prefill or decode role, `pdGroup` being the sole<br />`workloadSelector` field that may be combined with `endpoints`. |  |  |
+
+
 #### ExternalModelProvider
 
 
@@ -334,8 +371,9 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `model` _string_ | The real model that the modelServers are running.<br />If the `model` in LLM inference request is different from this field, it should be overwritten by this field.<br />Otherwise, the `model` in LLM inference request will not be mutated. |  | MaxLength: 256 <br /> |
 | `inferenceEngine` _[InferenceEngine](#inferenceengine)_ | The inference engine used to serve the model. |  | Enum: [vLLM SGLang] <br />Required: \{\} <br /> |
-| `workloadSelector` _[WorkloadSelector](#workloadselector)_ | WorkloadSelector is used to match the model serving instances.<br />Currently, they must be pods within the same namespace as modelServer object. |  | Required: \{\} <br /> |
-| `workloadPort` _[WorkloadPort](#workloadport)_ | WorkloadPort defines the port and protocol configuration for the model server. |  | Required: \{\} <br /> |
+| `workloadSelector` _[WorkloadSelector](#workloadselector)_ | WorkloadSelector is used to match the model serving instances.<br />Currently, they must be pods within the same namespace as modelServer object.<br />`workloadSelector.matchLabels` and `endpoints` are mutually exclusive ways of<br />declaring the serving instances, so exactly one of them must be used.<br />`workloadSelector.pdGroup` does not select instances; it only assigns them<br />prefill and decode roles, and therefore is the sole `workloadSelector` field<br />that may also be combined with `endpoints`. |  |  |
+| `endpoints` _[Endpoint](#endpoint) array_ | Endpoints is a static list of model serving instances. It is intended for<br />deployments where the serving instances are not discoverable as pods of the<br />cluster the router runs in, for example when the router reads its<br />configuration from local files instead of the Kubernetes API server.<br />`endpoints` and `workloadSelector.matchLabels` are mutually exclusive;<br />exactly one of them must be specified. |  | MaxItems: 1024 <br /> |
+| `workloadPort` _[WorkloadPort](#workloadport)_ | WorkloadPort defines the port and protocol configuration for the model server.<br />It may be omitted only when every entry in `endpoints` declares its own<br />`port`; endpoints without an explicit `port` fall back to `workloadPort.port`. |  |  |
 | `trafficPolicy` _[TrafficPolicy](#trafficpolicy)_ | Traffic Policy for accessing the model server instance. |  |  |
 | `kvConnector` _[KVConnectorSpec](#kvconnectorspec)_ | KVConnector specifies the KV connector configuration for PD disaggregated routing |  |  |
 
@@ -497,6 +535,61 @@ _Appears in:_
 | `targetModels` _[TargetModel](#targetmodel) array_ |  |  | MaxItems: 16 <br />MinItems: 1 <br /> |
 
 
+#### SessionKeySource
+
+
+
+SessionKeySource defines one session key extraction rule.
+
+
+
+_Appears in:_
+- [SessionSticky](#sessionsticky)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `type` _[SessionKeySourceType](#sessionkeysourcetype)_ |  |  | Enum: [Header Query Cookie JWTClaim] <br />Required: \{\} <br /> |
+| `name` _string_ | Name is the header name, query key, cookie name, or JWT claim name. |  | MinLength: 1 <br />Required: \{\} <br /> |
+
+
+#### SessionKeySourceType
+
+_Underlying type:_ _string_
+
+SessionKeySourceType identifies how a session key fragment is read.
+
+_Validation:_
+- Enum: [Header Query Cookie JWTClaim]
+
+_Appears in:_
+- [SessionKeySource](#sessionkeysource)
+
+| Field | Description |
+| --- | --- |
+| `Header` |  |
+| `Query` |  |
+| `Cookie` |  |
+| `JWTClaim` |  |
+
+
+#### SessionSticky
+
+
+
+SessionSticky configures per-ModelServer session key extraction and binding TTL.
+The backing store (memory vs Redis) is configured in the router process, not here.
+
+
+
+_Appears in:_
+- [TrafficPolicy](#trafficpolicy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `sessionAffinitySeconds` _integer_ | SessionAffinitySeconds is binding TTL in seconds.<br />Once the session has been idle for more than the specified duration, the session becomes invalid.<br />When unset, the default is 300 (5 minutes). |  | Minimum: 1 <br /> |
+| `sources` _[SessionKeySource](#sessionkeysource) array_ | Sources are evaluated in order; the first non-empty extracted value is the session key. |  | MaxItems: 16 <br /> |
+
+
 #### StringMatch
 
 
@@ -548,6 +641,8 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `retry` _[Retry](#retry)_ | The retry policy for the inference request. |  |  |
+| `connectionPool` _[ConnectionPool](#connectionpool)_ | ConnectionPool configures the upstream HTTP connection pool used when<br />forwarding to this ModelServer's pods. When omitted, a shared default<br />pool is used. Each ModelServer that sets this gets its own isolated pool. |  |  |
+| `sessionSticky` _[SessionSticky](#sessionsticky)_ | SessionSticky pins requests with the same extracted session key to the same<br />backend Pod of this ModelServer for a TTL. Nil or omitted disables session<br />affinity for this ModelServer. It does not override ModelRoute weighted<br />selection among ModelServers. |  |  |
 
 
 #### WorkloadPort

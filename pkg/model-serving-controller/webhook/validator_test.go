@@ -324,9 +324,23 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 				field.Invalid(
 					field.NewPath("spec").Child("rolloutStrategy").Child("rollingUpdateConfiguration"),
 					"",
-					"maxUnavailable cannot be 0",
+					"maxUnavailable and maxSurge cannot both resolve to 0",
 				),
 			},
+		},
+		{
+			name: "allows zero maxUnavailable with positive maxSurge",
+			args: args{ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				Replicas: &replicas,
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+					Type: workloadv1alpha1.ServingGroupRollingUpdate,
+					RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromInt(0)),
+						MaxSurge:       ptr.To(intstr.FromString("25%")),
+					},
+				},
+			}}},
+			want: nil,
 		},
 		{
 			name: "maxUnavailable greater than replicas is allowed for scale down",
@@ -556,7 +570,7 @@ func TestValidateMaxUnavailableForRoles(t *testing.T) {
 			}},
 		},
 		{
-			name: "rejects zero",
+			name: "rejects zero maxUnavailable without maxSurge",
 			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
 				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
 				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
@@ -583,6 +597,19 @@ func TestValidateMaxUnavailableForRoles(t *testing.T) {
 			}},
 		},
 		{
+			name: "allows CRD default maxUnavailable when the role has zero replicas",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "prefill",
+					Replicas: ptr.To[int32](0),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromInt(1)),
+					},
+				}}},
+			}},
+		},
+		{
 			name: "requires role rolling update for partition",
 			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
 				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.ServingGroupRollingUpdate},
@@ -591,6 +618,48 @@ func TestValidateMaxUnavailableForRoles(t *testing.T) {
 					Replicas: ptr.To[int32](4),
 					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
 						Partition: ptr.To(intstr.FromInt(1)),
+					},
+				}}},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "allows role maxSurge",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "decode",
+					Replicas: ptr.To[int32](4),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromInt(1)),
+						MaxSurge:       ptr.To(intstr.FromInt(1)),
+					},
+				}}},
+			}},
+		},
+		{
+			name: "allows zero maxUnavailable with positive maxSurge",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "decode",
+					Replicas: ptr.To[int32](4),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromInt(0)),
+						MaxSurge:       ptr.To(intstr.FromString("25%")),
+					},
+				}}},
+			}},
+		},
+		{
+			name: "rejects role maxSurge for serving group rolling update",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.ServingGroupRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "decode",
+					Replicas: ptr.To[int32](4),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxSurge: ptr.To(intstr.FromInt(1)),
 					},
 				}}},
 			}},
@@ -1494,6 +1563,177 @@ func TestValidateRecoveryPolicyAndRolloutStrategy(t *testing.T) {
 			for i := range got {
 				assert.Equalf(t, tt.want[i].Error(), got[i].Error(), "Error mismatch at index %d", i)
 			}
+		})
+	}
+}
+
+func TestValidateEvictionStrategyRoleMinAvailable(t *testing.T) {
+	replicas := int32(3)
+	roleReplicas := int32(2)
+	tests := []struct {
+		name              string
+		protection        workloadv1alpha1.ProtectionLevelType
+		minAvailable      *intstr.IntOrString
+		roleMinAvail      map[string]intstr.IntOrString
+		wantAllowed       bool
+		wantMessage       string
+		useEmptyRoleMap   bool
+		omitProtectionVal bool
+	}{
+		{
+			name:        "reject servingGroup without minAvailable",
+			protection:  workloadv1alpha1.ProtectionLevelServingGroup,
+			wantAllowed: false,
+			wantMessage: "minAvailable is required when evictionStrategy.protectionLevel is ServingGroup",
+		},
+		{
+			name:         "valid servingGroup integer minAvailable",
+			protection:   workloadv1alpha1.ProtectionLevelServingGroup,
+			minAvailable: intstrPtr(intstr.FromInt(2)),
+			wantAllowed:  true,
+		},
+		{
+			name:         "valid servingGroup percent minAvailable",
+			protection:   workloadv1alpha1.ProtectionLevelServingGroup,
+			minAvailable: intstrPtr(intstr.FromString("67%")),
+			wantAllowed:  true,
+		},
+		{
+			name:         "reject servingGroup minAvailable above replicas",
+			protection:   workloadv1alpha1.ProtectionLevelServingGroup,
+			minAvailable: intstrPtr(intstr.FromInt(4)),
+			wantAllowed:  false,
+			wantMessage:  "minAvailable (4) cannot exceed replicas (3)",
+		},
+		{
+			name:         "reject servingGroup negative minAvailable",
+			protection:   workloadv1alpha1.ProtectionLevelServingGroup,
+			minAvailable: intstrPtr(intstr.FromInt(-1)),
+			wantAllowed:  false,
+			wantMessage:  "must be a non-negative integer",
+		},
+		{
+			name:       "valid role minAvailable without global minAvailable",
+			protection: workloadv1alpha1.ProtectionLevelRole,
+			roleMinAvail: map[string]intstr.IntOrString{
+				"decode": intstr.FromInt(1),
+			},
+			wantAllowed: true,
+		},
+		{
+			name:        "reject role without roleMinAvailable",
+			protection:  workloadv1alpha1.ProtectionLevelRole,
+			wantAllowed: false,
+			wantMessage: "roleMinAvailable is required when evictionStrategy.protectionLevel is Role",
+		},
+		{
+			name:            "reject role with empty roleMinAvailable",
+			protection:      workloadv1alpha1.ProtectionLevelRole,
+			roleMinAvail:    map[string]intstr.IntOrString{},
+			useEmptyRoleMap: true,
+			wantAllowed:     false,
+			wantMessage:     "roleMinAvailable is required when evictionStrategy.protectionLevel is Role",
+		},
+		{
+			name:       "reject unknown role key",
+			protection: workloadv1alpha1.ProtectionLevelRole,
+			roleMinAvail: map[string]intstr.IntOrString{
+				"unknown": intstr.FromInt(1),
+			},
+			wantAllowed: false,
+			wantMessage: "role unknown does not exist in template.roles",
+		},
+		{
+			name:       "reject invalid role percent",
+			protection: workloadv1alpha1.ProtectionLevelRole,
+			roleMinAvail: map[string]intstr.IntOrString{
+				"decode": intstr.FromString("101%"),
+			},
+			wantAllowed: false,
+			wantMessage: "must be a valid percent value",
+		},
+		{
+			name:       "reject role minAvailable above role replicas",
+			protection: workloadv1alpha1.ProtectionLevelRole,
+			roleMinAvail: map[string]intstr.IntOrString{
+				"decode": intstr.FromInt(3),
+			},
+			wantAllowed: false,
+			wantMessage: "roleMinAvailable (3) for role decode cannot exceed replicas (2)",
+		},
+		{
+			name:       "valid role percent minAvailable",
+			protection: workloadv1alpha1.ProtectionLevelRole,
+			roleMinAvail: map[string]intstr.IntOrString{
+				"decode": intstr.FromString("50%"),
+			},
+			wantAllowed: true,
+		},
+		{
+			name:         "role ignores global minAvailable",
+			protection:   workloadv1alpha1.ProtectionLevelRole,
+			minAvailable: intstrPtr(intstr.FromInt(4)),
+			roleMinAvail: map[string]intstr.IntOrString{
+				"decode": intstr.FromInt(1),
+			},
+			wantAllowed: true,
+		},
+		{
+			name:              "empty protectionLevel defaults to servingGroup and requires minAvailable",
+			omitProtectionVal: true,
+			wantAllowed:       false,
+			wantMessage:       "minAvailable is required when evictionStrategy.protectionLevel is ServingGroup",
+		},
+		{
+			name:         "reject invalid servingGroup percent",
+			protection:   workloadv1alpha1.ProtectionLevelServingGroup,
+			minAvailable: intstrPtr(intstr.FromString("101%")),
+			wantAllowed:  false,
+			wantMessage:  "must be a valid percent value",
+		},
+		{
+			name:         "reject unsupported protectionLevel",
+			protection:   workloadv1alpha1.ProtectionLevelType("Invalid"),
+			minAvailable: intstrPtr(intstr.FromInt(1)),
+			wantAllowed:  false,
+			wantMessage:  "Unsupported value: \"Invalid\"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			strategy := &workloadv1alpha1.EvictionStrategySpec{
+				MinAvailable:     tt.minAvailable,
+				RoleMinAvailable: tt.roleMinAvail,
+			}
+			if !tt.omitProtectionVal {
+				strategy.ProtectionLevel = tt.protection
+			}
+			if tt.useEmptyRoleMap {
+				strategy.RoleMinAvailable = tt.roleMinAvail
+			}
+
+			ms := &workloadv1alpha1.ModelServing{
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Replicas: &replicas,
+					RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+						EvictionStrategy: strategy,
+					},
+					Template: workloadv1alpha1.ServingGroup{
+						Roles: []workloadv1alpha1.Role{
+							{Name: "decode", Replicas: &roleReplicas},
+						},
+					},
+				},
+			}
+
+			errs := validateEvictionStrategy(ms)
+			if tt.wantAllowed {
+				assert.Empty(t, errs)
+				return
+			}
+			assert.NotEmpty(t, errs)
+			assert.Contains(t, errs.ToAggregate().Error(), tt.wantMessage)
 		})
 	}
 }

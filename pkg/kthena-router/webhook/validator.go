@@ -29,6 +29,7 @@ import (
 	"golang.org/x/net/http/httpguts"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -99,7 +100,7 @@ func (v *KthenaRouterValidator) HandleModelRoute(w http.ResponseWriter, r *http.
 	}
 
 	// Validate the ModelRoute
-	allowed, reason := v.validateModelRoute(modelRoute)
+	allowed, reason := ValidateModelRoute(modelRoute)
 
 	// Create the admission response
 	admissionResponse := admissionv1.AdmissionResponse{
@@ -135,7 +136,7 @@ func (v *KthenaRouterValidator) HandleModelServer(w http.ResponseWriter, r *http
 	}
 
 	// Validate the ModelServer
-	allowed, reason := v.validateModelServer(modelServer)
+	allowed, reason := ValidateModelServer(modelServer)
 
 	// Create the admission response
 	admissionResponse := admissionv1.AdmissionResponse{
@@ -171,7 +172,7 @@ func (v *KthenaRouterValidator) HandleExternalModelProvider(w http.ResponseWrite
 	}
 
 	// Validate the ExternalModelProvider
-	allowed, reason := v.validateExternalModelProvider(provider)
+	allowed, reason := ValidateExternalModelProvider(provider)
 
 	// Create the admission response
 	admissionResponse := admissionv1.AdmissionResponse{
@@ -196,8 +197,9 @@ func (v *KthenaRouterValidator) HandleExternalModelProvider(w http.ResponseWrite
 	}
 }
 
-// validateModelRoute validates the ModelRoute resource
-func (v *KthenaRouterValidator) validateModelRoute(modelRoute *networkingv1alpha1.ModelRoute) (bool, string) {
+// ValidateModelRoute validates the ModelRoute resource. It is shared between
+// the admission webhook and the file-based resource source.
+func ValidateModelRoute(modelRoute *networkingv1alpha1.ModelRoute) (bool, string) {
 	var allErrs field.ErrorList
 	specField := field.NewPath("spec")
 
@@ -276,18 +278,66 @@ func (v *KthenaRouterValidator) validateModelRoute(modelRoute *networkingv1alpha
 	return true, ""
 }
 
-// validateModelServer validates the ModelServer resource
-func (v *KthenaRouterValidator) validateModelServer(modelServer *networkingv1alpha1.ModelServer) (bool, string) {
+func validateSessionSticky(ss *networkingv1alpha1.SessionSticky, ssField *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+	if ss == nil {
+		return allErrs
+	}
+	if len(ss.Sources) == 0 {
+		allErrs = append(allErrs, field.Required(ssField.Child("sources"), "sources must be non-empty when sessionSticky is set"))
+	}
+	if len(ss.Sources) > 16 {
+		allErrs = append(allErrs, field.Invalid(ssField.Child("sources"), len(ss.Sources), "must have at most 16 entries"))
+	}
+	if ss.SessionAffinitySeconds != nil && *ss.SessionAffinitySeconds < 1 {
+		allErrs = append(allErrs, field.Invalid(ssField.Child("sessionAffinitySeconds"), *ss.SessionAffinitySeconds, "must be >= 1"))
+	}
+	for i := range ss.Sources {
+		src := ss.Sources[i]
+		sf := ssField.Child("sources").Index(i)
+		if src.Name == "" {
+			allErrs = append(allErrs, field.Required(sf.Child("name"), "name must not be empty"))
+		}
+		switch src.Type {
+		case networkingv1alpha1.SessionKeySourceHeader,
+			networkingv1alpha1.SessionKeySourceQuery,
+			networkingv1alpha1.SessionKeySourceCookie,
+			networkingv1alpha1.SessionKeySourceJWTClaim:
+		default:
+			allErrs = append(allErrs, field.Invalid(sf.Child("type"), src.Type, "must be Header, Query, Cookie, or JWTClaim"))
+		}
+	}
+	return allErrs
+}
+
+// ValidateModelServer validates the ModelServer resource. It is shared between
+// the admission webhook and the file-based resource source.
+func ValidateModelServer(modelServer *networkingv1alpha1.ModelServer) (bool, string) {
 	var allErrs field.ErrorList
 	specField := field.NewPath("spec")
 	workloadSelectorField := specField.Child("workloadSelector")
+	endpointsField := specField.Child("endpoints")
+	hasEndpoints := len(modelServer.Spec.Endpoints) > 0
+
+	// `workloadPort` is not required at the CRD level so that static endpoints
+	// can carry their own ports, but pods matched by a selector have no other
+	// port source.
+	if !hasEndpoints && modelServer.Spec.WorkloadPort.Port == 0 {
+		allErrs = append(allErrs, field.Required(specField.Child("workloadPort", "port"), "workloadPort.port must be specified when endpoints are not used"))
+	}
 
 	if modelServer.Spec.WorkloadSelector == nil {
-		allErrs = append(allErrs, field.Required(workloadSelectorField, "workloadSelector must be specified"))
+		if !hasEndpoints {
+			allErrs = append(allErrs, field.Required(workloadSelectorField, "one of workloadSelector and endpoints must be specified"))
+		}
 	} else {
 		matchLabelsField := workloadSelectorField.Child("matchLabels")
 		if len(modelServer.Spec.WorkloadSelector.MatchLabels) == 0 {
-			allErrs = append(allErrs, field.Required(matchLabelsField, "labels must contain at least one label"))
+			// Static endpoints are not selected by labels, so a selector that only
+			// carries a pdGroup is valid for them.
+			if !hasEndpoints {
+				allErrs = append(allErrs, field.Required(matchLabelsField, "labels must contain at least one label"))
+			}
 		} else if _, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: modelServer.Spec.WorkloadSelector.MatchLabels}); err != nil {
 			allErrs = append(allErrs, field.Invalid(matchLabelsField, modelServer.Spec.WorkloadSelector.MatchLabels, fmt.Sprintf("invalid selector: %v", err)))
 		}
@@ -315,6 +365,12 @@ func (v *KthenaRouterValidator) validateModelServer(modelServer *networkingv1alp
 		}
 	}
 
+	allErrs = append(allErrs, validateEndpoints(modelServer, endpointsField)...)
+	allErrs = append(allErrs, validateConnectionPool(specField, modelServer)...)
+	if tp := modelServer.Spec.TrafficPolicy; tp != nil {
+		allErrs = append(allErrs, validateSessionSticky(tp.SessionSticky, specField.Child("trafficPolicy").Child("sessionSticky"))...)
+	}
+
 	if len(allErrs) > 0 {
 		var messages []string
 		for _, err := range allErrs {
@@ -325,7 +381,98 @@ func (v *KthenaRouterValidator) validateModelServer(modelServer *networkingv1alp
 	return true, ""
 }
 
-func (v *KthenaRouterValidator) validateExternalModelProvider(provider *networkingv1alpha1.ExternalModelProvider) (bool, string) {
+// validateEndpoints validates the statically configured serving instances.
+func validateEndpoints(modelServer *networkingv1alpha1.ModelServer, endpointsField *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+	if len(modelServer.Spec.Endpoints) == 0 {
+		return allErrs
+	}
+
+	if modelServer.Spec.WorkloadSelector != nil && len(modelServer.Spec.WorkloadSelector.MatchLabels) > 0 {
+		allErrs = append(allErrs, field.Forbidden(endpointsField, "endpoints and workloadSelector.matchLabels are mutually exclusive"))
+	}
+
+	names := make(map[string]struct{}, len(modelServer.Spec.Endpoints))
+	for i, endpoint := range modelServer.Spec.Endpoints {
+		endpointField := endpointsField.Index(i)
+		if endpoint.Name == "" {
+			allErrs = append(allErrs, field.Required(endpointField.Child("name"), "name must be specified"))
+		} else if _, duplicated := names[endpoint.Name]; duplicated {
+			allErrs = append(allErrs, field.Duplicate(endpointField.Child("name"), endpoint.Name))
+		} else {
+			names[endpoint.Name] = struct{}{}
+		}
+
+		if endpoint.Address == "" {
+			allErrs = append(allErrs, field.Required(endpointField.Child("address"), "address must be specified"))
+		}
+
+		port := modelServer.Spec.WorkloadPort.Port
+		if endpoint.Port != nil {
+			port = *endpoint.Port
+			if port < 1 || port > 65535 {
+				allErrs = append(allErrs, field.Invalid(endpointField.Child("port"), port, "port must be between 1 and 65535"))
+			}
+		} else if port < 1 {
+			allErrs = append(allErrs, field.Required(endpointField.Child("port"), "port must be specified when spec.workloadPort.port is unset"))
+		}
+
+		for key, value := range endpoint.Labels {
+			for _, err := range validation.IsQualifiedName(key) {
+				allErrs = append(allErrs, field.Invalid(endpointField.Child("labels"), key, err))
+			}
+			for _, err := range validation.IsValidLabelValue(value) {
+				allErrs = append(allErrs, field.Invalid(endpointField.Child("labels").Key(key), value, err))
+			}
+		}
+	}
+
+	return allErrs
+}
+
+// validateConnectionPool validates the trafficPolicy.connectionPool fields.
+// Negative limits and non-positive idle timeouts are rejected rather than
+// silently replaced with defaults.
+func validateConnectionPool(specField *field.Path, modelServer *networkingv1alpha1.ModelServer) field.ErrorList {
+	var allErrs field.ErrorList
+	if modelServer.Spec.TrafficPolicy == nil || modelServer.Spec.TrafficPolicy.ConnectionPool == nil {
+		return allErrs
+	}
+	cp := modelServer.Spec.TrafficPolicy.ConnectionPool
+	cpField := specField.Child("trafficPolicy").Child("connectionPool")
+
+	if cp.MaxIdleConnections != nil && *cp.MaxIdleConnections < 0 {
+		allErrs = append(allErrs, field.Invalid(cpField.Child("maxIdleConnections"), *cp.MaxIdleConnections, "must be non-negative"))
+	}
+	if cp.MaxIdleConnectionsPerHost != nil && *cp.MaxIdleConnectionsPerHost < 0 {
+		allErrs = append(allErrs, field.Invalid(cpField.Child("maxIdleConnectionsPerHost"), *cp.MaxIdleConnectionsPerHost, "must be non-negative"))
+	}
+	if cp.MaxConnectionsPerHost != nil && *cp.MaxConnectionsPerHost < 0 {
+		allErrs = append(allErrs, field.Invalid(cpField.Child("maxConnectionsPerHost"), *cp.MaxConnectionsPerHost, "must be non-negative"))
+	}
+	if cp.IdleTimeout != nil && cp.IdleTimeout.Duration <= 0 {
+		allErrs = append(allErrs, field.Invalid(cpField.Child("idleTimeout"), cp.IdleTimeout.Duration, "must be a positive duration"))
+	}
+
+	// SGLang runs prefill and decode concurrently, holding connections to two
+	// pods at once. A capped maxConnectionsPerHost can deadlock two concurrent
+	// requests. Only applies when the SGLang connector is selected (engine is
+	// SGLang and no kvConnector is explicitly set); an explicit connector uses
+	// serial prefill-decode. Other pool fields only affect reuse, so stay allowed.
+	if cp.MaxConnectionsPerHost != nil && *cp.MaxConnectionsPerHost > 0 {
+		usesSGLangConnector := modelServer.Spec.InferenceEngine == networkingv1alpha1.SGLang &&
+			(modelServer.Spec.KVConnector == nil || modelServer.Spec.KVConnector.Type == "")
+		if usesSGLangConnector {
+			allErrs = append(allErrs, field.Invalid(cpField.Child("maxConnectionsPerHost"), *cp.MaxConnectionsPerHost,
+				"not supported for SGLang: concurrent prefill-decode requires unlimited per-host connections to avoid deadlock"))
+		}
+	}
+	return allErrs
+}
+
+// ValidateExternalModelProvider validates the ExternalModelProvider resource.
+// It is shared between the admission webhook and the file-based resource source.
+func ValidateExternalModelProvider(provider *networkingv1alpha1.ExternalModelProvider) (bool, string) {
 	var allErrs field.ErrorList
 	specField := field.NewPath("spec")
 
@@ -355,8 +502,8 @@ func (v *KthenaRouterValidator) validateExternalModelProvider(provider *networki
 		if common.IsReservedProviderHeader(header) {
 			allErrs = append(allErrs, field.Invalid(headerField, header, "header is reserved and cannot be configured as a static header"))
 		}
-		if strings.ContainsAny(value, "\r\n") {
-			allErrs = append(allErrs, field.Invalid(headerField, value, "header value must not contain CR or LF"))
+		if !httpguts.ValidHeaderFieldValue(value) {
+			allErrs = append(allErrs, field.Invalid(headerField, value, "header value must be a valid HTTP header field value"))
 		}
 	}
 

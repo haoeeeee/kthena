@@ -21,13 +21,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -38,6 +38,7 @@ import (
 	informersv1alpha1 "github.com/volcano-sh/kthena/client-go/informers/externalversions"
 	listerv1alpha1 "github.com/volcano-sh/kthena/client-go/listers/networking/v1alpha1"
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
@@ -56,12 +57,17 @@ type ModelServerController struct {
 	workqueue   workqueue.TypedRateLimitingInterface[QueueItem]
 	initialSync *atomic.Bool
 	store       datastore.Store
+
+	// transportRegistry holds per-ModelServer upstream transports driven by
+	// this controller's single worker, so writes are serialized.
+	transportRegistry *common.TransportRegistry
 }
 
 func NewModelServerController(
 	kthenaInformerFactory informersv1alpha1.SharedInformerFactory,
 	kubeInformerFactory informers.SharedInformerFactory,
 	store datastore.Store,
+	transportRegistry *common.TransportRegistry,
 ) (*ModelServerController, error) {
 	modelServerInformer := kthenaInformerFactory.Networking().V1alpha1().ModelServers()
 	podInformer := kubeInformerFactory.Core().V1().Pods()
@@ -74,6 +80,7 @@ func NewModelServerController(
 		workqueue:         workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[QueueItem]()),
 		initialSync:       &atomic.Bool{},
 		store:             store,
+		transportRegistry: transportRegistry,
 	}
 
 	var err error
@@ -176,11 +183,30 @@ func (c *ModelServerController) syncModelServerHandler(key string) error {
 
 	ms, err := c.modelServerLister.ModelServers(namespace).Get(name)
 	if errors.IsNotFound(err) {
-		_ = c.store.DeleteModelServer(types.NamespacedName{Namespace: namespace, Name: name})
+		msName := types.NamespacedName{Namespace: namespace, Name: name}
+		_ = c.store.DeleteModelServer(msName)
+		c.transportRegistry.Delete(msName)
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+
+	// Refresh the per-ModelServer upstream transport to match the current
+	// connectionPool config. Update is a no-op when the config is unchanged.
+	var cp *aiv1alpha1.ConnectionPool
+	if ms.Spec.TrafficPolicy != nil {
+		cp = ms.Spec.TrafficPolicy.ConnectionPool
+	}
+	c.transportRegistry.Update(utils.GetNamespaceName(ms), cp)
+
+	if len(ms.Spec.Endpoints) > 0 {
+		return SyncStaticEndpoints(c.store, ms)
+	}
+
+	if ms.Spec.WorkloadSelector == nil {
+		klog.Warningf("model server %s specifies neither workloadSelector nor endpoints, skipping", key)
+		return nil
 	}
 
 	selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: ms.Spec.WorkloadSelector.MatchLabels})
@@ -193,7 +219,7 @@ func (c *ModelServerController) syncModelServerHandler(key string) error {
 		return err
 	}
 
-	pods := sets.NewWithLength[types.NamespacedName](len(podList))
+	pods := make(sets.Set[types.NamespacedName], len(podList))
 	for _, pod := range podList {
 		if isPodReady(pod) {
 			pods.Insert(utils.GetNamespaceName(pod))
@@ -265,6 +291,10 @@ func (c *ModelServerController) addOrUpdatePod(pod *corev1.Pod) error {
 
 	servers := []*aiv1alpha1.ModelServer{}
 	for _, item := range modelServers {
+		// ModelServers backed by static endpoints do not select cluster pods.
+		if item.Spec.WorkloadSelector == nil || len(item.Spec.Endpoints) > 0 {
+			continue
+		}
 		selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: item.Spec.WorkloadSelector.MatchLabels})
 		if err != nil || !selector.Matches(labels.Set(pod.Labels)) {
 			continue
@@ -284,7 +314,7 @@ func (c *ModelServerController) addOrUpdatePod(pod *corev1.Pod) error {
 func (c *ModelServerController) enqueueModelServer(obj interface{}) {
 	var key string
 	var err error
-	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+	if key, err = cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err != nil {
 		utilruntime.HandleError(err)
 		return
 	}
@@ -297,7 +327,7 @@ func (c *ModelServerController) enqueueModelServer(obj interface{}) {
 func (c *ModelServerController) enqueuePod(obj interface{}) {
 	var key string
 	var err error
-	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+	if key, err = cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err != nil {
 		utilruntime.HandleError(err)
 		return
 	}

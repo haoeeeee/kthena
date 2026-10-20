@@ -21,6 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	clientsetfake "github.com/volcano-sh/kthena/client-go/clientset/versioned/fake"
 	workloadlisters "github.com/volcano-sh/kthena/client-go/listers/workload/v1alpha1"
 	workload "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
@@ -222,6 +225,55 @@ func TestGetTargetLabels(t *testing.T) {
 					t.Errorf("GetTargetLabels() selector label %q = %q, want %q", key, gotValue, wantValue)
 				}
 			}
+		})
+	}
+}
+
+func TestGetTargetLabelsDoesNotMutateInput(t *testing.T) {
+	configured := map[string]string{"app": "my-app"}
+
+	tests := []struct {
+		name          string
+		targetNames   []string
+		wantSelectors []string
+	}{
+		{
+			name:        "one target",
+			targetNames: []string{"serving-a"},
+			wantSelectors: []string{
+				"app=my-app," + workload.EntryLabelKey + "=" + Entry + "," + workload.ModelServingNameLabelKey + "=serving-a",
+			},
+		},
+		{
+			name:        "two targets sharing the pod source",
+			targetNames: []string{"serving-a", "serving-b"},
+			wantSelectors: []string{
+				"app=my-app," + workload.EntryLabelKey + "=" + Entry + "," + workload.ModelServingNameLabelKey + "=serving-a",
+				"app=my-app," + workload.EntryLabelKey + "=" + Entry + "," + workload.ModelServingNameLabelKey + "=serving-b",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			podSource := &workload.PodMetricSource{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "my-app"},
+				},
+			}
+
+			gotSelectors := make([]string, 0, len(tt.targetNames))
+			for _, name := range tt.targetNames {
+				target := &workload.Target{TargetRef: corev1.ObjectReference{Name: name}}
+				selector, err := GetTargetLabels(target, podSource)
+				require.NoError(t, err)
+				require.NotNil(t, selector)
+				gotSelectors = append(gotSelectors, (*selector).String())
+				assert.Empty(t, target.TargetRef.Kind)
+			}
+
+			assert.Equal(t, tt.wantSelectors, gotSelectors)
+			assert.Equal(t, configured, podSource.LabelSelector.MatchLabels)
 		})
 	}
 }

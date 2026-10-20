@@ -112,6 +112,12 @@ func TestModelRouteMultiModels(t *testing.T) {
 	router.TestModelRouteMultiModelsShared(t, testCtx, testNamespace, true, kthenaNamespace)
 }
 
+// TestModelRouteResponses tests POST /v1/responses routing through a ModelRoute.
+// This test runs the shared test function with Gateway API enabled (with ParentRefs).
+func TestModelRouteResponses(t *testing.T) {
+	router.TestModelRouteResponsesShared(t, testCtx, testNamespace, true, kthenaNamespace)
+}
+
 // TestModelRoutePrefillDecodeDisaggregation tests PD disaggregation with ModelServing, ModelServer, and ModelRoute.
 // This test runs the shared test function with Gateway API enabled (with ParentRefs).
 func TestModelRoutePrefillDecodeDisaggregation(t *testing.T) {
@@ -336,4 +342,8 @@ func TestDuplicateModelName(t *testing.T) {
 // This test runs the shared test function with Gateway API enabled (with ParentRefs).
 func TestRouterConfigUpdate(t *testing.T) {
 	router.TestRouterConfigUpdateShared(t, testCtx, testNamespace, true, kthenaNamespace)
+}
+
+func TestSessionSticky(t *testing.T) {
+	router.TestSessionStickyShared(t, testCtx, testNamespace, true, kthenaNamespace)
 }

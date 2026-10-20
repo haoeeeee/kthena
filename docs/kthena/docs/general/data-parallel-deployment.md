@@ -7,9 +7,11 @@ Data parallelism is a technique for scaling LLM serving by deploying multiple re
 parallelism (which splits a single model across multiple GPUs to fit large models), data parallelism focuses on
 increasing throughput by distributing incoming requests across multiple independent model instances.
 
-This guide describes how to deploy the **Qwen3-0.6B** model using data parallelism with **ModelBooster**. The deployment
-leverages **vLLM** as the inference backend and demonstrates two different load balancing strategies to suit different
-infrastructure needs:
+:::warning ModelBooster examples are deprecated
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. For new deployments, follow the [ModelServing quick start](../getting-started/quick-start.md#modelserving). The internal-load-balancing examples below are retained for existing users; see the [deprecation details](../user-guide/model-deployment.md#modelbooster-deprecation).
+:::
+
+This guide describes data parallelism for the **Qwen3-0.6B** model with **vLLM** as the inference backend and demonstrates two different load balancing strategies:
 
 1. **Internal Load Balancing**: Distribute requests across workers.
 2. **External Load Balancing**: Relies on external components (like Kubernetes Services or Ingress) to route traffic to
@@ -21,11 +23,16 @@ Internal load balancing serves as the default mode where the coordination implem
 distribution of requests to the available workers. This is suitable for scenarios where you want a unified endpoint that
 internally manages its worker pool.
 
+The following legacy ModelBooster examples are retained for existing deployments. For new deployments, configure
+the workload through ModelServing and manage ModelServer and ModelRoute directly.
+
 ### For Single Node
 
-For example, deploy on a single 2-GPU machine.
+Legacy ModelBooster example for a single 2-GPU machine:
 
 ```yaml
+# ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute.
+# Removal is no earlier than v1.5.
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelBooster
 metadata:
@@ -66,10 +73,12 @@ spec:
 When deploying across multiple nodes, we typically rely on a distributed framework like Ray. This allows the model
 serving engine to scale horizontally beyond a single machine's capacity.
 
-Here is an example to deploy on 2 nodes with 2 GPUs each. The `pods: 2` configuration ensures we have distributed
+This legacy ModelBooster example deploys on 2 nodes with 2 GPUs each. The `pods: 2` configuration ensures we have distributed
 workers, and `data-parallel-backend: "ray"` enables the coordination.
 
 ```yaml
+# ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute.
+# Removal is no earlier than v1.5.
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelBooster
 metadata:
@@ -109,8 +118,10 @@ spec:
 ## External Load Balancing
 
 In scenarios where you want to deploy multiple independent replicas of the model, each with its own endpoint, external
-load balancing is the preferred approach. For now, it does not support deploy by `ModelBooster`, you should use
-`ModelServing` directly. Here is an example deployment of 2 pods (each with 1 GPU) for the **Qwen3-0.6B** model:
+load balancing is the preferred approach. Use `ModelServing` directly for new deployments; the deprecated ModelBooster
+API does not support this mode. The following ModelServing example deploys 2 pods (each with 1 GPU) for the
+**Qwen3-0.6B** model. Configure `ModelServer` and `ModelRoute` separately when routing through Kthena Router, as
+shown in the [quick start](../getting-started/quick-start.md#modelserving).
 
 <CodeBlock language="yaml" showLineNumbers>
     {DataParallelDeployment}

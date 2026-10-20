@@ -162,9 +162,8 @@ func (optimizer *Optimizer) NeedUpdate(policy *workload.AutoscalingPolicy) bool 
 }
 
 func (optimizer *Optimizer) Optimize(ctx context.Context, podLister listerv1.PodLister, autoscalePolicy *workload.AutoscalingPolicy, currentInstancesCounts map[string]int32) (map[string]int32, error) {
-	size := len(optimizer.Meta.Config.Params)
-	unreadyInstancesCount := int32(0)
-	readyInstancesMetrics := make([]algorithm.Metrics, 0, size)
+	unreadyInstancesCountByMetric := make(map[string]int32)
+	readyInstancesMetrics := make(map[string][]algorithm.Metrics)
 	// externalSamples accumulates per-backend (value, replicas) pairs for each
 	// external metric so that the correct aggregation can be applied afterwards.
 	externalSamples := make(map[string][]backendExternalSample)
@@ -180,13 +179,17 @@ func (optimizer *Optimizer) Optimize(ctx context.Context, podLister listerv1.Pod
 
 		backendReplicas := currentInstancesCounts[targetKey]
 		instancesCountSum += backendReplicas
-		currentUnreadyInstancesCount, currentReadyInstancesMetrics, currentExternalMetrics, err := collector.UpdateMetrics(ctx, podLister, param.Target.MetricSources)
+		currentUnreadyInstancesCountByMetric, currentReadyInstancesMetrics, currentExternalMetrics, err := collector.UpdateMetrics(ctx, podLister, param.Target.MetricSources)
 		if err != nil {
 			klog.Warningf("update metrics error: %v", err)
 			continue
 		}
-		unreadyInstancesCount += currentUnreadyInstancesCount
-		readyInstancesMetrics = append(readyInstancesMetrics, currentReadyInstancesMetrics)
+		for metricName, count := range currentUnreadyInstancesCountByMetric {
+			unreadyInstancesCountByMetric[metricName] += count
+		}
+		for metricName, metrics := range currentReadyInstancesMetrics {
+			readyInstancesMetrics[metricName] = append(readyInstancesMetrics[metricName], metrics...)
+		}
 		for metricName, metricValue := range currentExternalMetrics {
 			externalSamples[metricName] = append(externalSamples[metricName], backendExternalSample{
 				value:    metricValue,
@@ -204,14 +207,14 @@ func (optimizer *Optimizer) Optimize(ctx context.Context, podLister listerv1.Pod
 	}
 	// Get recommended replicas of all model serving instances
 	instancesAlgorithm := algorithm.RecommendedInstancesAlgorithm{
-		MinInstances:          optimizer.Meta.MinReplicas,
-		MaxInstances:          optimizer.Meta.MaxReplicas,
-		CurrentInstancesCount: instancesCountSum,
-		Tolerance:             float64(autoscalePolicy.Spec.TolerancePercent) * 0.01,
-		MetricTargets:         optimizer.Meta.MetricTargets,
-		UnreadyInstancesCount: unreadyInstancesCount,
-		ReadyInstancesMetrics: readyInstancesMetrics,
-		ExternalMetrics:       externalMetrics,
+		MinInstances:                  optimizer.Meta.MinReplicas,
+		MaxInstances:                  optimizer.Meta.MaxReplicas,
+		CurrentInstancesCount:         instancesCountSum,
+		Tolerance:                     float64(autoscalePolicy.Spec.TolerancePercent) * 0.01,
+		MetricTargets:                 optimizer.Meta.MetricTargets,
+		UnreadyInstancesCountByMetric: unreadyInstancesCountByMetric,
+		ReadyInstancesMetrics:         readyInstancesMetrics,
+		ExternalMetrics:               externalMetrics,
 	}
 	recommendedInstances, skip := instancesAlgorithm.GetRecommendedInstances()
 	if skip {
@@ -229,13 +232,13 @@ func (optimizer *Optimizer) Optimize(ctx context.Context, podLister listerv1.Pod
 		MaxInstances:         optimizer.Meta.MaxReplicas,
 		CurrentInstances:     instancesCountSum,
 		RecommendedInstances: recommendedInstances}
-	recommendedInstances = CorrectedInstancesAlgorithm.GetCorrectedInstances()
+	correctedInstances := CorrectedInstancesAlgorithm.GetCorrectedInstances()
 
-	klog.InfoS("autoscale controller", "recommendedInstances", recommendedInstances, "correctedInstances", recommendedInstances)
+	klog.InfoS("autoscale controller", "recommendedInstances", recommendedInstances, "correctedInstances", correctedInstances)
 	optimizer.Status.AppendRecommendation(recommendedInstances)
-	optimizer.Status.AppendCorrected(recommendedInstances)
+	optimizer.Status.AppendCorrected(correctedInstances)
 
-	replicasMap := optimizer.Meta.RestoreReplicasOfEachBackend(recommendedInstances)
+	replicasMap := optimizer.Meta.RestoreReplicasOfEachBackend(correctedInstances)
 	return replicasMap, nil
 }
 

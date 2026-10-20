@@ -20,9 +20,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,10 +35,10 @@ import (
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	listerv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 
@@ -105,15 +107,18 @@ func (collector *MetricCollector) UpdateMetrics(
 	ctx context.Context,
 	podLister listerv1.PodLister,
 	targetMetricSources map[string]v1alpha1.MetricSource,
-) (unreadyInstancesCount int32, readyInstancesMetric algorithm.Metrics, externalMetrics algorithm.Metrics, err error) {
-	readyInstancesMetric = make(algorithm.Metrics)
+) (unreadyInstancesCountByMetric map[string]int32, readyInstancesMetrics map[string][]algorithm.Metrics, externalMetrics algorithm.Metrics, err error) {
+	// Results are keyed by metric. Each metric only sees the pods its own source
+	// selects, so a pod that was never asked for a metric is not counted as
+	// missing it, and an unready pod only counts for the metrics that select it.
+	unreadyInstancesCountByMetric = make(map[string]int32)
+	readyInstancesMetrics = make(map[string][]algorithm.Metrics)
 
 	pastHistograms, ok := collector.PastHistograms.GetLastUnfreshSnapshot()
 	if !ok {
 		pastHistograms = make(map[string]HistogramInfo)
 	}
 	currentHistograms := make(map[string]HistogramInfo)
-	unreadyPods := sets.New[string]()
 
 	// Group pod metrics by identical PodMetricSource (uri/port/selector) so we
 	// scrape each ready pod endpoint once per reconcile and extract every
@@ -131,15 +136,16 @@ func (collector *MetricCollector) UpdateMetrics(
 			klog.Warningf("collect pod metrics for target %s skipped because pod failed/restarted", collector.Target.TargetRef.Name)
 			continue
 		}
-		for podKey := range groupUnreadyPods {
-			unreadyPods.Insert(podKey)
+		groupMetrics := make([]algorithm.Metrics, 0, len(values))
+		for _, podKey := range slices.Sorted(maps.Keys(values)) {
+			groupMetrics = append(groupMetrics, values[podKey])
 		}
-		for policyKey, v := range values {
-			readyInstancesMetric[policyKey] = v
+		for _, spec := range g.specs {
+			readyInstancesMetrics[spec.policyKey] = groupMetrics
+			unreadyInstancesCountByMetric[spec.policyKey] = int32(len(groupUnreadyPods))
 		}
 	}
 
-	unreadyInstancesCount = int32(len(unreadyPods))
 	collector.PastHistograms.Append(currentHistograms)
 	return
 }
@@ -237,8 +243,7 @@ func (collector *MetricCollector) collectPodMetricsGroup(
 	specs []podMetricSpec,
 	pastHistograms map[string]HistogramInfo,
 	currentHistograms map[string]HistogramInfo,
-) (values map[string]float64, unreadyPods sets.Set[string], failed bool, err error) {
-	values = make(map[string]float64, len(specs))
+) (values map[string]algorithm.Metrics, unreadyPods sets.Set[string], failed bool, err error) {
 	pods, err := util.GetMetricPods(podLister, collector.Scope.Namespace, collector.Target, podSource)
 	if err != nil {
 		return nil, nil, false, err
@@ -255,13 +260,19 @@ func (collector *MetricCollector) collectPodMetricsGroup(
 	// Multiple policy keys may target the same scrape metric name.
 	wanted := groupPolicyKeysByScrapeName(specs)
 
+	values = make(map[string]algorithm.Metrics, len(pods))
 	for _, pod := range pods {
 		if !inferControllerUtils.IsPodRunningAndReady(pod) {
 			continue
 		}
-		if err = collector.collectPodMetrics(ctx, pod, podSource, wanted, values, pastHistograms, currentHistograms); err != nil {
-			return nil, nil, false, err
+		podValues := make(algorithm.Metrics, len(specs))
+		if scrapeErr := collector.collectPodMetrics(ctx, pod, podSource, wanted, podValues, pastHistograms, currentHistograms); scrapeErr != nil {
+			// Keep the ready pod as an entry with no values so the algorithm counts
+			// its metrics as missing, instead of dropping it or treating it as zero load.
+			klog.Warningf("collect metrics from pod %s failed: %v", metricPodKey(pod), scrapeErr)
+			podValues = make(algorithm.Metrics)
 		}
+		values[metricPodKey(pod)] = podValues
 	}
 	return
 }

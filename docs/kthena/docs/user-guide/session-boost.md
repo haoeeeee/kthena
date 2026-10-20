@@ -52,7 +52,7 @@ Session boost is designed for these scenarios:
 Session boost is **not** needed when:
 
 - Your workload is single-turn (independent requests with no shared prefix).
-- You need multi-tenant fairness as the primary scheduling concern (use [fairness scheduling](./fairness-scheduling) instead). Session sticky routing is complementary and can be combined with session boost (see [Operational Notes](#operational-notes)).
+- You need multi-tenant fairness as the primary scheduling concern (use [fairness scheduling](./fairness-scheduling) instead). Session sticky routing is complementary and can be combined with session boost (see [session sticky](./session-sticky) and [Operational Notes](#operational-notes)).
 
 ## Prerequisites
 
@@ -250,7 +250,7 @@ To observe the effect, generate concurrent load with multiple simultaneous multi
 ## Operational Notes
 
 - Session state is **in memory** on each router instance. In multi-replica deployments, state is not shared across replicas. Combine with session sticky routing to ensure the same session hits the same router instance.
-- Session boost does not guarantee pod affinity. For maximum prefix cache benefit, combine with session sticky routing so boosted requests reach the pod that holds the warm KV cache.
+- Session boost does not guarantee pod affinity. For maximum prefix cache benefit, combine with [session sticky routing](./session-sticky) so boosted requests reach the pod that holds the warm KV cache.
 - Requests without the configured session header are enqueued as normal (non-boosted) requests.
 - Session tracking does not survive router restarts.
 
@@ -265,7 +265,7 @@ Verify that:
 
 ### TTFT is not improving despite boost
 
-Session boost only controls queue ordering. If the boosted request is routed to a different pod than the one holding the warm prefix cache, no TTFT improvement occurs. Combine session boost with session sticky routing for full benefit.
+Session boost only controls queue ordering. If the boosted request is routed to a different pod than the one holding the warm prefix cache, no TTFT improvement occurs. Combine session boost with [session sticky routing](./session-sticky) for full benefit.
 
 ### High memory usage from session tracking
 

@@ -17,7 +17,6 @@ limitations under the License.
 package router
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -30,6 +29,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -52,6 +52,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins/conf"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/sessionsticky"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
 
@@ -106,6 +107,10 @@ type Router struct {
 	// KV Connector management
 	connectorFactory *connectors.Factory
 
+	// Per-ModelServer upstream transports (nil entries fall back to shared
+	// proxyTransport/upstreamTransport).
+	transportRegistry *common.TransportRegistry
+
 	// Priority queue configuration
 	queueTimeout     time.Duration
 	tokenWeight      float64 // Weight for token-based priority in the fairness strategy (default 1.0)
@@ -116,6 +121,8 @@ type Router struct {
 	// waiting indefinitely for backend capacity. It defaults to 30s; a non-positive
 	// value disables the timeout (the request is bounded only by client disconnect).
 	sessionBoostTimeout time.Duration
+
+	sessionStickyStore sessionsticky.Store
 }
 
 // ActiveRequestCount returns the number of requests currently being handled by the router.
@@ -123,7 +130,7 @@ func (r *Router) ActiveRequestCount() int64 {
 	return r.metrics.ActiveRequestsCount()
 }
 
-func NewRouter(store datastore.Store, routerConfigPath string) *Router {
+func NewRouter(store datastore.Store, routerConfigPath string, transportRegistry *common.TransportRegistry) *Router {
 	// User fairness and session boost are mutually exclusive scheduling strategies.
 	// Enabling both is a configuration error.
 	if EnableFairnessScheduling && EnableSessionBoost {
@@ -163,6 +170,11 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 		klog.Fatalf("failed to parse router config: %v", err)
 	}
 
+	sessionStickyStore, err := sessionsticky.NewStore(routerConfig.SessionSticky)
+	if err != nil {
+		klog.Fatalf("session sticky store: %v", err)
+	}
+
 	// Initialize access logger with configuration from environment variables
 	accessLogConfig := &accesslog.AccessLoggerConfig{
 		Enabled: true,
@@ -195,19 +207,21 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 	}
 
 	return &Router{
-		store:            store,
-		scheduler:        scheduler.NewScheduler(store, routerConfig),
-		authenticator:    auth.NewJWTAuthenticator(routerConfig),
-		loadRateLimiter:  loadRateLimiter,
-		accessLogger:     accessLogger,
-		metrics:          metricsInstance,
-		tokenizer:        tokenizerInstance,
-		connectorFactory: connectors.NewDefaultFactory(),
-		queueTimeout:     parseQueueTimeout(),
-		tokenWeight:      parseEnvFloat("FAIRNESS_PRIORITY_TOKEN_WEIGHT", 1.0),
-		requestNumWeight: parseEnvFloat("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", 0.0),
+		store:             store,
+		scheduler:         scheduler.NewScheduler(store, routerConfig),
+		authenticator:     auth.NewJWTAuthenticator(routerConfig),
+		loadRateLimiter:   loadRateLimiter,
+		accessLogger:      accessLogger,
+		metrics:           metricsInstance,
+		tokenizer:         tokenizerInstance,
+		connectorFactory:  connectors.NewDefaultFactory(),
+		transportRegistry: transportRegistry,
+		queueTimeout:      parseQueueTimeout(),
+		tokenWeight:       parseEnvFloat("FAIRNESS_PRIORITY_TOKEN_WEIGHT", 1.0),
+		requestNumWeight:  parseEnvFloat("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", 0.0),
 
 		sessionBoostTimeout: parseSessionBoostTimeout(),
+		sessionStickyStore:  sessionStickyStore,
 	}
 }
 
@@ -296,7 +310,7 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 		c.Set("model", modelName)
 
 		// Create metrics recorder for this request
-		path := c.Request.URL.Path
+		path := requestPathLabel(c)
 		hasModel := r.store.HasModel(modelName)
 		metricsModel := metrics.UnknownModel
 		if hasModel {
@@ -425,6 +439,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 	var modelServerName types.NamespacedName
 	var modelTarget datastore.ModelTarget
 	var modelRoute *v1alpha1.ModelRoute
+	var matchedRule *v1alpha1.Rule
 	var modelServer *v1alpha1.ModelServer
 	var inferencePoolFullName string
 
@@ -441,13 +456,17 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 
 	var isLora bool
 	var err error
-	// Try to match ModelRoute first
-	modelTarget, isLora, modelRoute, err = r.store.MatchModelTarget(modelName, c.Request, gatewayKey)
+	modelTarget, isLora, modelRoute, matchedRule, err = r.store.MatchModelTarget(modelName, c.Request, gatewayKey)
 	if err != nil {
 		accesslog.SetError(c, "model_route_matching", fmt.Sprintf("failed to match model route target: %v", err))
 	}
 
 	if err == nil && strings.HasPrefix(c.Request.URL.Path, "/v1/") {
+		// The matched ModelRoute serves this request. Attribute it to the `uri`
+		// match value of the rule that matched, so /v1 paths other than the
+		// router-owned endpoints keep a bounded label instead of "other".
+		setRequestPathLabel(c, modelRouteURIMatchValue(matchedRule))
+
 		if modelTarget.Kind == datastore.ModelTargetKindExternalModelProvider {
 			provider := r.store.GetExternalModelProvider(modelTarget.Name)
 			if provider == nil {
@@ -621,6 +640,17 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		upstreamModelForMetrics = *modelServer.Spec.Model
 	}
 
+	var stickySpec *v1alpha1.SessionSticky
+	var sessionKey, stickyStoreKey string
+	var stickyBinding sessionsticky.Binding
+	var stickyBindingOK bool
+	stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingOK = r.lookupSessionStickyBinding(c, modelServer)
+	stickyBindingFound := stickyBindingOK
+	// PD sticky requires a complete Prefill/Decode binding; aggregated uses Pod only.
+	if stickyBindingOK && pdGroup != nil {
+		stickyBindingOK = stickyBinding.ValidPD()
+	}
+
 	ctx := &framework.Context{
 		Model:           modelName,
 		Prompt:          prompt,
@@ -630,6 +660,10 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		PDGroup:         pdGroup,
 		MetricsRecorder: metricsRecorder,
 	}
+	if stickyBindingOK {
+		ctx.StickyPodName = stickyBinding.Pod
+		ctx.StickyPrefillPodName = stickyBinding.PrefillPod
+	}
 
 	err = r.scheduler.Schedule(ctx, pods)
 	if err != nil {
@@ -637,6 +671,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		c.AbortWithStatusJSON(http.StatusBadRequest, fmt.Sprintf("can't schedule to target pod: %v", err))
 		return fmt.Errorf("can't schedule to target pod: %v", err)
 	}
+	r.finalizeSessionSticky(c, ctx, stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingFound, modelServerName.Name)
 
 	// Set complete request routing information in access log
 	modelServerFullName := ""
@@ -665,11 +700,12 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		backendName = inferencePoolFullName
 	}
 	accesslog.SetBackendInfo(c, backendType, backendName, upstreamModel)
+	modelIsRegistered := r.store.HasModel(modelName)
 	destination := metrics.DestinationLabels{
 		ModelRoute:    modelRouteName,
 		BackendType:   backendType,
 		BackendName:   backendName,
-		UpstreamModel: upstreamModel,
+		UpstreamModel: upstreamModelLabelForMetrics(modelServer, modelName, isLora, modelIsRegistered),
 	}
 	if recorder, exists := c.Get("metricsRecorder"); exists {
 		if rec, ok := recorder.(*metrics.RequestMetricsRecorder); ok {
@@ -696,6 +732,88 @@ func upstreamTimeoutFor(ms *v1alpha1.ModelServer) time.Duration {
 		return 0
 	}
 	return ms.Spec.TrafficPolicy.Timeout.Duration
+}
+
+// transportFor returns the per-ModelServer upstream transport, or nil when no
+// connectionPool is configured (callers fall back to a shared transport).
+func (r *Router) transportFor(name types.NamespacedName) *http.Transport {
+	if r.transportRegistry == nil {
+		return nil
+	}
+	return r.transportRegistry.Get(name)
+}
+
+func sessionStickyFromModelServer(ms *v1alpha1.ModelServer) *v1alpha1.SessionSticky {
+	if ms == nil || ms.Spec.TrafficPolicy == nil {
+		return nil
+	}
+	return ms.Spec.TrafficPolicy.SessionSticky
+}
+
+func (r *Router) lookupSessionStickyBinding(c *gin.Context, modelServer *v1alpha1.ModelServer) (
+	stickySpec *v1alpha1.SessionSticky, sessionKey, stickyStoreKey string, binding sessionsticky.Binding, ok bool,
+) {
+	stickySpec = sessionStickyFromModelServer(modelServer)
+	if stickySpec == nil || r.sessionStickyStore == nil {
+		return stickySpec, "", "", sessionsticky.Binding{}, false
+	}
+	sessionKey, stickyStoreKey, binding, ok = sessionsticky.LookupBinding(
+		c,
+		types.NamespacedName{Namespace: modelServer.Namespace, Name: modelServer.Name},
+		stickySpec,
+		r.sessionStickyStore,
+	)
+	return stickySpec, sessionKey, stickyStoreKey, binding, ok
+}
+
+// finalizeSessionSticky runs post-schedule session affinity bookkeeping (clear stale bindings, commit winner).
+func (r *Router) finalizeSessionSticky(
+	c *gin.Context,
+	ctx *framework.Context,
+	stickySpec *v1alpha1.SessionSticky,
+	sessionKey, stickyStoreKey string,
+	prev sessionsticky.Binding,
+	prevOK bool,
+	selectedModelServer string,
+) {
+	// No backing store or session key could not be resolved from the request.
+	if r.sessionStickyStore == nil || sessionKey == "" || stickyStoreKey == "" {
+		return
+	}
+
+	// ModelServer has no session sticky or scheduling did not pick a pod to bind.
+	if stickySpec == nil || selectedModelServer == "" {
+		return
+	}
+	selected := sessionsticky.Binding{ModelServer: selectedModelServer}
+	if ctx.PDGroup != nil {
+		if len(ctx.PrefillPods) == 0 || len(ctx.DecodePods) == 0 ||
+			ctx.PrefillPods[0] == nil || ctx.DecodePods[0] == nil {
+			klog.Warningf("session sticky: skip commit for PD modelServer %q: missing selectable prefill/decode pair after schedule (prefill=%d decode=%d)",
+				selectedModelServer, len(ctx.PrefillPods), len(ctx.DecodePods))
+			return
+		}
+		selected.PrefillPod = ctx.PrefillPods[0].GetPodNamespacedName().Name
+		selected.Pod = ctx.DecodePods[0].GetPodNamespacedName().Name
+	} else {
+		if len(ctx.BestPods) == 0 || ctx.BestPods[0].Pod == nil {
+			klog.Warningf("session sticky: skip commit for modelServer %q: no selectable pod after schedule",
+				selectedModelServer)
+			return
+		}
+		selected.Pod = ctx.BestPods[0].Pod.Name
+	}
+	reqCtx := c.Request.Context()
+	if prevOK && !prev.Equal(selected) {
+		r.sessionStickyStore.Delete(reqCtx, stickyStoreKey)
+		klog.InfoS("session sticky: mapped binding no longer selectable, cleared",
+			"key", stickyStoreKey, "prev", prev.String(), "selected", selected.String())
+	}
+
+	ttl := sessionsticky.TTL(stickySpec)
+	if _, err := r.sessionStickyStore.Commit(reqCtx, stickyStoreKey, selected, ttl); err != nil {
+		klog.Errorf("session sticky commit: %v", err)
+	}
 }
 
 func ParseModelRequest(c *gin.Context) (ModelRequest, error) {
@@ -749,6 +867,10 @@ func (r *Router) handleHTTPRoute(c *gin.Context, gatewayKey string) (bool, types
 	if !matched {
 		return false, types.NamespacedName{}, nil
 	}
+
+	// Attribute request metrics to the path template of the rule that matched:
+	// this is the HTTPRoute that serves the request.
+	setRequestPathLabel(c, matchResult.matchedPathTemplate)
 
 	// Record Gateway API match into access log (gatewayKey is already "namespace/name").
 	httpRouteKey := fmt.Sprintf("%s/%s", matchResult.route.Namespace, matchResult.route.Name)
@@ -837,6 +959,7 @@ func (r *Router) proxy(
 	stream bool,
 	port int32,
 	timeout time.Duration,
+	rt http.RoundTripper,
 	onUsage func(u providers.TokenUsage),
 ) error {
 	// Capture body bytes once so each retry attempt gets a fresh reader.
@@ -867,7 +990,7 @@ func (r *Router) proxy(
 		}
 
 		// Request dispatched to the pod.
-		err := proxyRequest(c, req, podObj.Status.PodIP, port, stream, timeout, onUsage)
+		err := proxyRequest(c, req, podObj.Status.PodIP, utils.EndpointPort(podObj, port), stream, timeout, rt, onUsage)
 
 		if ctx.MetricsRecorder != nil {
 			ctx.MetricsRecorder.DecActiveUpstreamRequests()
@@ -911,14 +1034,26 @@ func (r *Router) proxyModelEndpoint(
 		}
 	}
 
+	// Resolve the per-ModelServer transport. May be nil (no connectionPool
+	// configured, or InferencePool/external path); callers fall back to the
+	// shared proxyTransport/upstreamTransport.
+	rt := r.transportFor(ctx.ModelServerName)
+	// Stash it for the PD-disaggregated connectors path; upstreamRoundTripper
+	// falls back to upstreamTransport when nil.
+	c.Set(common.UpstreamTransportKey, rt)
+
 	// proxy to pd aggregated pod
 	if ctx.BestPods != nil {
+		effRT := http.RoundTripper(proxyTransport)
+		if rt != nil {
+			effRT = rt
+		}
 		// build request
 		decodeRequest := connectors.BuildDecodeRequest(c, req, modelRequest)
 		stream := isStreaming(modelRequest)
 		modelName := ctx.Model
 		userID := c.GetString(common.UserIdKey)
-		err := r.proxy(c, decodeRequest, ctx, stream, port, timeout, func(usage providers.TokenUsage) {
+		err := r.proxy(c, decodeRequest, ctx, stream, port, timeout, effRT, func(usage providers.TokenUsage) {
 			if usage.TotalTokens <= 0 {
 				return
 			}
@@ -955,7 +1090,7 @@ func (r *Router) proxyModelEndpoint(
 	}
 
 	// PD disaggregated mode - use KV connector
-	return r.proxyToPDDisaggregated(c, req, ctx, kvConnector, modelRequest, port)
+	return r.proxyToPDDisaggregated(c, req, ctx, kvConnector, modelRequest, port, timeout)
 }
 
 func (r *Router) proxyExternalProvider(
@@ -1129,9 +1264,10 @@ func proxyRequest(
 	port int32,
 	stream bool,
 	timeout time.Duration,
+	rt http.RoundTripper,
 	onUsage func(u providers.TokenUsage),
 ) error {
-	resp, err := doRequest(req, podIP, port, timeout)
+	resp, err := doRequest(req, podIP, port, timeout, rt)
 	if resp != nil {
 		defer resp.Body.Close()
 		accesslog.SetUpstreamInfo(c, resp.StatusCode, 0)
@@ -1139,8 +1275,42 @@ func proxyRequest(
 	if err != nil {
 		return fmt.Errorf("decode request error: %w", err)
 	}
-	parser := providers.DefaultAdapter().ResponseParser(c, req.URL.Path)
+	path := originalRequestPath(c, req)
+	if isResponsesRequest(c, req) {
+		path = "/v1/responses"
+	}
+	parser := providers.DefaultAdapter().ResponseParser(c, path)
 	return forwardResponseWithUsageParser(c, resp, stream, parser, onUsage)
+}
+
+// originalRequestPath returns the client-facing request path used for wire
+// protocol detection (e.g. selecting the OpenAI Responses vs Chat Completions
+// response parser). It prefers the path recorded by the access-log middleware,
+// which always runs before HTTPRoute matching and so captures the path before
+// any URLRewrite filter can mutate req.URL.Path in place; it falls back to
+// req.URL.Path when no access-log context is set.
+func originalRequestPath(c *gin.Context, req *http.Request) string {
+	if c != nil {
+		if accessCtx := accesslog.GetAccessLogContext(c); accessCtx != nil && accessCtx.Path != "" {
+			return accessCtx.Path
+		}
+	}
+	return req.URL.Path
+}
+
+// isResponsesPath reports whether p targets the OpenAI Responses API endpoint.
+// It mirrors the exact-match convention used by the provider adapters.
+func isResponsesPath(p string) bool {
+	return p == "/v1/responses"
+}
+
+// isResponsesRequest reports whether req targets the OpenAI Responses API. It
+// checks both the original client-facing path and the current (possibly
+// URLRewrite-mutated) request path, so a canonical client using /v1/responses
+// directly and an HTTPRoute that rewrites a custom public path (e.g.
+// /llm/v1/responses) to canonical /v1/responses are both recognized.
+func isResponsesRequest(c *gin.Context, req *http.Request) bool {
+	return isResponsesPath(originalRequestPath(c, req)) || isResponsesPath(req.URL.Path)
 }
 
 func proxyExternalRequest(
@@ -1176,6 +1346,9 @@ func proxyExternalRequest(
 	return nil
 }
 
+// forwardResponseWithUsageParser writes the response status/headers, then forwards
+// the body via the shared parser-driven stream/body helpers in providers, which own
+// the SSE forwarding loop generic over providers.ResponseUsageParser.
 func forwardResponseWithUsageParser(
 	c *gin.Context,
 	resp *http.Response,
@@ -1187,66 +1360,12 @@ func forwardResponseWithUsageParser(
 	c.Status(resp.StatusCode)
 
 	if stream {
-		reader := bufio.NewReader(resp.Body)
-		var streamErr error
-		clientDisconnected := c.Stream(func(w io.Writer) bool {
-			line, err := reader.ReadBytes('\n')
-			if len(line) > 0 {
-				parseResult := parser.ParseStreamLine(string(line))
-				if parseResult.HasUsage {
-					klog.V(4).Infof("Parsed usage: %+v", parseResult.Usage)
-					if onUsage != nil {
-						onUsage(parseResult.Usage)
-					}
-					if parseResult.SuppressLine {
-						return true
-					}
-				}
-				n, writeErr := w.Write(line)
-				if writeErr != nil {
-					klog.Errorf("error writing stream body: %v", writeErr)
-					streamErr = writeErr
-					return false
-				}
-				if n != len(line) {
-					klog.Errorf("error writing stream body: %v", io.ErrShortWrite)
-					streamErr = io.ErrShortWrite
-					return false
-				}
-				parser.RecordStreamLineWritten(string(line))
-			}
-			if err != nil {
-				if err != io.EOF {
-					if !errors.Is(err, context.Canceled) || !parser.StreamCompleted() {
-						klog.Errorf("error reading stream body: %v", err)
-						streamErr = err
-					}
-				}
-				return false
-			}
-			return true
-		})
-		if clientDisconnected && streamErr == nil && !parser.StreamCompleted() {
-			streamErr = context.Canceled
-		}
-		if usage, ok := parser.FinalStreamUsage(); ok && onUsage != nil {
-			onUsage(usage)
-		}
-		return streamErr
-	}
-
-	var buf bytes.Buffer
-	teeReader := io.TeeReader(resp.Body, &buf)
-	if _, err := io.Copy(c.Writer, teeReader); err != nil {
-		klog.Errorf("copy response to downstream failed: %v", err)
+		_, err := providers.ForwardStream(c, resp.Body, parser, onUsage)
 		return err
 	}
 
-	if usage, ok := parser.ParseBody(buf.Bytes()); ok && onUsage != nil {
-		klog.V(4).Infof("Parsed usage: %+v", usage)
-		onUsage(usage)
-	}
-	return nil
+	_, err := providers.ForwardBody(c, resp.Body, parser, onUsage)
+	return err
 }
 
 func isTimeoutError(err error) bool {
@@ -1326,6 +1445,7 @@ func doRequest(
 	podIP string,
 	port int32,
 	timeout time.Duration,
+	rt http.RoundTripper,
 ) (*http.Response, error) {
 	// step 1: change request URL to prefill pod URL.
 	req.URL.Host = net.JoinHostPort(podIP, strconv.Itoa(int(port)))
@@ -1342,7 +1462,7 @@ func doRequest(
 		req = req.WithContext(ctx)
 	}
 
-	resp, err := http.DefaultTransport.RoundTrip(req)
+	resp, err := rt.RoundTrip(req)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -1398,6 +1518,7 @@ func (r *Router) proxyToPDDisaggregated(
 	kvConnector connectors.KVConnector,
 	modelRequest ModelRequest,
 	port int32,
+	timeout time.Duration,
 ) error {
 	// Get metrics recorder from context
 	var metricsRecorder *metrics.RequestMetricsRecorder
@@ -1413,6 +1534,10 @@ func (r *Router) proxyToPDDisaggregated(
 		maxRetry = len(ctx.PrefillPods)
 	}
 
+	// Set when an attempt fails with a captured (not yet written) decode upstream
+	// error, so it can still be forwarded to the client below if every retry fails.
+	var lastResponsesErr *connectors.DecodeUpstreamError
+
 	for i := 0; i < maxRetry; i++ {
 		if ctx.PrefillPods[i] == nil || ctx.DecodePods[i] == nil {
 			continue
@@ -1422,8 +1547,8 @@ func (r *Router) proxyToPDDisaggregated(
 		accesslog.SetUpstreamInfo(c, 0, i+1)
 
 		// Build addresses for prefill and decode pods
-		prefillAddr := net.JoinHostPort(prefillPod.Status.PodIP, strconv.Itoa(int(port)))
-		decodeAddr := net.JoinHostPort(decodePod.Status.PodIP, strconv.Itoa(int(port)))
+		prefillAddr := net.JoinHostPort(prefillPod.Status.PodIP, strconv.Itoa(int(utils.EndpointPort(prefillPod, port))))
+		decodeAddr := net.JoinHostPort(decodePod.Status.PodIP, strconv.Itoa(int(utils.EndpointPort(decodePod, port))))
 
 		klog.V(4).Infof("Attempting PD disaggregated request: prefill=%s, decode=%s", prefillAddr, decodeAddr)
 
@@ -1439,7 +1564,7 @@ func (r *Router) proxyToPDDisaggregated(
 		}
 
 		// Execute the PD disaggregated proxy operation
-		outputTokens, err := kvConnector.Proxy(c, modelRequest, prefillAddr, decodeAddr, hooks)
+		outputTokens, err := kvConnector.Proxy(c, modelRequest, prefillAddr, decodeAddr, timeout, hooks)
 		if c.Writer.Written() {
 			accesslog.SetUpstreamInfo(c, c.Writer.Status(), 0)
 		}
@@ -1447,6 +1572,13 @@ func (r *Router) proxyToPDDisaggregated(
 		if err != nil {
 			klog.Errorf("proxy failed for prefill pod %s, decode pod %s: %v",
 				prefillPod.Name, decodePod.Name, err)
+			if c.Writer.Written() {
+				return err
+			}
+			var responsesErr *connectors.DecodeUpstreamError
+			if errors.As(err, &responsesErr) {
+				lastResponsesErr = responsesErr
+			}
 			continue
 		}
 
@@ -1469,7 +1601,19 @@ func (r *Router) proxyToPDDisaggregated(
 		return nil
 	}
 
-	c.AbortWithStatusJSON(http.StatusInternalServerError, "all prefill/decode attempts failed")
+	if !c.Writer.Written() {
+		// Every retry failed. If at least one attempt got a real (non-2xx) Responses
+		// upstream response rather than a connection-level failure, forward that
+		// response's actual status/headers/body instead of a generic 500 — this is
+		// the last one observed, matching the existing "last attempt wins" behavior
+		// implicit in this loop (accesslog.SetUpstreamInfo etc. also reflect only
+		// the final attempt).
+		if lastResponsesErr != nil {
+			lastResponsesErr.WriteTo(c)
+			return lastResponsesErr
+		}
+		c.AbortWithStatusJSON(http.StatusInternalServerError, "all prefill/decode attempts failed")
+	}
 	return fmt.Errorf("all prefill/decode attempts failed")
 }
 
@@ -1542,6 +1686,7 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 		// starve authenticated users (lower value = higher priority).
 		pri = math.MaxFloat64
 	}
+	var queueClosed atomic.Bool
 	queueReq := &datastore.Request{
 		UserID:      userId,
 		ModelName:   modelName,
@@ -1550,7 +1695,7 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 		RequestTime: time.Now(),
 		NotifyChan:  make(chan struct{}),
 		CancelCh:    reqCtx.Done(),
-		Cancel:      cancel,
+		Cancel:      func() { queueClosed.Store(true); cancel() },
 	}
 
 	if err := r.store.Enqueue(queueReq); err != nil {
@@ -1596,6 +1741,12 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 			}
 			c.AbortWithStatusJSON(http.StatusGatewayTimeout, "Request processing timed out in queue")
 			return fmt.Errorf("request processing timed out in queue")
+		}
+		if queueClosed.Load() {
+			klog.V(2).Infof("%s request rejected because the queue closed: reqID=%s sessionID=%s user=%s model=%s",
+				logPrefix, requestID, sessionID, userId, modelName)
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, "Request queue closed while waiting")
+			return fmt.Errorf("request queue closed while waiting")
 		}
 		klog.V(4).Infof("%s request cancelled (client disconnected): reqID=%s sessionID=%s user=%s model=%s",
 			logPrefix, requestID, sessionID, userId, modelName)

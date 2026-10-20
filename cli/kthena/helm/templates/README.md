@@ -2,6 +2,8 @@
 
 This directory contains Helm templates for the Kthena CLI, designed to provide a set of curated, production‑ready manifests for common AI inference workloads.
 
+> **Deprecated templates:** The templates in this directory create ModelBooster resources. ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. These templates are retained for existing users. For new deployments, follow the [ModelServing quick start](../../../../docs/kthena/docs/getting-started/quick-start.md#modelserving).
+
 ## Design Principles
 
 Templates in this repository adhere to the following principles:

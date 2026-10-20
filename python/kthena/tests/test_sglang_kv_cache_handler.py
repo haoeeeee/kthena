@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -85,7 +86,7 @@ async def test_block_stored_writes_matrix_and_mapping_keys():
     pipeline = _FakePipeline()
     redis_client = _make_redis_client(pipeline)
     manager = SGLangKVCacheRedisManager(redis_client=redis_client)
-    handler = SGLangKVCacheEventHandler(redis_manager=manager)
+    handler = SGLangKVCacheEventHandler(kv_manager=manager)
 
     token_ids = list(range(32))  # 2 blocks of 16
     sglang_block_hashes = [111, 222]
@@ -139,7 +140,7 @@ async def test_block_removed_uses_in_memory_mapping():
     manager.hash_mapping[111] = 999
     manager.hash_mapping[222] = 888
 
-    handler = SGLangKVCacheEventHandler(redis_manager=manager)
+    handler = SGLangKVCacheEventHandler(kv_manager=manager)
     event_data = SGLangEventData(
         event_type=EventType.SGLANG_BLOCK_REMOVED,
         timestamp=datetime.now(timezone.utc),
@@ -180,7 +181,7 @@ async def test_all_blocks_cleared_clears_pod_from_matrix():
     redis_client.scan_keys = AsyncMock(side_effect=[matrix_keys, mapping_keys])
 
     manager = SGLangKVCacheRedisManager(redis_client=redis_client)
-    handler = SGLangKVCacheEventHandler(redis_manager=manager)
+    handler = SGLangKVCacheEventHandler(kv_manager=manager)
     event_data = SGLangEventData(
         event_type=EventType.SGLANG_ALL_BLOCKS_CLEARED,
         timestamp=datetime.now(timezone.utc),
@@ -280,3 +281,19 @@ async def test_scan_keys_handles_empty_round_before_cursor_returns_to_zero():
         "matrix:kv:block:qwen@1"
     ]
     assert client._client.cursors == [0, 9]
+
+
+def test_standardized_hash_keeps_token_ids_out_of_info_logs(caplog):
+    """Token ids detokenize back to prompt text, so INFO must never carry them."""
+    with caplog.at_level(logging.INFO, logger="kthena.runtime.kv_cache_manager"):
+        compute_standardized_hash([101, 202, 303])
+    assert caplog.records == []
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="kthena.runtime.kv_cache_manager"):
+        compute_standardized_hash([101, 202, 303])
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "tokens=3" in message
+    assert "token_ids" not in message
+    assert "101" not in message

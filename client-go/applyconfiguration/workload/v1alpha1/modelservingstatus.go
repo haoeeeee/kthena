@@ -24,16 +24,32 @@ import (
 
 // ModelServingStatusApplyConfiguration represents a declarative configuration of the ModelServingStatus type for use
 // with apply.
+//
+// ModelServingStatus defines the observed state of ModelServing
 type ModelServingStatusApplyConfiguration struct {
-	ObservedGeneration *int64                           `json:"observedGeneration,omitempty"`
-	Replicas           *int32                           `json:"replicas,omitempty"`
-	CurrentReplicas    *int32                           `json:"currentReplicas,omitempty"`
-	UpdatedReplicas    *int32                           `json:"updatedReplicas,omitempty"`
-	AvailableReplicas  *int32                           `json:"availableReplicas,omitempty"`
-	CurrentRevision    *string                          `json:"currentRevision,omitempty"`
-	UpdateRevision     *string                          `json:"updateRevision,omitempty"`
-	Conditions         []v1.ConditionApplyConfiguration `json:"conditions,omitempty"`
-	LabelSelector      *string                          `json:"labelSelector,omitempty"`
+	// observedGeneration is the most recent generation observed for ModelServing. It corresponds to the
+	// ModelServing's generation, which is updated on mutation by the API Server.
+	ObservedGeneration *int64 `json:"observedGeneration,omitempty"`
+	// Replicas track the total number of ServingGroup that have been created (updated or not, ready or not)
+	Replicas *int32 `json:"replicas,omitempty"`
+	// CurrentReplicas is the number of ServingGroup created by the ModelServing controller from the ModelServing version
+	CurrentReplicas *int32 `json:"currentReplicas,omitempty"`
+	// UpdatedReplicas track the number of ServingGroup that have been updated (ready or not).
+	UpdatedReplicas *int32 `json:"updatedReplicas,omitempty"`
+	// AvailableReplicas track the number of ServingGroup that are in ready state (updated or not).
+	AvailableReplicas *int32 `json:"availableReplicas,omitempty"`
+	// CurrentRevision, if not empty, indicates the ControllerRevision version preserved by
+	// ServingGroups that have not been updated.
+	CurrentRevision *string `json:"currentRevision,omitempty"`
+	// UpdateRevision, if not empty, indicates the ControllerRevision version targeted by
+	// the current ModelServing spec.
+	UpdateRevision *string `json:"updateRevision,omitempty"`
+	// CollisionCount tracks hash collisions for ControllerRevision names.
+	CollisionCount *int32 `json:"collisionCount,omitempty"`
+	// Conditions track the condition of the ModelServing.
+	Conditions []v1.ConditionApplyConfiguration `json:"conditions,omitempty"`
+	// LabelSelector is a label query over pods that should match the replica count.
+	LabelSelector *string `json:"labelSelector,omitempty"`
 }
 
 // ModelServingStatusApplyConfiguration constructs a declarative configuration of the ModelServingStatus type for use with
@@ -95,6 +111,14 @@ func (b *ModelServingStatusApplyConfiguration) WithCurrentRevision(value string)
 // If called multiple times, the UpdateRevision field is set to the value of the last call.
 func (b *ModelServingStatusApplyConfiguration) WithUpdateRevision(value string) *ModelServingStatusApplyConfiguration {
 	b.UpdateRevision = &value
+	return b
+}
+
+// WithCollisionCount sets the CollisionCount field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the CollisionCount field is set to the value of the last call.
+func (b *ModelServingStatusApplyConfiguration) WithCollisionCount(value int32) *ModelServingStatusApplyConfiguration {
+	b.CollisionCount = &value
 	return b
 }
 

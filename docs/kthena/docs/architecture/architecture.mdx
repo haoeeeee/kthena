@@ -18,10 +18,10 @@ The Control Plane is Kthena's model-aware brain. You describe intent through CRD
 
 ### Custom Resource Definitions (CRDs)
 
-Kthena extends Kubernetes with a layered CRD model. A single high-level resource cascades into fine-grained primitives — so you can operate at whichever abstraction level fits your workflow.
+For new deployments, create `ModelServing`, `ModelServer`, and `ModelRoute` directly, with autoscaling policies as needed. The deprecated ModelBooster API creates these resources for existing users, as shown below. ModelBooster is deprecated in v1.1, with removal no earlier than v1.5; see the [deprecation details](../user-guide/model-deployment.md#modelbooster-deprecation).
 
 ```
-ModelBooster  (one-stop deployment API)
+ModelBooster  (deprecated deployment API)
  ├── ModelRoute        – routing rules, canary weights, rate limits
  ├── ModelServer       – service exposure, traffic policy, endpoint discovery
  ├── ModelServing      – replica topology: ServingGroups × Roles (Prefill / Decode)
@@ -31,7 +31,7 @@ ModelBooster  (one-stop deployment API)
 
 | CRD | Purpose |
 |---|---|
-| **ModelBooster** | High-level, opinionated API. Captures model specs and cascades create/update/delete of all downstream resources — one resource to deploy, one resource to manage. |
+| **ModelBooster (deprecated)** | Retained for existing deployments. Captures model specs and cascades create/update/delete of downstream resources. |
 | **ModelRoute** | Declares routing intent: match by `modelName`, `loraAdapters`, path, or headers. Supports weighted traffic splits, canary/A-B strategies, and token-based `rateLimit`s. |
 | **ModelServer** | Defines service exposure and traffic policy for inference pods. Discovers backends via `workloadSelector` (including role-aware Prefill/Decode groupings) and applies retries, timeouts, and connection settings. |
 | **ModelServing** | Manages inference workloads as `ServingGroup`s with role-based replicas. Supports entry/worker pod templates, `recoveryPolicy`, topology- and gang-aware scheduling, rolling upgrades, and a dedicated scheduler. |
@@ -109,7 +109,7 @@ Because the planes are decoupled, three deployment shapes are supported:
 
 - **Control plane only** (`--set networking.enabled=false`) — Use Kthena purely as a workload manager. Declare `ModelServing` for role-based, gang-scheduled, topology-aware replicas and let autoscaling policies drive capacity, while traffic keeps flowing through your existing gateway or a plain `Service`.
 - **Data plane only** (`--set workload.enabled=false`) — Use the router as a standalone, model-aware LLM gateway. `ModelServer` discovers backends via a label `workloadSelector`, so the pods behind it can come from a Deployment, a StatefulSet, another operator, or an external provider such as OpenAI. No Kthena workload CRDs required.
-- **Full platform** (default) — Both subcharts installed. This is required for the one-stop `ModelBooster` API, which cascades into both CRD groups, and for end-to-end features that span planes such as PD-aware routing driven by `ModelServing` roles.
+- **Full platform** (default) — Both subcharts installed. Use `ModelServing` together with `ModelServer` and `ModelRoute` for end-to-end features such as PD-aware routing. Existing deployments using the deprecated `ModelBooster` API also require both subcharts.
 
 Each subchart installs only its own CRDs, RBAC, and webhooks, so a component-scoped installation leaves no unused resources behind. See the [installation guide](../getting-started/installation.md#component-scoped-installation) for the exact commands.
 

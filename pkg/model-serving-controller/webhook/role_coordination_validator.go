@@ -18,10 +18,13 @@ package webhook
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
+	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -29,6 +32,74 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
+
+// Legacy mismatches may receive unrelated updates, but cannot start another
+// rollout or change their capacity/partition without restoring a common ratio.
+func validateCoordinatedPartitions(oldMS, ms *workloadv1alpha1.ModelServing) field.ErrorList {
+	if oldMS != nil {
+		oldRoles := roleSpecsByName(oldMS.Spec.Template.Roles)
+		selected := map[string]struct{}{}
+		if coordination := roleCoordination(ms); coordination != nil {
+			selected = selectedRoleNames(coordination, roleSpecsByName(ms.Spec.Template.Roles))
+		}
+		// Reordering immutable sets/maps is not a configuration change.
+		changed := len(validateRoleCoordinationImmutable(oldMS, ms)) > 0
+		for _, role := range ms.Spec.Template.Roles {
+			if _, ok := selected[role.Name]; !ok {
+				continue
+			}
+			old, exists := oldRoles[role.Name]
+			changed = changed || !exists || replicasOrDefault(old.Replicas) != replicasOrDefault(role.Replicas) ||
+				!apiequality.Semantic.DeepEqual(old.Partition, role.Partition) || !utils.EqualRoleTemplateForRevision(old, role)
+		}
+		if !changed {
+			return nil
+		}
+	}
+	if i, err := utils.CoordinatedPartitionConflict(ms); err != nil {
+		return field.ErrorList{field.Invalid(field.NewPath("spec", "template", "roles").Index(i).Child("partition"), ms.Spec.Template.Roles[i].Partition, err.Error())}
+	}
+	return nil
+}
+
+func validateRoleCoordinationImmutable(oldMS, newMS *workloadv1alpha1.ModelServing) field.ErrorList {
+	if oldMS == nil {
+		return nil
+	}
+	// With an empty roles selector, changing template Role names would silently
+	// change the immutable coordination set. Names are identities; reordering
+	// the existing names remains valid.
+	var allErrs field.ErrorList
+	if roleCoordination(oldMS) != nil || roleCoordination(newMS) != nil {
+		names := func(ms *workloadv1alpha1.ModelServing) []string {
+			result := make([]string, 0, len(ms.Spec.Template.Roles))
+			for _, role := range ms.Spec.Template.Roles {
+				result = append(result, role.Name)
+			}
+			slices.Sort(result)
+			return result
+		}
+		allErrs = append(allErrs, apivalidation.ValidateImmutableField(names(newMS), names(oldMS), field.NewPath("spec", "template", "roles"))...)
+	}
+	canonical := func(ms *workloadv1alpha1.ModelServing) *workloadv1alpha1.RoleCoordination {
+		if ms.Spec.RolloutStrategy == nil || ms.Spec.RolloutStrategy.RoleCoordination == nil {
+			return nil
+		}
+		coordination := ms.Spec.RolloutStrategy.RoleCoordination.DeepCopy()
+		// These fields are declared as sets and a map in the API. Reordering
+		// them does not change policy, and validation must not mutate the object.
+		slices.Sort(coordination.Roles)
+		for i := range coordination.Dependencies {
+			slices.Sort(coordination.Dependencies[i].DependsOn)
+		}
+		slices.SortFunc(coordination.Dependencies, func(a, b workloadv1alpha1.RoleRolloutDependency) int {
+			return strings.Compare(a.Role, b.Role)
+		})
+		return coordination
+	}
+	return append(allErrs, apivalidation.ValidateImmutableField(canonical(newMS), canonical(oldMS),
+		field.NewPath("spec", "rolloutStrategy", "roleCoordination"))...)
+}
 
 func validateRoleCoordination(ms *workloadv1alpha1.ModelServing) field.ErrorList {
 	var allErrs field.ErrorList
@@ -330,7 +401,7 @@ func dependencyCapacityRequirements(
 			return false
 		}
 		oldRole, existed := oldRoles[roleName]
-		return !existed || utils.CalRoleTemplateHash(oldRole) != utils.CalRoleTemplateHash(newRole)
+		return !existed || !utils.EqualRoleTemplateForRevision(oldRole, newRole)
 	}
 
 	// Presence means target capacity is required; true additionally means old

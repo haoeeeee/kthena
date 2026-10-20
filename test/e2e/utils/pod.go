@@ -59,7 +59,7 @@ func GetReadyRouterPods(t *testing.T, kubeClient kubernetes.Interface, namespace
 
 	readyPods := make([]corev1.Pod, 0, len(pods.Items))
 	for _, pod := range pods.Items {
-		if IsPodReady(pod) {
+		if pod.DeletionTimestamp == nil && IsPodReady(pod) {
 			readyPods = append(readyPods, pod)
 		}
 	}

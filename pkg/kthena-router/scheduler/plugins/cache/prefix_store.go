@@ -19,8 +19,8 @@ package cache
 import (
 	"sync"
 
-	"istio.io/istio/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
@@ -168,7 +168,7 @@ func (s *ModelPrefixStore) FindTopMatches(model string, hashes []uint64, pods []
 			// Note: we are iterating over a copy of the set, so we don't need to hold the lock.
 			for pod := range podSet {
 				// Skip if pod is not in the candidate set or already matched
-				if !candidatePods.Contains(pod) {
+				if !candidatePods.Has(pod) {
 					continue
 				}
 				if _, alreadyMatched := matches[pod]; alreadyMatched {

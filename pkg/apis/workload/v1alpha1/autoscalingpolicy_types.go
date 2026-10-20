@@ -260,7 +260,7 @@ type AutoscalingPolicyList struct {
 //	metricSources:
 //	  gpu_cache_usage:
 //	    pod:
-//	      name: vllm:gpu_cache_usage_perc
+//	      name: vllm:kv_cache_usage_perc
 //	      uri: /metrics
 //	      port: 8000
 //
@@ -302,7 +302,7 @@ type MetricSource struct {
 type PodMetricSource struct {
 	// Name is the Prometheus metric name matched against labels in the pod's scraped output.
 	// Defaults to the policy metric key when omitted.
-	// For example, set it to "vllm:gpu_cache_usage_perc" to read that exact series.
+	// For example, set it to "vllm:kv_cache_usage_perc" to read that exact series.
 	// +optional
 	Name string `json:"name,omitempty"`
 	// Uri defines the HTTP path where metrics are exposed (e.g., "/metrics").

@@ -2,6 +2,10 @@
 
 The Kthena CLI provides kubectl‑style commands for managing AI inference workloads on Kubernetes, featuring quick deployment via curated templates and optional integration with kubectl‑ai for natural‑language command generation.
 
+:::note ModelBooster templates
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. CLI templates that create ModelBooster resources are retained for existing users. For new deployments, follow the [ModelServing quick start](../getting-started/quick-start.md#modelserving).
+:::
+
 This document is divided into two parts:
 
 1. **[Using the Kthena CLI](#using-the-kthena-cli)** – How to install and use the CLI directly.
@@ -37,7 +41,7 @@ kthena get templates
 # Describe a specific template
 kthena describe template deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 
-# Create a model deployment from a template (dry‑run)
+# Preview a legacy ModelBooster template (deprecated in v1.1)
 kthena create manifest --template Qwen/Qwen3-8B --name my-qwen --dry-run
 
 # List model serving workloads across all namespaces
@@ -78,35 +82,43 @@ By adding Kthena as a custom tool, you enable kubectl‑ai to perform advanced A
     
     ```yaml
     - name: kthena
-      description: "A CLI tool for managing Kthena AI inference workloads in Kubernetes clusters. Use it to create, manage, and monitor AI model deployments."
+      description: "A CLI tool for managing Kthena AI inference workloads. Its ModelBooster deployment templates are deprecated; use ModelServing, ModelServer, and ModelRoute for new deployments."
       command: "kthena"
       command_desc: |
         The kthena command-line interface for AI inference workload management.
     
         For detailed documentation and advanced usage examples, visit https://kthena.volcano.sh/
+
+        ## Deployment Guidance
+        ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5.
+        For new deployments, create and manage these resources directly using kubectl and reviewed YAML manifests.
+        Follow the ModelServing quick start: https://kthena.volcano.sh/docs/next/getting-started/quick-start#modelserving
+        The templates listed below create legacy ModelBooster resources. Use the template creation workflow only
+        when the user explicitly requests a legacy ModelBooster deployment.
       
         Core subcommands and usage patterns:
       
         ## Template Management
-        - `kthena get templates`: List all available model deployment templates
+        - `kthena get templates`: List templates, including deprecation markers for legacy ModelBooster templates
         - `kthena describe template <template-name>`: Show detailed template content and parameters
         - `kthena get template <template-name> -o yaml`: Get template in YAML format
       
-        ## Creating Model Deployments
-        - `kthena create manifest --template <template> --name <name>`: Create and deploy a model from template
+        ## Creating Legacy ModelBooster Deployments (Deprecated)
+        These commands are retained for existing users of ModelBooster templates.
+        - `kthena create manifest --template <template> --name <name>`: Create and deploy a legacy ModelBooster from template
         - `kthena create manifest --template <template> --name <name> --dry-run`: Preview template rendering without applying
         - `kthena create manifest --template <template> --values-file values.yaml`: Create with custom values from file
         - `kthena create manifest --template <template> --name <name> --set key1=value1,key2=value2`: Set template values directly
       
         ## Resource Management
-        - `kthena get model-boosters`: List registered models (requires Kubernetes connection)
+        - `kthena get model-boosters`: Inspect existing deprecated ModelBooster resources (requires Kubernetes connection)
         - `kthena get model-servings`: List model serving workloads (requires Kubernetes connection)
         - `kthena get autoscaling-policies`: List autoscaling policies
-        - `kthena describe model-booster <name>`: Show detailed model information
+        - `kthena describe model-booster <name>`: Inspect an existing deprecated ModelBooster
         - `kthena describe model-serving <name>`: Show detailed serving workload information
       
-        ## Common Templates
-        Available templates include:
+        ## Common Legacy Templates (Deprecated)
+        These templates create ModelBooster resources and are retained for existing users:
         - deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
         - deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
         - Qwen/Qwen3-8B
@@ -120,11 +132,11 @@ By adding Kthena as a custom tool, you enable kubectl‑ai to perform advanced A
         - `--set`: Set template values (key=value pairs)
         - `--values-file`: YAML file with template values
       
-        Example workflow:
-        1. `kthena get templates` - Browse available models
+        Legacy ModelBooster workflow (only when explicitly requested):
+        1. `kthena get templates` - Browse templates and their deprecation markers
         2. `kthena describe template deepseek-ai/DeepSeek-R1-Distill-Qwen-32B` - View template details
         3. `kthena create manifest --template deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --name my-deepseek --dry-run` - Preview
-        4. `kthena create manifest --template deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --name my-deepseek` - Deploy
+        4. `kthena create manifest --template deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --name my-deepseek` - Deploy a legacy ModelBooster
     ```
     </details>
 
@@ -139,13 +151,17 @@ By adding Kthena as a custom tool, you enable kubectl‑ai to perform advanced A
 The `tools.yaml` file defines how kubectl‑ai invokes the `kthena` command. It includes:
 
 - **Command description**: A detailed overview of Kthena’s capabilities and subcommands.
-- **Common usage patterns**: Examples for template management, creating deployments, and inspecting resources.
-- **Available templates**: A list of curated model templates (DeepSeek‑R1, Qwen, etc.).
+- **Deployment guidance**: Recommend ModelServing, ModelServer, and ModelRoute for new deployments.
+- **Common usage patterns**: Examples for inspecting resources and managing legacy ModelBooster templates.
+- **Available templates**: A list of deprecated ModelBooster templates (DeepSeek‑R1, Qwen, etc.).
 - **Key parameters**: Flags like `--template`, `--name`, `--dry‑run`, and `--values‑file`.
 
 When kubectl‑ai processes a prompt, it matches the intent to one of the described subcommands and generates the appropriate `kthena` invocation.
 
 ### Example Workflows
+
+Template creation and preview examples below are legacy workflows for users explicitly working with ModelBooster.
+For new deployments, use the [ModelServing quick start](../getting-started/quick-start.md#modelserving).
 
 #### 1. Browse Available Model Templates
 ```
@@ -154,14 +170,20 @@ kubectl-ai "Show me all model templates that kthena can deploy"
 *Expected output:* `kthena get templates`
 
 #### 2. Deploy a DeepSeek Model
+
+Legacy ModelBooster workflow (deprecated):
+
 ```
-kubectl-ai "Create a model deployment named my‑deepseek using the DeepSeek‑R1‑Distill‑Qwen‑32B template in the default namespace"
+kubectl-ai "Explicitly use the legacy ModelBooster workflow to create my‑deepseek with the DeepSeek‑R1‑Distill‑Qwen‑32B template in the default namespace"
 ```
 *Expected output:* `kthena create manifest --template deepseek‑ai/DeepSeek‑R1‑Distill‑Qwen‑32B --name my‑deepseek`
 
 #### 3. Preview a Deployment (Dry‑Run)
+
+Legacy ModelBooster template preview (deprecated):
+
 ```
-kubectl-ai "Preview the YAML for a Qwen3‑8B deployment without applying it"
+kubectl-ai "Preview the legacy Qwen3‑8B ModelBooster template without applying it"
 ```
 *Expected output:* `kthena create manifest --template Qwen/Qwen3‑8B --name my‑qwen --dry‑run`
 

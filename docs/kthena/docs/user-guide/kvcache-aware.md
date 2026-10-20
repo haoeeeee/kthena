@@ -1,6 +1,6 @@
 # KV Cache Aware Plugin
 
-The `kvcache-aware` plugin is a score plugin for the Kthena Router scheduler that routes inference requests to pods most likely to have matching KV cache entries. It uses **token-block based matching** with **Redis-based distributed coordination** to maximize cache hits and reduce redundant prefill computation.
+The `kvcache-aware` plugin is a score plugin for the Kthena Router scheduler that routes inference requests to pods most likely to have matching KV cache entries. It uses **token-block based matching** with a choice of two coordination backends: **Redis-based distributed coordination** (default) or a **direct in-memory mode** where runtime sidecars stream KV events straight into the router's memory, removing the per-request Redis round-trip.
 
 ## Overview
 
@@ -9,19 +9,55 @@ When multiple vLLM pods serve the same model, each pod maintains its own KV cach
 The `kvcache-aware` plugin solves this by:
 1. Tokenizing the incoming prompt using the model's tokenizer.
 2. Dividing the token sequence into fixed-size blocks and hashing each block.
-3. Querying Redis to find which pods have cached each token block.
+3. Looking up which pods have cached each token block — either in Redis, or in the router's local in-memory index.
 4. Scoring pods based on consecutive block matches from the beginning of the prompt.
 
 Pods with more consecutive matching blocks score higher and are preferred for routing.
 
+## Coordination backends
+
+| Backend           | How block ownership reaches the router                                                 | Per-request lookup                      | Extra infrastructure |
+| ----------------- | -------------------------------------------------------------------------------------- | --------------------------------------- | -------------------- |
+| `redis` (default) | Runtime sidecars write standardized block hashes into Redis                            | Batched Redis pipeline query            | Redis instance       |
+| `memory`          | Every router instance streams KV events from each runtime sidecar over HTTP            | Local in-memory map lookup (no network) | None                 |
+
+### How memory mode works
+
+Because the router may run with multiple replicas, each router instance **pulls KV events itself** from every runtime sidecar:
+
+1. Each router replica keeps one long-lived connection to the runtime sidecar of every model-serving pod it knows (pods selected by a `ModelServer` that are Running and Ready), by calling `POST /kvcache/routers/register` on the pod IP. The response is never finished: it is the sidecar's stream of KV events (newline-delimited JSON).
+2. The stream starts with the sidecar's full KV block index, so a freshly started or restarted router immediately has complete state.
+3. From then on, every KV cache event (`stored` / `removed` / `cleared`) is converted to standardized block hashes and sent on the stream of **every registered router instance**. An idle stream carries a heartbeat every 10s; the router reopens a stream that stays silent for 30s.
+4. At request time the plugin answers block-ownership lookups from its local in-memory index — no Redis query, no network latency on the scoring path.
+
+The router attributes the events of a stream to the pod it connected to, so the router does not expose any endpoint for KV events. The blocks of a pod are only kept while its stream is open: when the stream ends (the pod is deleted or stops being Ready, its sidecar restarts, the connection breaks), the router drops them, and the next stream sends them again. In particular, a pod that is Ready again after a readiness probe failure gets its warm cache back as soon as the router reconnects.
+
+Stale entries are garbage-collected in the router after 24 hours, and ownership written before the owning pod's containers last restarted is ignored, same as in Redis mode.
+
+**Trade-offs of memory mode:**
+
+- Scoring lookups are local memory reads, removing the Redis round-trip latency from the request path.
+- No Redis deployment is required for KV cache coordination.
+- Each router replica keeps its own copy of the index (memory usage scales with cached blocks × replicas).
+- If a runtime sidecar restarts, its in-memory engine-hash mapping is lost; its streams end and the router drops the blocks of the pod, which are rebuilt from the new KV events of the engine.
+
+**Trust model of memory mode:**
+
+- The router only receives KV events on connections it opens itself, to the pod IP of a pod selected by a `ModelServer`; nothing in a stream can claim another pod's identity. Pods sharing an IP (e.g. `hostNetwork` pods on the same node) cannot be told apart, so the router does not stream from them.
+- A runtime sidecar only sends KV events back on the connection of the caller of `POST /kvcache/routers/register`, so a caller cannot direct them anywhere else. A registration with the `router_id` of an open stream replaces that stream, and a sidecar serves at most 128 streams at once; a replaced or ended stream still counts until its response has exited, and a response that is not read is aborted within a second.
+- Store times are capped at the time the router receives them, and each pod can hold at most `maxBlocksPerPod` blocks in the index.
+- The register endpoint does not authenticate its callers, so any workload that can reach the runtime port can read the block hashes of the pod. Restrict access to it with a NetworkPolicy if untrusted workloads share the cluster.
+
 ## Prerequisites
 
-- **Redis**: A Redis instance accessible by both the router and the runtime sidecars. Deploy Redis using the provided [redis-standalone.yaml](../assets/examples/redis/redis-standalone.yaml) example.
-- **Kthena Runtime sidecar**: Must be deployed alongside each vLLM pod. The sidecar listens to vLLM's ZMQ `kv-events` stream and writes token block hashes into Redis.
+- **Redis** (Redis backend only): A Redis instance accessible by both the router and the runtime sidecars. Deploy Redis using the provided [redis-standalone.yaml](../assets/examples/redis/redis-standalone.yaml) example. Memory mode does not need Redis.
+- **Kthena Runtime sidecar**: Must be deployed alongside each vLLM pod. The sidecar listens to vLLM's ZMQ `kv-events` stream and either writes token block hashes into Redis or streams them to registered routers.
 - **vLLM v1 with KV event support**: The vLLM engine must be running with `VLLM_USE_V1=1` and expose the ZMQ kv-events topic.
 - **Multi-pod inference deployment**: The plugin is meaningful only when multiple pods serve the same model.
 
 ## Architecture
+
+**Redis backend (default):**
 
 ```
                         ┌────────────────┐
@@ -61,9 +97,68 @@ Pods with more consecutive matching blocks score higher and are preferred for ro
 - The **Runtime sidecar** subscribes to vLLM ZMQ kv-events (`VLLM_BLOCK_STORED`, `VLLM_BLOCK_REMOVED`, `VLLM_ALL_BLOCKS_CLEARED`) and writes standardized token block hashes into Redis.
 - The **Router's `kvcache-aware` plugin** queries Redis at request time to find pods with matching blocks and scores them.
 
+**Memory backend:**
+
+```
+                     ┌────────────────┐
+                     │ Client Request │
+                     └───────┬────────┘
+                             │
+                             ▼
+     ┌───────────────────────┐   ┌───────────────────────┐
+     │   Kthena Router #1    │   │   Kthena Router #2    │
+     │  ┌─────────────────┐  │   │  ┌─────────────────┐  │
+     │  │ in-memory index │  │   │  │ in-memory index │  │
+     │  └─────────────────┘  │   │  └─────────────────┘  │
+     └─────┬───────────▲─────┘   └─────┬───────────▲─────┘
+           │           │               │           │
+  register │           │ KV event      │ register  │ KV event
+           │           │ stream        │           │ stream
+           ▼           │               ▼           │
+     ┌─────────────────┴───────────────────────────┴─────┐
+     │                    vLLM Pods                      │
+     │  ┌─────────────────┐                              │
+     │  │ Runtime sidecar │ ◀── ZMQ kv-events            │
+     │  └─────────────────┘                              │
+     │  ┌─────────────────┐                              │
+     │  │   vLLM Engine   │                              │
+     │  └─────────────────┘                              │
+     └───────────────────────────────────────────────────┘
+```
+                        ┌────────────────┐
+                        │ Client Request │
+                        └───────┐────────┘
+                                │
+                                ▼
+        ┌─────────────────────┐  ┌─────────────────────┐
+        │  Kthena Router #1     │  │  Kthena Router #2     │
+        │  ┌───────────────┐  │  │  ┌───────────────┐  │
+        │  │ in-memory index │  │  │  │ in-memory index │  │
+        │  └───────────────┘  │  │  └───────────────┘  │
+        └───▲────────┐───────┘  └───▲────────┐───────┘
+            │        │              │        │
+   push KV  │        │ register     │        │ register
+   events   │        │ (heartbeat)  │        │ (heartbeat)
+            │        ▼              │        ▼
+           ┌┘────────────────────┴─────────────┐
+           │          vLLM Pods                   │
+           │  ┌───────────────┐                   │
+           │  │Runtime sidecar│ ◀── ZMQ kv-events │
+           │  └───────────────┘                   │
+           │  ┌───────────────┐                   │
+           │  │  vLLM Engine  │                   │
+           │  └───────────────┘                   │
+           └─────────────────────────────────────┘
+```
+
+- Each **router replica** registers with every runtime sidecar; the response of the registration is the sidecar's KV event stream.
+- The **Runtime sidecar** (started with `KV_EVENT_SYNC_MODE=memory`) streams standardized block hashes to every registered router; each stream starts with the full block index.
+
 ## Setup
 
-### Step 1: Deploy Redis
+### Step 1: Deploy Redis (Redis backend only)
+
+> Skip this step when using the in-memory backend (`indexMode: memory`).
 
 Deploy Redis in the `kthena-system` namespace (where the Kthena Router runs):
 
@@ -75,7 +170,13 @@ This creates a `redis-config` ConfigMap, `redis-secret` Secret, and a `redis-ser
 
 ### Step 2: Deploy vLLM pods with the Kthena Runtime sidecar
 
-**Option A: Using ModelBooster (recommended)**
+For new deployments, use the ModelServing example in Option B below and configure `ModelServer` and `ModelRoute` for routing.
+
+**Option A: Using ModelBooster (deprecated)**
+
+:::warning Deprecated example
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. This example is retained for existing users; see the [deprecation details](./model-deployment.md#modelbooster-deprecation).
+:::
 
 When using ModelBooster, the runtime sidecar is automatically injected with the correct Redis environment variables. No extra configuration is needed:
 
@@ -110,7 +211,7 @@ spec:
             nvidia.com/gpu: "1"
 ```
 
-**Option B: Using ModelServing**
+**Option B: Using ModelServing (recommended)**
 
 A complete ModelServing example with KV cache awareness is provided at [gpu-kvcache-aware.yaml](../assets/examples/model-serving/gpu-kvcache-aware.yaml). This example deploys a vLLM server with the Kthena Runtime sidecar pre-configured for Redis-based KV cache coordination.
 
@@ -293,18 +394,81 @@ data:
               weight: 1
 ```
 
+:::note
+Always enable `kvcache-aware` together with at least one other score plugin (e.g. `least-request`). The plugin returns no scores when there are no cached blocks yet (cold start) or when tokenization fails. Pods it does not score stay candidates with a score of 0, so if it were the only score plugin, those requests would go to an arbitrary pod instead of the least loaded one.
+:::
+
 **Plugin arguments:**
 
-| Parameter             | Default | Description                                                                      |
-| --------------------- | ------- | -------------------------------------------------------------------------------- |
-| `blockSizeToHash`     | 16      | Number of tokens per block. Must match the vLLM block size for optimal matching. |
-| `maxBlocksToMatch`    | 128     | Maximum number of blocks to process per request. Limits Redis queries.           |
-| `vllmTokenizerPort`   | 8000    | Port used to fetch the tokenizer from vLLM pods.                                 |
-| `sglangTokenizerPort` | 30000   | Port used to fetch the tokenizer from SGLang pods.                               |
+| Parameter                     | Default  | Description                                                                                                                            |
+| ----------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `blockSizeToHash`             | 16       | Number of tokens per block. Must match the vLLM block size for optimal matching.                                                       |
+| `maxBlocksToMatch`            | 128      | Maximum number of blocks to process per request. Limits lookups.                                                                       |
+| `vllmTokenizerPort`           | 8000     | Port used to fetch the tokenizer from vLLM pods.                                                                                       |
+| `sglangTokenizerPort`         | 30000    | Port used to fetch the tokenizer from SGLang pods.                                                                                     |
+| `tokenizerService`            | disabled | Use the dedicated [Tokenizer Service](./tokenizer-service.md) instead of engine pods for prompt tokenization, with automatic fallback. |
+| `indexMode`                   | `redis`  | Coordination backend: `redis` or `memory`.                                                                                             |
+| `runtimePort`                 | 9000     | Memory mode only: runtime sidecar port the router streams KV events from (match the sidecar `--port`).                                 |
+| `maxBlocksPerPod`             | 1048576  | Memory mode only: maximum number of blocks one pod can hold in the router's index across all models; the oldest are evicted first.     |
+
+> **Tip:** By default the plugin tokenizes prompts by calling the `/tokenize` endpoint of a backend engine pod, which adds load and latency to GPU pods. Consider enabling the [Tokenizer Service](./tokenizer-service.md) to offload tokenization to a dedicated, GPU-free component.
 
 **Helm values:**
 
 The `kvcache-aware` plugin is **not** enabled in the Helm chart by default. To enable it, override the router ConfigMap in your `values.yaml` to include `kvcache-aware` in both `pluginConfig` and `Score.enabled` sections as shown above.
+
+### Using the in-memory backend (optional)
+
+To remove the per-request Redis round-trip, switch both sides to memory mode:
+
+**1. Runtime sidecar**: set `KV_EVENT_SYNC_MODE=memory` in the runtime sidecar container's environment (instead of the `REDIS_HOST`/`REDIS_PORT` variables):
+
+```yaml
+- name: runtime
+  image: ghcr.io/volcano-sh/runtime:latest
+  args: [ ... ]
+  env:
+    - name: KV_EVENT_SYNC_MODE
+      value: "memory"
+    # POD_NAME / NAMESPACE etc. unchanged
+```
+
+**2. Router ConfigMap**: set `indexMode: memory` on the plugin:
+
+```yaml
+scheduler:
+  pluginConfig:
+  - name: kvcache-aware
+    args:
+      indexMode: memory
+      blockSizeToHash: 16
+      maxBlocksToMatch: 128
+      runtimePort: 8900   # must match the runtime sidecar --port
+  plugins:
+    Score:
+      enabled:
+        - name: least-request
+          weight: 1
+        - name: kvcache-aware
+          weight: 1
+```
+
+**3. Network**: router pods must be able to reach model pods on `runtimePort` by pod IP. The router identifies itself to sidecars by `POD_NAMESPACE`/`POD_NAME` (injected by the Helm chart), falling back to its hostname.
+
+With multiple router replicas, every replica registers itself independently and each receives its own KV event stream, so scheduling decisions stay consistent across instances.
+
+To verify memory mode is active:
+
+```bash
+# Router side
+kubectl logs deployment/kthena-router -n <namespace> | grep -i "memory mode active"
+# Sidecar side
+kubectl logs <vllm-pod> -c runtime -n <namespace> | grep -iE "memory|router registered"
+```
+
+Expected messages:
+- Router: `KVCacheAware: memory mode active, runtimePort=..., ...`
+- Sidecar: `KV event sync mode: memory (stream to registered routers)` and `Router registered: id=<router-namespace>/<router-pod>`
 
 ### Step 4: Restart the Router
 
@@ -375,23 +539,41 @@ Send the same prompt to the router multiple times. On the first request, the `kv
 
 ## How It Differs from Other Plugins
 
-| Feature                | `prefix-cache`            | `kvcache-aware`                   |
-| ---------------------- | ------------------------- | --------------------------------- |
-| Matching unit          | Byte-based prefix         | Token-block based                 |
-| Cache data source      | Router in-memory tracking | Redis (distributed)               |
-| Cross-pod coordination | No (local to router)      | Yes (via Redis)                   |
-| Cache truth source     | Router heuristic          | Actual engine KV events from vLLM |
-| Dependencies           | None                      | Redis + Runtime sidecar           |
+| Feature                | `prefix-cache`            | `kvcache-aware` (redis)           | `kvcache-aware` (memory)            |
+| ---------------------- | ------------------------- | --------------------------------- | ----------------------------------- |
+| Matching unit          | Byte-based prefix         | Token-block based                 | Token-block based                   |
+| Cache data source      | Router in-memory tracking | Redis (distributed)               | Router in-memory index (streamed)   |
+| Cross-pod coordination | No (local to router)      | Yes (via Redis)                   | Yes (each router streams from pods) |
+| Cache truth source     | Router heuristic          | Actual engine KV events from vLLM | Actual engine KV events from vLLM   |
+| Dependencies           | None                      | Redis + Runtime sidecar           | Runtime sidecar (no Redis)          |
 
 - Use **`prefix-cache`** when you want lightweight, dependency-free prefix matching for simple workloads.
 - Use **`kvcache-aware`** when you need accurate, distributed KV cache coordination backed by real engine cache events — particularly effective with long shared system prompts.
 
 ## Troubleshooting
 
+Common to both backends:
+
 | Symptom                                                  | Possible Cause                          | Resolution                                                                                        |
 | -------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| Plugin scores are always 0                               | Redis not reachable from router         | Verify Redis connectivity and env vars (`REDIS_HOST`, `REDIS_PORT`)                               |
-| No Redis keys (`matrix:kv:block:*`)                      | Runtime sidecar not receiving KV events | Check that `VLLM_USE_V1=1` is set, runtime `--engine vllm` / `--pod` / `--model` args are correct |
-| Runtime log: `Failed to initialize Redis client`         | Redis not deployed or unreachable       | Deploy Redis and verify the `redis-config` ConfigMap exists in the same namespace                 |
+| No KV events in the runtime sidecar                      | Runtime sidecar not receiving KV events | Check that `VLLM_USE_V1=1` is set, runtime `--engine vllm` / `--pod` / `--model` args are correct |
 | Runtime log: `Pod identifier or model name not provided` | Missing `--pod` or `--model` args       | Ensure the runtime sidecar has `--pod $(POD_NAME).$(NAMESPACE)` and `--model <name>`              |
-| Router log: `redis client not initialized`               | Router cannot connect to Redis          | Check that Redis env vars are available to the router pod                                         |
+
+Redis backend (`indexMode: redis`):
+
+| Symptom                                          | Possible Cause                    | Resolution                                                                        |
+| ------------------------------------------------ | --------------------------------- | --------------------------------------------------------------------------------- |
+| Plugin scores are always 0                       | Redis not reachable from router   | Verify Redis connectivity and env vars (`REDIS_HOST`, `REDIS_PORT`)               |
+| No Redis keys (`matrix:kv:block:*`)              | Sidecar cannot write to Redis     | Verify sidecar Redis env vars and network access to the Redis service             |
+| Runtime log: `Failed to initialize Redis client` | Redis not deployed or unreachable | Deploy Redis and verify the `redis-config` ConfigMap exists in the same namespace |
+| Router log: `redis client not initialized`       | Router cannot connect to Redis    | Check that Redis env vars are available to the router pod                         |
+
+Memory backend (`indexMode: memory`):
+
+| Symptom                                                                    | Possible Cause                                                                                                                      | Resolution                                                                                                                         |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Plugin scores are always 0                                                 | The router cannot reach the runtime sidecars                                                                                        | Verify `runtimePort` matches the sidecar `--port` and model pods are reachable on it by pod IP; check router logs at `-v=4`        |
+| Runtime log: `Runtime is not in memory KV event sync mode`                 | Sidecar not started in memory mode                                                                                                  | Set `KV_EVENT_SYNC_MODE=memory` on the runtime sidecar                                                                             |
+| Runtime log: `KV event queue of router ... is full; ending its stream`     | The router does not read its stream fast enough                                                                                     | The router reconnects and receives the full block index again; check router CPU load                                              |
+| Router log: `reached the limit of ... indexed blocks` (`-v=2`)             | The pod holds more blocks than `maxBlocksPerPod`, so its oldest blocks are evicted                                                  | Raise `maxBlocksPerPod` if the engine KV cache legitimately holds more blocks                                                      |
+| Scores stale after pod deletion                                            | Missed removal events                                                                                                               | Blocks of deleted or not Ready pods are dropped as soon as the router notices; other stale entries are garbage-collected after 24 hours |

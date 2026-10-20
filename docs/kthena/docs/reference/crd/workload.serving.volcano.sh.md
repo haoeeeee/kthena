@@ -224,6 +224,24 @@ _Appears in:_
 | `ratioConstraint` _[RoleRatioConstraint](#roleratioconstraint)_ | RatioConstraint defines the acceptable ratio range of a single role pair.<br />It enforces that replicas[numeratorRole] / replicas[denominatorRole] stays<br />within [minRatio, maxRatio] when denominator replica is non-zero. |  |  |
 
 
+#### EvictionStrategySpec
+
+
+
+EvictionStrategySpec defines the protection policy during node eviction.
+
+
+
+_Appears in:_
+- [RolloutStrategy](#rolloutstrategy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `protectionLevel` _[ProtectionLevelType](#protectionleveltype)_ | ProtectionLevel defines the protection level: ServingGroup or Role.<br />- ServingGroup: guarantees that the number of ready ServingGroups is not below the threshold.<br />- Role: guarantees that the number of ready instances for each role is not below the threshold. | ServingGroup | Enum: [ServingGroup Role] <br /> |
+| `minAvailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MinAvailable defines the minimum number of available ServingGroup instances.<br />It is used only when protectionLevel is ServingGroup.<br />It can be an absolute number (ex: 3) or a percentage of total instances (ex: 80%). |  |  |
+| `roleMinAvailable` _object (keys:string, values:[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util))_ | RoleMinAvailable defines role-specific minimum available role instances.<br />It is used only when protectionLevel is Role. Map keys must match names in spec.template.roles.<br />If a role is absent from this map, it is not protected by the eviction budget.<br />Values can be absolute numbers (ex: 3) or percentages of total role instances (ex: 80%). |  |  |
+
+
 #### GangPolicy
 
 
@@ -375,7 +393,7 @@ Example (scrape the metric directly from each pod's /metrics endpoint):
 	metricSources:
 	  gpu_cache_usage:
 	    pod:
-	      name: vllm:gpu_cache_usage_perc
+	      name: vllm:kv_cache_usage_perc
 	      uri: /metrics
 	      port: 8000
 
@@ -405,6 +423,10 @@ _Appears in:_
 
 ModelBackend defines the configuration for a model backend.
 
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
+
 
 
 _Appears in:_
@@ -430,6 +452,10 @@ _Underlying type:_ _string_
 
 ModelBackendType defines the type of model backend.
 
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
+
 _Validation:_
 - Enum: [vLLM vLLMDisaggregated]
 
@@ -451,6 +477,10 @@ _Appears in:_
 
 ModelBooster is the Schema for the models API.
 
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
+
 
 
 _Appears in:_
@@ -470,6 +500,10 @@ _Appears in:_
 
 ModelBoosterList contains a list of ModelBooster.
 
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
+
 
 
 
@@ -486,6 +520,10 @@ ModelBoosterList contains a list of ModelBooster.
 
 
 ModelBoosterSpec defines the desired state of ModelBooster.
+
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
 
 
 
@@ -557,6 +595,7 @@ _Appears in:_
 | `template` _[ServingGroup](#servinggroup)_ | Template defines the template for ServingGroup |  |  |
 | `rolloutStrategy` _[RolloutStrategy](#rolloutstrategy)_ | RolloutStrategy defines the strategy that will be applied to update replicas |  |  |
 | `recoveryPolicy` _[RecoveryPolicy](#recoverypolicy)_ | RecoveryPolicy defines the recovery policy for the failed Pod to be rebuilt | RoleRecreate | Enum: [ServingGroupRecreate RoleRecreate None] <br /> |
+| `revisionHistoryLimit` _integer_ | RevisionHistoryLimit is the maximum number of non-live revisions to retain.<br />Revisions still referenced by the ModelServing or its workloads do not count<br />toward this limit. | 10 | Minimum: 0 <br /> |
 
 
 #### ModelServingStatus
@@ -579,6 +618,7 @@ _Appears in:_
 | `availableReplicas` _integer_ | AvailableReplicas track the number of ServingGroup that are in ready state (updated or not). |  |  |
 | `currentRevision` _string_ | CurrentRevision, if not empty, indicates the ControllerRevision version preserved by<br />ServingGroups that have not been updated. |  |  |
 | `updateRevision` _string_ | UpdateRevision, if not empty, indicates the ControllerRevision version targeted by<br />the current ModelServing spec. |  |  |
+| `collisionCount` _integer_ | CollisionCount tracks hash collisions for ControllerRevision names. |  |  |
 | `labelSelector` _string_ | LabelSelector is a label query over pods that should match the replica count. |  |  |
 
 
@@ -587,6 +627,10 @@ _Appears in:_
 
 
 ModelStatus defines the observed state of ModelBooster.
+
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
 
 
 
@@ -605,6 +649,10 @@ _Appears in:_
 
 
 ModelWorker defines the model worker configuration.
+
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
 
 
 
@@ -628,6 +676,10 @@ _Appears in:_
 _Underlying type:_ _string_
 
 ModelWorkerType defines the type of model worker.
+
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
 
 _Validation:_
 - Enum: [server prefill decode controller coordinator]
@@ -762,7 +814,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `name` _string_ | Name is the Prometheus metric name matched against labels in the pod's scraped output.<br />Defaults to the policy metric key when omitted.<br />For example, set it to "vllm:gpu_cache_usage_perc" to read that exact series. |  |  |
+| `name` _string_ | Name is the Prometheus metric name matched against labels in the pod's scraped output.<br />Defaults to the policy metric key when omitted.<br />For example, set it to "vllm:kv_cache_usage_perc" to read that exact series. |  |  |
 | `uri` _string_ | Uri defines the HTTP path where metrics are exposed (e.g., "/metrics"). | /metrics | Pattern: `^/` <br /> |
 | `port` _integer_ | Port defines the network port where metrics are exposed by the pods (e.g., 8000). | 8100 | Maximum: 65535 <br />Minimum: 1 <br /> |
 
@@ -828,6 +880,23 @@ _Appears in:_
 | `auth` _[PrometheusAuth](#prometheusauth)_ | Auth holds optional authentication configuration for the Prometheus server. |  |  |
 
 
+#### ProtectionLevelType
+
+_Underlying type:_ _string_
+
+ProtectionLevelType defines the level of protection during eviction.
+
+
+
+_Appears in:_
+- [EvictionStrategySpec](#evictionstrategyspec)
+
+| Field | Description |
+| --- | --- |
+| `ServingGroup` | ProtectionLevelServingGroup guarantees that the number of ready ServingGroups is not below the threshold.<br /> |
+| `Role` | ProtectionLevelRole guarantees that the number of ready instances for each role is not below the threshold.<br /> |
+
+
 #### RecoveryPolicy
 
 _Underlying type:_ _string_
@@ -864,7 +933,8 @@ _Appears in:_
 | `entryTemplate` _[PodTemplateSpec](#podtemplatespec)_ | EntryTemplate defines the template for the entry pod of a role.<br />Required: Currently, a role must have only one entry-pod. |  |  |
 | `workerReplicas` _integer_ | WorkerReplicas defines the number for the worker pod of a role.<br />Required: Need to set the number of worker-pod replicas. |  |  |
 | `workerTemplate` _[PodTemplateSpec](#podtemplatespec)_ | WorkerTemplate defines the template for the worker pod of a role. |  |  |
-| `maxUnavailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxUnavailable is the maximum number of resources that may be<br />unavailable during an update. It can be an absolute number (for example,<br />5) or a percentage (for example, 10%). A percentage is calculated from<br />ModelServing replicas for ServingGroupRollingUpdate and from the<br />corresponding Role's replicas for RoleRollingUpdate, then rounded down.<br />The value must not resolve to 0. Defaults to 1. | 1 | XIntOrString: \{\} <br /> |
+| `maxUnavailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxUnavailable is the maximum number of resources that may be<br />unavailable during an update. It can be an absolute number (for example,<br />5) or a percentage (for example, 10%). A percentage is calculated from<br />ModelServing replicas for ServingGroupRollingUpdate and from the<br />corresponding Role's replicas for RoleRollingUpdate, then rounded down.<br />It may resolve to 0 only when MaxSurge resolves above 0. Defaults to 1. | 1 | XIntOrString: \{\} <br /> |
+| `maxSurge` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxSurge is the maximum number of resources that may be created above<br />the desired replica count during an update. It can be an absolute number<br />(for example, 1) or a percentage (for example, 25%). A percentage is<br />calculated from ModelServing replicas for ServingGroupRollingUpdate and<br />from the corresponding Role's replicas for RoleRollingUpdate, then rounded<br />up. It defaults to 0. |  | XIntOrString: \{\} <br /> |
 | `partition` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | Partition protects the first N existing replicas in ascending ordinal order<br />from updates. The remaining replicas are eligible for rolling update.<br />For a contiguous ordinal set, this is equivalent to protecting [0, Partition).<br />Value can be an absolute number (ex: 5) or a percentage of total replicas (ex: 10%).<br />Absolute number is calculated from percentage by rounding up.<br />The default value is 0. |  | XIntOrString: \{\} <br /> |
 
 
@@ -873,7 +943,7 @@ _Appears in:_
 
 
 RoleCoordination enables proportional rolling updates across selected Roles
-in each ServingGroup.
+in each ServingGroup. Its presence and policy are immutable after creation.
 
 
 
@@ -883,8 +953,8 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `roles` _string array_ | Roles selects the Roles participating in coordinated rolling update. An<br />empty list selects every Role in spec.template.roles. |  |  |
-| `maxSkew` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxSkew is the maximum percentage-point difference allowed between the<br />normalized rolling progress of participating Roles. Only percentage values,<br />for example "10%", are accepted. |  | XIntOrString: \{\} <br /> |
-| `dependencies` _[RoleRolloutDependency](#rolerolloutdependency) array_ | Dependencies defines rollout startup dependencies. If Role A depends on B,<br />compatible target-version dependencies must be Ready before A first starts. |  |  |
+| `maxSkew` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxSkew is the maximum percentage-point difference allowed between the<br />target-version Ready ratios of participating Roles, using their entire formal<br />replica count, including partition-protected capacity. Only percentage values,<br />for example "10%", are accepted. |  | XIntOrString: \{\} <br /> |
+| `dependencies` _[RoleRolloutDependency](#rolerolloutdependency) array_ | Dependencies defines rollout startup dependencies. A graph root waits for<br />target-version Ready capacity throughout its dependency closure before its<br />first target start. Internal Roles may start together; old dependency<br />capacity is retained while old callers remain. |  |  |
 
 
 #### RoleRatioConstraint
@@ -975,7 +1045,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `maxUnavailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxUnavailable is the maximum number of resources that may be<br />unavailable during an update. It can be an absolute number (for example,<br />5) or a percentage (for example, 10%). A percentage is calculated from<br />ModelServing replicas for ServingGroupRollingUpdate and from the<br />corresponding Role's replicas for RoleRollingUpdate, then rounded down.<br />The value must not resolve to 0. Defaults to 1. | 1 | XIntOrString: \{\} <br /> |
+| `maxUnavailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxUnavailable is the maximum number of resources that may be<br />unavailable during an update. It can be an absolute number (for example,<br />5) or a percentage (for example, 10%). A percentage is calculated from<br />ModelServing replicas for ServingGroupRollingUpdate and from the<br />corresponding Role's replicas for RoleRollingUpdate, then rounded down.<br />It may resolve to 0 only when MaxSurge resolves above 0. Defaults to 1. | 1 | XIntOrString: \{\} <br /> |
+| `maxSurge` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxSurge is the maximum number of resources that may be created above<br />the desired replica count during an update. It can be an absolute number<br />(for example, 1) or a percentage (for example, 25%). A percentage is<br />calculated from ModelServing replicas for ServingGroupRollingUpdate and<br />from the corresponding Role's replicas for RoleRollingUpdate, then rounded<br />up. It defaults to 0. |  | XIntOrString: \{\} <br /> |
 | `partition` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | Partition protects the first N existing replicas in ascending ordinal order<br />from updates. The remaining replicas are eligible for rolling update.<br />For a contiguous ordinal set, this is equivalent to protecting [0, Partition).<br />Value can be an absolute number (ex: 5) or a percentage of total replicas (ex: 10%).<br />Absolute number is calculated from percentage by rounding up.<br />The default value is 0. |  | XIntOrString: \{\} <br /> |
 
 
@@ -994,8 +1065,9 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `type` _[RolloutStrategyType](#rolloutstrategytype)_ | Type selects the granularity of rolling updates. Supported values are<br />ServingGroupRollingUpdate and RoleRollingUpdate. It defaults to<br />ServingGroupRollingUpdate.<br />ServingGroupRollingUpdate uses rolloutStrategy.rollingUpdateConfiguration;<br />rolling update settings on individual Roles do not take effect.<br />RoleRollingUpdate uses the rolling update configuration on each Role;<br />rolloutStrategy.rollingUpdateConfiguration must not be set.<br />Kthena performs RoleRollingUpdate across all ServingGroups at the same time.<br />Therefore, we recommend using it only in scenarios with a single ServingGroup. | ServingGroupRollingUpdate | Enum: [ServingGroupRollingUpdate RoleRollingUpdate] <br /> |
-| `rollingUpdateConfiguration` _[RollingUpdateConfiguration](#rollingupdateconfiguration)_ | RollingUpdateConfiguration configures ServingGroupRollingUpdate.<br />It must not be set when type is RoleRollingUpdate; configure maxUnavailable<br />and partition on each Role instead. |  |  |
+| `rollingUpdateConfiguration` _[RollingUpdateConfiguration](#rollingupdateconfiguration)_ | RollingUpdateConfiguration configures ServingGroupRollingUpdate.<br />It must not be set when type is RoleRollingUpdate; configure maxUnavailable<br />maxSurge, and partition on each Role instead. |  |  |
 | `roleCoordination` _[RoleCoordination](#rolecoordination)_ | RoleCoordination defines the cross-Role coordination parameters to be used<br />when type is RoleRollingUpdate. |  |  |
+| `evictionStrategy` _[EvictionStrategySpec](#evictionstrategyspec)_ | EvictionStrategy defines the protection policy during node eviction. |  |  |
 
 
 #### RolloutStrategyType

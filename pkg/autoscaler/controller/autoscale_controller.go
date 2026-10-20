@@ -30,7 +30,6 @@ import (
 	workloadLister "github.com/volcano-sh/kthena/client-go/listers/workload/v1alpha1"
 	workload "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/autoscaler/util"
-	"istio.io/istio/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -151,19 +151,19 @@ func (ac *AutoscaleController) Reconcile(ctx context.Context) {
 	}
 
 	for key := range ac.scalerMap {
-		if !scalerSet.Contains(key) {
+		if !scalerSet.Has(key) {
 			delete(ac.scalerMap, key)
 		}
 	}
 
 	for key := range ac.optimizerMap {
-		if !optimizerSet.Contains(key) {
+		if !optimizerSet.Has(key) {
 			delete(ac.optimizerMap, key)
 		}
 	}
 
 	for key := range ac.disaggregatedScalerMap {
-		if !disaggregatedScalerSet.Contains(key) {
+		if !disaggregatedScalerSet.Has(key) {
 			delete(ac.disaggregatedScalerMap, key)
 		}
 	}

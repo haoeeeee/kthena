@@ -22,10 +22,10 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
@@ -105,7 +105,7 @@ func TestStore_AddModelServerFirst_ThenPod(t *testing.T) {
 
 	// Verify ModelServer now references the pod
 	msValue, _ := s.modelServer.Load(msName)
-	assert.True(t, msValue.(*modelServer).pods.Contains(podName))
+	assert.True(t, msValue.(*modelServer).pods.Has(podName))
 }
 
 // Test Case 2: Pod added first, then ModelServer
@@ -134,7 +134,7 @@ func TestStore_AddPodFirst_ThenModelServer(t *testing.T) {
 
 	// Verify ModelServer references the Pod
 	msValue, _ := s.modelServer.Load(msName)
-	assert.True(t, msValue.(*modelServer).pods.Contains(podName))
+	assert.True(t, msValue.(*modelServer).pods.Has(podName))
 
 	// Step 3: Update ModelServer with explicit pod references
 	err = s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName](podName))
@@ -171,8 +171,8 @@ func TestStore_MultiplePods_ThenModelServer(t *testing.T) {
 	assert.True(t, s.GetPodInfo(pod1Name).HasModelServer(msName))
 	assert.True(t, s.GetPodInfo(pod2Name).HasModelServer(msName))
 	msValue, _ := s.modelServer.Load(msName)
-	assert.True(t, msValue.(*modelServer).pods.Contains(pod1Name))
-	assert.True(t, msValue.(*modelServer).pods.Contains(pod2Name))
+	assert.True(t, msValue.(*modelServer).pods.Has(pod1Name))
+	assert.True(t, msValue.(*modelServer).pods.Has(pod2Name))
 
 	// Update ModelServer with explicit pod references
 	err = s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName](pod1Name, pod2Name))
@@ -248,8 +248,8 @@ func TestStore_PodBelongsToMultipleModelServers(t *testing.T) {
 	// Verify both ModelServers reference the Pod
 	ms1Value, _ := s.modelServer.Load(ms1Name)
 	ms2Value, _ := s.modelServer.Load(ms2Name)
-	assert.True(t, ms1Value.(*modelServer).pods.Contains(podName))
-	assert.True(t, ms2Value.(*modelServer).pods.Contains(podName))
+	assert.True(t, ms1Value.(*modelServer).pods.Has(podName))
+	assert.True(t, ms2Value.(*modelServer).pods.Has(podName))
 }
 
 // Test Case 6: Pod with multiple ModelServers
@@ -279,8 +279,8 @@ func TestStore_PodWithMultipleModelServers_ThenAddModelServers(t *testing.T) {
 	ms2Value, _ := s.modelServer.Load(ms2Name)
 	assert.NotNil(t, ms1Value)
 	assert.NotNil(t, ms2Value)
-	assert.True(t, ms1Value.(*modelServer).pods.Contains(podName))
-	assert.True(t, ms2Value.(*modelServer).pods.Contains(podName))
+	assert.True(t, ms1Value.(*modelServer).pods.Has(podName))
+	assert.True(t, ms2Value.(*modelServer).pods.Has(podName))
 
 	// Update ModelServers explicitly
 	err = s.AddOrUpdateModelServer(ms1, sets.New[types.NamespacedName](podName))
@@ -321,8 +321,8 @@ func TestStore_UpdatePodModelServerAssociations(t *testing.T) {
 	assert.False(t, s.GetPodInfo(podName).HasModelServer(ms2Name))
 	ms1Value, _ := s.modelServer.Load(ms1Name)
 	ms2Value, _ := s.modelServer.Load(ms2Name)
-	assert.True(t, ms1Value.(*modelServer).pods.Contains(podName))
-	assert.False(t, ms2Value.(*modelServer).pods.Contains(podName))
+	assert.True(t, ms1Value.(*modelServer).pods.Has(podName))
+	assert.False(t, ms2Value.(*modelServer).pods.Has(podName))
 
 	// Update: Pod now belongs to ms2 instead
 	err = s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms2})
@@ -387,10 +387,10 @@ func TestStore_InterleavedOperations(t *testing.T) {
 
 	ms1Value, _ := s.modelServer.Load(ms1Name)
 	ms2Value, _ := s.modelServer.Load(ms2Name)
-	assert.True(t, ms1Value.(*modelServer).pods.Contains(pod1Name))
-	assert.False(t, ms1Value.(*modelServer).pods.Contains(pod2Name))
-	assert.True(t, ms2Value.(*modelServer).pods.Contains(pod1Name))
-	assert.True(t, ms2Value.(*modelServer).pods.Contains(pod2Name))
+	assert.True(t, ms1Value.(*modelServer).pods.Has(pod1Name))
+	assert.False(t, ms1Value.(*modelServer).pods.Has(pod2Name))
+	assert.True(t, ms2Value.(*modelServer).pods.Has(pod1Name))
+	assert.True(t, ms2Value.(*modelServer).pods.Has(pod2Name))
 }
 
 // Test Case 9: Deletion scenarios
@@ -434,10 +434,10 @@ func TestStore_DeletionScenarios(t *testing.T) {
 	// Verify ModelServers no longer reference pod1 but still reference pod2
 	ms1Value, _ := s.modelServer.Load(ms1Name)
 	ms2Value, _ := s.modelServer.Load(ms2Name)
-	assert.False(t, ms1Value.(*modelServer).pods.Contains(pod1Name))
-	assert.True(t, ms1Value.(*modelServer).pods.Contains(pod2Name))
-	assert.False(t, ms2Value.(*modelServer).pods.Contains(pod1Name))
-	assert.True(t, ms2Value.(*modelServer).pods.Contains(pod2Name))
+	assert.False(t, ms1Value.(*modelServer).pods.Has(pod1Name))
+	assert.True(t, ms1Value.(*modelServer).pods.Has(pod2Name))
+	assert.False(t, ms2Value.(*modelServer).pods.Has(pod1Name))
+	assert.True(t, ms2Value.(*modelServer).pods.Has(pod2Name))
 
 	// Delete ms1
 	err = s.DeleteModelServer(types.NamespacedName{Namespace: ms1.Namespace, Name: ms1.Name})
@@ -498,7 +498,7 @@ func TestStore_RandomOperations(t *testing.T) {
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(pods))
-	podSets := sets.NewWithLength[types.NamespacedName](5)
+	podSets := make(sets.Set[types.NamespacedName], 5)
 	for i := range pods {
 		podSets.Insert(utils.GetNamespaceName(pods[i]))
 		go func(p *corev1.Pod) {
@@ -516,7 +516,7 @@ func TestStore_RandomOperations(t *testing.T) {
 		podName := utils.GetNamespaceName(pod)
 		assert.True(t, s.GetPodInfo(podName).HasModelServer(msName))
 		msValue, _ := s.modelServer.Load(msName)
-		assert.True(t, msValue.(*modelServer).pods.Contains(podName))
+		assert.True(t, msValue.(*modelServer).pods.Has(podName))
 	}
 
 	retrievedPods, err := s.GetPodsByModelServer(msName)
@@ -527,7 +527,7 @@ func TestStore_RandomOperations(t *testing.T) {
 	s.DeletePod(utils.GetNamespaceName(pods[0]))
 	assert.Nil(t, s.GetPodInfo(utils.GetNamespaceName(pods[0])))
 	msValue, _ := s.modelServer.Load(msName)
-	assert.False(t, msValue.(*modelServer).pods.Contains(utils.GetNamespaceName(pods[0])))
+	assert.False(t, msValue.(*modelServer).pods.Has(utils.GetNamespaceName(pods[0])))
 	retrievedPods, err = s.GetPodsByModelServer(msName)
 	assert.NoError(t, err)
 	assert.Len(t, retrievedPods, 4)

@@ -15,6 +15,7 @@ package controller
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -29,6 +30,15 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	testhelper "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
+
+// client-go v0.35 enables the WatchListClient feature by default, and an informer only falls back to
+// list and watch when its client implements IsWatchListSemanticsUnSupported. The volcano.sh/apis fake
+// clientset was generated before client-gen added that method, so its informers never sync.
+// Remove this once volcano.sh/apis ships a fake clientset generated with client-gen v0.35 or later.
+func TestMain(m *testing.M) {
+	os.Setenv("KUBE_FEATURE_WatchListClient", "false")
+	os.Exit(m.Run())
+}
 
 type testControllerHarness struct {
 	t             *testing.T
@@ -82,7 +92,7 @@ func newTestController(t *testing.T, modelServings ...*workloadv1alpha1.ModelSer
 		t.Fatalf("timed out waiting for informer caches to sync")
 	}
 	require.Eventually(t, func() bool {
-		return controller.initialSync
+		return controller.initialSync.Load()
 	}, 5*time.Second, 10*time.Millisecond, "timed out waiting for initial sync")
 
 	t.Cleanup(cancel)

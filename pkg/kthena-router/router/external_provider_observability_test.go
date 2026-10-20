@@ -38,6 +38,7 @@ import (
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/accesslog"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/providers"
@@ -161,6 +162,35 @@ func TestExternalProviderObservabilityNonTextInputUsesLocalTextAccounting(t *tes
 			assertExternalMetricsExposed(t, fixture, tt.path, http.StatusOK, "successful_request", 0, tt.wantOutputTokens)
 		})
 	}
+}
+
+func TestExternalProviderRouteInputRateLimitRejectsBeforeUpstream(t *testing.T) {
+	upstreamCalls := 0
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"rate-limit","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	fixture := newExternalObservabilityFixture(t, "route-rate-limit", aiv1alpha1.OpenAI, upstream.URL)
+	inputLimit := uint32(1)
+	require.NoError(t, fixture.router.loadRateLimiter.AddOrUpdateLimiter(fixture.clientModel, &aiv1alpha1.RateLimit{
+		InputTokensPerUnit: &inputLimit,
+		Unit:               aiv1alpha1.Minute,
+	}))
+	before := externalCounterValue(t, &fixture.router.metrics.RateLimitExceeded,
+		fixture.clientModel, metrics.LimitTypeInputTokens, "/v1/chat/completions")
+
+	body := addModelToRequestBody(`{"messages":[{"role":"user","content":"x"}]}`, fixture.clientModel)
+	w, accessCtx := executeExternalObservabilityRequest(t, fixture, "/v1/chat/completions", body)
+
+	assert.Equal(t, http.StatusTooManyRequests, w.Code)
+	assert.Zero(t, upstreamCalls)
+	require.NotNil(t, accessCtx.Error)
+	assert.Equal(t, "input_rate_limit", accessCtx.Error.Type)
+	assert.Equal(t, before+1, externalCounterValue(t, &fixture.router.metrics.RateLimitExceeded,
+		fixture.clientModel, metrics.LimitTypeInputTokens, "/v1/chat/completions"))
 }
 
 func TestExternalProviderObservabilityStreamingResponses(t *testing.T) {
@@ -629,7 +659,7 @@ type externalObservabilityFixture struct {
 func newExternalObservabilityFixture(t *testing.T, suffix string, providerType aiv1alpha1.ExternalProviderType, baseURL string) externalObservabilityFixture {
 	t.Helper()
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	clientModel := "observability-client-" + suffix
 	providerModel := "observability-upstream-" + suffix
 	providerName := "observability-provider-" + suffix

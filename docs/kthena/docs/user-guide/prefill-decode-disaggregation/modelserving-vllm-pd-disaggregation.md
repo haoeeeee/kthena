@@ -8,10 +8,10 @@ by [vLLM](https://github.com/vllm-project/vllm):
 - **`nixl`** — in-band, point-to-point KV transfer between prefill and decode.
 - **`lmcache`** — KV reuse through a shared store (e.g. Redis).
 
-This is the lower-level counterpart to the single-resource
-[ModelBooster approach](./modelbooster-vllm-pd-disaggregation.md): it gives you
-full control over the Pod templates, roles, and networking, at the cost of writing
-more YAML.
+This is the recommended approach for new deployments and gives you direct control
+over Pod templates, roles, and networking. The single-resource
+[ModelBooster approach](./modelbooster-vllm-pd-disaggregation.md) is deprecated in
+v1.1, with removal no earlier than v1.5.
 
 ## Deployment overview
 

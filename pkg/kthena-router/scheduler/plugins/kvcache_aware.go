@@ -43,6 +43,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 )
@@ -76,6 +77,12 @@ const (
 
 	kvCacheGCInterval = time.Hour
 	kvCacheGCScanSize = int64(100)
+
+	// kvCacheIndexModeRedis queries the Redis block matrix written by runtime
+	// sidecars (default). kvCacheIndexModeMemory serves scores from an in-memory
+	// index fed by KV events that runtime sidecars stream to this router.
+	kvCacheIndexModeRedis  = "redis"
+	kvCacheIndexModeMemory = "memory"
 )
 
 type KVCacheAwareArgs struct {
@@ -85,13 +92,40 @@ type KVCacheAwareArgs struct {
 	VLLMTokenizerPort int `yaml:"vllmTokenizerPort,omitempty"`
 	// SGLangTokenizerPort overrides the default SGLang tokenizer port (30000).
 	SGLangTokenizerPort int `yaml:"sglangTokenizerPort,omitempty"`
+	// IndexMode selects the coordination backend: "redis" (default) or "memory".
+	IndexMode string `yaml:"indexMode,omitempty"`
+	// RuntimePort is the port of the runtime sidecar the router streams KV
+	// events from (memory mode only, default 9000).
+	RuntimePort int `yaml:"runtimePort,omitempty"`
+	// MaxBlocksPerPod caps how many blocks a single pod may hold in the
+	// in-memory index across all models; at the cap, the pod's oldest blocks
+	// are evicted to store new ones (memory mode only, default 1048576).
+	MaxBlocksPerPod int `yaml:"maxBlocksPerPod,omitempty"`
+	// TokenizerService configures the optional dedicated tokenizer service.
+	TokenizerService *TokenizerServiceArgs `yaml:"tokenizerService,omitempty"`
+}
+
+// TokenizerServiceArgs configures the dedicated tokenizer service used for
+// prompt tokenization instead of the backend inference engines.
+type TokenizerServiceArgs struct {
+	// Enabled turns on the dedicated tokenizer service. Default: false.
+	Enabled bool `yaml:"enabled,omitempty"`
+	// Endpoint is the base URL of the tokenizer service, e.g.
+	// "http://127.0.0.1:8100" for the sidecar deployment or
+	// "http://kthena-tokenizer.kthena-system.svc:8100" for standalone.
+	Endpoint string `yaml:"endpoint,omitempty"`
+	// FallbackToEngine falls back to engine-side tokenization when the
+	// tokenizer service fails. Default: true.
+	FallbackToEngine *bool `yaml:"fallbackToEngine,omitempty"`
 }
 
 type KVCacheAware struct {
 	name             string
 	maxBlocksToMatch int
 	keyPrefix        string
+	indexMode        string
 	redisClient      *redis.Client
+	memoryIndex      *KVBlockMemoryIndex
 	processor        *TokenBlockProcessor
 	tokenizerManager *tokenization.TokenizerManager
 	gcCursor         uint64
@@ -124,7 +158,7 @@ func (b KVCacheAwareBlock) String(prefix string) string {
 	return fmt.Sprintf("%s%s@%d", prefix, b.ModelName, b.ChunkHash)
 }
 
-func NewKVCacheAware(pluginArg runtime.RawExtension) *KVCacheAware {
+func NewKVCacheAware(store datastore.Store, pluginArg runtime.RawExtension) *KVCacheAware {
 	klog.Infof("KVCacheAware: initializing plugin, raw args length=%d", len(pluginArg.Raw))
 
 	var args KVCacheAwareArgs
@@ -142,20 +176,37 @@ func NewKVCacheAware(pluginArg runtime.RawExtension) *KVCacheAware {
 	if maxBlocksToMatch <= 0 {
 		maxBlocksToMatch = defaultMaxBlocksToMatch
 	}
+	indexMode := normalizeIndexMode(args.IndexMode)
 
 	vllmPort := normalizeTokenizerPort(tokenization.EngineVLLM, args.VLLMTokenizerPort, defaultVLLMTokenizerPort)
 	sglangPort := normalizeTokenizerPort(tokenization.EngineSGLang, args.SGLangTokenizerPort, defaultSGLangTokenizerPort)
 
-	klog.Infof("KVCacheAware: config blockSizeToHash=%d, maxBlocksToMatch=%d, vllmTokenizerPort=%d, sglangTokenizerPort=%d",
-		blockSizeToHash, maxBlocksToMatch, vllmPort, sglangPort)
+	klog.Infof("KVCacheAware: config indexMode=%s, blockSizeToHash=%d, maxBlocksToMatch=%d, vllmTokenizerPort=%d, sglangTokenizerPort=%d",
+		indexMode, blockSizeToHash, maxBlocksToMatch, vllmPort, sglangPort)
 
 	managerConfig := tokenization.TokenizerManagerConfig{
 		EndpointPorts: map[string]int{
 			tokenization.EngineVLLM:   vllmPort,
 			tokenization.EngineSGLang: sglangPort,
 		},
+		Service: normalizeTokenizerServiceArgs(args.TokenizerService),
 	}
 	manager := tokenization.NewTokenizerManager(managerConfig)
+
+	plugin := &KVCacheAware{
+		name:             KVCacheAwarePluginName,
+		maxBlocksToMatch: maxBlocksToMatch,
+		keyPrefix:        kvCacheKeyPrefix,
+		indexMode:        indexMode,
+		processor:        &TokenBlockProcessor{blockSize: blockSizeToHash},
+		tokenizerManager: manager,
+	}
+
+	if indexMode == kvCacheIndexModeMemory {
+		plugin.memoryIndex = NewKVBlockMemoryIndex(args.MaxBlocksPerPod)
+		plugin.startMemoryMode(store, args)
+		return plugin
+	}
 
 	redisClient := utils.TryGetRedisClient()
 	if redisClient == nil {
@@ -163,17 +214,43 @@ func NewKVCacheAware(pluginArg runtime.RawExtension) *KVCacheAware {
 	} else {
 		klog.Infof("KVCacheAware: Redis client initialized successfully")
 	}
-
-	plugin := &KVCacheAware{
-		name:             KVCacheAwarePluginName,
-		maxBlocksToMatch: maxBlocksToMatch,
-		keyPrefix:        kvCacheKeyPrefix,
-		redisClient:      redisClient,
-		processor:        &TokenBlockProcessor{blockSize: blockSizeToHash},
-		tokenizerManager: manager,
-	}
+	plugin.redisClient = redisClient
 	plugin.startGC()
 	return plugin
+}
+
+func normalizeIndexMode(mode string) string {
+	switch mode {
+	case "", kvCacheIndexModeRedis:
+		return kvCacheIndexModeRedis
+	case kvCacheIndexModeMemory:
+		return kvCacheIndexModeMemory
+	default:
+		klog.Fatalf("KVCacheAware: invalid indexMode %q, must be %q or %q",
+			mode, kvCacheIndexModeRedis, kvCacheIndexModeMemory)
+		return ""
+	}
+}
+
+// startMemoryMode starts streaming KV events from the runtime sidecars and the
+// in-memory index GC.
+func (t *KVCacheAware) startMemoryMode(store datastore.Store, args KVCacheAwareArgs) {
+	if store == nil {
+		klog.Fatalf("KVCacheAware: memory mode requires a datastore to find runtime sidecars")
+	}
+	runtimePort := args.RuntimePort
+	if runtimePort == 0 {
+		runtimePort = defaultRuntimePort
+	} else if runtimePort < 1 || runtimePort > maxTokenizerPort {
+		klog.Fatalf("KVCacheAware: invalid runtimePort %d, must be within [1, %d]", runtimePort, maxTokenizerPort)
+	}
+
+	go t.memoryIndex.runGC(context.Background(), kvCacheGCInterval, kvCacheFieldFreshDuration)
+	subscriber := newKVEventSubscriber(store, t.memoryIndex, routerInstanceID(), runtimePort)
+	store.RegisterCallback("Pod", subscriber.onPodEvent)
+	go subscriber.run(context.Background())
+	klog.Infof("KVCacheAware: memory mode active, runtimePort=%d, maxBlocksPerPod=%d",
+		runtimePort, t.memoryIndex.maxBlocksPerOwner)
 }
 
 func normalizeTokenizerPort(engine string, configuredPort, defaultPort int) int {
@@ -184,6 +261,29 @@ func normalizeTokenizerPort(engine string, configuredPort, defaultPort int) int 
 		klog.Warningf("KVCacheAware: invalid %s tokenizer port %d, using default %d", engine, configuredPort, defaultPort)
 	}
 	return defaultPort
+}
+
+// normalizeTokenizerServiceArgs validates the tokenizer service plugin args and
+// converts them to the tokenization package config. The feature is disabled by
+// default; fallback to engine tokenization defaults to true.
+func normalizeTokenizerServiceArgs(args *TokenizerServiceArgs) tokenization.TokenizerServiceConfig {
+	if args == nil || !args.Enabled {
+		return tokenization.TokenizerServiceConfig{}
+	}
+	if args.Endpoint == "" {
+		klog.Warningf("KVCacheAware: tokenizerService.enabled is true but endpoint is empty, disabling tokenizer service")
+		return tokenization.TokenizerServiceConfig{}
+	}
+	fallback := true
+	if args.FallbackToEngine != nil {
+		fallback = *args.FallbackToEngine
+	}
+	klog.Infof("KVCacheAware: tokenizer service enabled, endpoint=%s, fallbackToEngine=%v", args.Endpoint, fallback)
+	return tokenization.TokenizerServiceConfig{
+		Enabled:          true,
+		Endpoint:         args.Endpoint,
+		FallbackToEngine: fallback,
+	}
 }
 
 func (t *KVCacheAware) Name() string {
@@ -248,16 +348,16 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	}
 
 	redisStart := time.Now()
-	blockToPods, err := t.queryRedisForBlocks(blockHashes, ctx.Model, ownerStartTimes(pods))
+	blockToPods, err := t.queryBlocks(blockHashes, ctx.Model, ownerStartTimes(pods))
 	redisDuration := time.Since(redisStart)
 	if err != nil {
 		if ctx.MetricsRecorder != nil {
 			ctx.MetricsRecorder.RecordKVCacheError(metrics.StageRedis)
 		}
-		klog.Warningf("KVCacheAware.Score: Redis query failed after %v: %v", redisDuration, err)
+		klog.Warningf("KVCacheAware.Score: block index query failed after %v: %v", redisDuration, err)
 		return nil
 	}
-	klog.V(4).Infof("KVCacheAware.Score: Redis query took %v, blocksWithHits=%d/%d",
+	klog.V(4).Infof("KVCacheAware.Score: block index query took %v, blocksWithHits=%d/%d",
 		redisDuration, len(blockToPods), len(blockHashes))
 
 	if ctx.MetricsRecorder != nil {
@@ -296,6 +396,33 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 
 	klog.V(4).Infof("KVCacheAware.Score: completed in %v, finalScores=%v", time.Since(scoreStart), podScores)
 	return scoreResults
+}
+
+// queryBlocks resolves block ownership through the configured backend.
+func (t *KVCacheAware) queryBlocks(blockHashes []uint64, modelName string, ownerStartedAt map[string]int64) (map[uint64][]string, error) {
+	if t.indexMode == kvCacheIndexModeMemory {
+		return t.queryMemoryForBlocks(blockHashes, modelName, ownerStartedAt)
+	}
+	return t.queryRedisForBlocks(blockHashes, modelName, ownerStartedAt)
+}
+
+// queryMemoryForBlocks resolves block ownership from the in-memory index fed
+// by KV events pushed by runtime sidecars.
+func (t *KVCacheAware) queryMemoryForBlocks(blockHashes []uint64, modelName string, ownerStartedAt map[string]int64) (map[uint64][]string, error) {
+	if t.memoryIndex == nil {
+		return nil, fmt.Errorf("memory index not initialized")
+	}
+
+	blockToPods := make(map[uint64][]string)
+	for hash, entries := range t.memoryIndex.GetBlockOwners(modelName, blockHashes) {
+		pods := freshOwners(entries, ownerStartedAt)
+		if len(pods) == 0 {
+			continue
+		}
+		blockToPods[hash] = pods
+	}
+	klog.V(4).Infof("KVCacheAware.queryMemory: total blocks with hits: %d/%d", len(blockToPods), len(blockHashes))
+	return blockToPods, nil
 }
 
 // queryRedisForBlocks queries Redis to find which pods have cached the given token block hashes
@@ -359,7 +486,10 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 
 // podCacheOwnerIdentifier matches the pod.namespace Redis owner format written by the Runtime.
 func podCacheOwnerIdentifier(pod *datastore.PodInfo) string {
-	podName := pod.GetPodNamespacedName()
+	return cacheOwnerIdentifier(pod.GetPodNamespacedName())
+}
+
+func cacheOwnerIdentifier(podName types.NamespacedName) string {
 	return fmt.Sprintf("%s.%s", podName.Name, podName.Namespace)
 }
 

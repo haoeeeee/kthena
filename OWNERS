@@ -4,6 +4,7 @@ reviewers:
   - YaoZengzeng
   - FAUST-BENCHOU
   - LiZhenCheng9527
+  - kube-gopher
 
 # List of usernames who may use /approve
 approvers:

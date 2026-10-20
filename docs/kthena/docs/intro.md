@@ -9,7 +9,11 @@ sidebar_position: 1
 Kthena ships as **two independent, self-contained components** — workload controllers and a router. Install one, the other, or both; each is useful on its own.
 
 > **Declarative CRDs. Any engine. Every scale.**
-> Deploy with a single `ModelBooster` for a one-stop experience, or compose fine-grained primitives — `ModelRoute`, `ModelServer`, `ModelServing`, `AutoScalingPolicy`, and `AutoScalingPolicyBinding` — for full control. From a single-GPU/NPU prototype to a multi-node, prefill/decode disaggregated fleet.
+> Compose `ModelServing`, `ModelServer`, and `ModelRoute`, with autoscaling policies as needed, to manage workloads and inference traffic. From a single-GPU/NPU prototype to a multi-node, prefill/decode disaggregated fleet.
+
+:::note ModelBooster deprecation
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. See the [deployment guidance](./user-guide/model-deployment.md#modelbooster-deprecation).
+:::
 
 ---
 

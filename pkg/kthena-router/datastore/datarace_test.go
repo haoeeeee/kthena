@@ -23,10 +23,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 // helpers for test setup
@@ -298,7 +298,6 @@ func TestConcurrentRemovePodFromPDGroupsAndAddOrUpdateModelServer(t *testing.T) 
 	// Pre-populate with pods in the PD group
 	numPods := 10
 	podNames := make([]types.NamespacedName, numPods)
-	podLabelsList := make([]map[string]string, numPods)
 	for i := 0; i < numPods; i++ {
 		podName := types.NamespacedName{Namespace: "default", Name: fmt.Sprintf("pod-%d", i)}
 		podNames[i] = podName
@@ -307,7 +306,6 @@ func TestConcurrentRemovePodFromPDGroupsAndAddOrUpdateModelServer(t *testing.T) 
 			role = "prefill"
 		}
 		labels := map[string]string{"pd-group": "group-a", "role": role}
-		podLabelsList[i] = labels
 		msObj.addPod(podName)
 		msObj.categorizePodForPDGroup(podName, labels)
 	}
@@ -332,7 +330,7 @@ func TestConcurrentRemovePodFromPDGroupsAndAddOrUpdateModelServer(t *testing.T) 
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			msObj.removePodFromPDGroups(podNames[idx], podLabelsList[idx])
+			msObj.removePodFromPDGroups(podNames[idx])
 		}(i)
 	}
 
@@ -364,7 +362,7 @@ func TestConcurrentCategorizePodAndRemovePodFromPDGroups(t *testing.T) {
 		// Remove (may or may not find the pod)
 		go func() {
 			defer wg.Done()
-			msObj.removePodFromPDGroups(podName, labels)
+			msObj.removePodFromPDGroups(podName)
 			msObj.deletePod(podName)
 		}()
 	}
@@ -391,7 +389,7 @@ func TestRemovePodFromPDGroupsCorrectness(t *testing.T) {
 	assert.Len(t, decodePods, 1, "should have 1 decode pod before removal")
 
 	// Remove the pod
-	msObj.removePodFromPDGroups(podName, labels)
+	msObj.removePodFromPDGroups(podName)
 
 	// Verify pod is removed
 	decodePods = msObj.getAllDecodePods()

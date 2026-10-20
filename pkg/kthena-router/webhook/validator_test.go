@@ -18,14 +18,16 @@ package webhook
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/fake"
 
 	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 )
+
+func ptrInt32(v int32) *int32 { return &v }
 
 func TestValidateModelRoute(t *testing.T) {
 	weight0 := uint32(0)
@@ -635,13 +637,9 @@ func TestValidateModelRoute(t *testing.T) {
 		},
 	}
 
-	// Create a validator instance
-	kubeClient := fake.NewSimpleClientset()
-	validator := NewKthenaRouterValidator(kubeClient, 8080)
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			allowed, reason := validator.validateModelRoute(tt.modelRoute)
+			allowed, reason := ValidateModelRoute(tt.modelRoute)
 
 			assert.Equal(t, tt.expectValid, allowed, "Expected validation result should match")
 
@@ -655,8 +653,7 @@ func TestValidateModelRoute(t *testing.T) {
 }
 
 func TestValidateModelRouteRejectsNilTargetModel(t *testing.T) {
-	validator := NewKthenaRouterValidator(fake.NewSimpleClientset(), 8080)
-	allowed, reason := validator.validateModelRoute(&networkingv1alpha1.ModelRoute{
+	allowed, reason := ValidateModelRoute(&networkingv1alpha1.ModelRoute{
 		Spec: networkingv1alpha1.ModelRouteSpec{
 			ModelName: "test-model",
 			Rules: []*networkingv1alpha1.Rule{{
@@ -737,6 +734,29 @@ func TestValidateModelServer(t *testing.T) {
 			expectValid: true,
 		},
 		{
+			name: "invalid model server - workload selector without workload port",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{
+							"app": "test-server",
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.workloadPort.port: Required value: workloadPort.port must be specified when endpoints are not used",
+		},
+		{
 			name: "invalid model server - empty workload selector",
 			modelServer: &networkingv1alpha1.ModelServer{
 				TypeMeta: metav1.TypeMeta{
@@ -815,14 +835,358 @@ func TestValidateModelServer(t *testing.T) {
 			expectValid:    false,
 			expectedReason: "validation failed:   - spec.workloadSelector.pdGroup.groupKey: Required value: groupKey must be specified  - spec.workloadSelector.pdGroup.prefillLabels: Required value: labels must contain at least one label  - spec.workloadSelector.pdGroup.decodeLabels: Required value: labels must contain at least one label",
 		},
+		{
+			name: "valid model server with static endpoints",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+					Endpoints: []networkingv1alpha1.Endpoint{
+						{Name: "vllm-0", Address: "10.0.0.1"},
+						{Name: "vllm-1", Address: "vllm-1.example.com", Port: ptrInt32(8001)},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "valid model server with static endpoints and pd group",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						PDGroup: &networkingv1alpha1.PDGroup{
+							GroupKey:      "pd-group",
+							PrefillLabels: map[string]string{"role": "prefill"},
+							DecodeLabels:  map[string]string{"role": "decode"},
+						},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+					Endpoints: []networkingv1alpha1.Endpoint{
+						{Name: "vllm-0", Address: "10.0.0.1", Labels: map[string]string{"role": "prefill", "pd-group": "a"}},
+						{Name: "vllm-1", Address: "10.0.0.2", Labels: map[string]string{"role": "decode", "pd-group": "a"}},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "invalid model server - neither workload selector nor endpoints",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.workloadSelector: Required value: one of workloadSelector and endpoints must be specified",
+		},
+		{
+			name: "invalid model server - endpoints combined with match labels",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+					Endpoints: []networkingv1alpha1.Endpoint{
+						{Name: "vllm-0", Address: "10.0.0.1"},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.endpoints: Forbidden: endpoints and workloadSelector.matchLabels are mutually exclusive",
+		},
+		{
+			name: "invalid model server - duplicated endpoint name and missing address",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+					Endpoints: []networkingv1alpha1.Endpoint{
+						{Name: "vllm-0", Address: "10.0.0.1"},
+						{Name: "vllm-0"},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.endpoints[1].name: Duplicate value: \"vllm-0\"  - spec.endpoints[1].address: Required value: address must be specified",
+		},
+		{
+			name: "invalid model server - endpoint without any port",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					Endpoints: []networkingv1alpha1.Endpoint{
+						{Name: "vllm-0", Address: "10.0.0.1"},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.endpoints[0].port: Required value: port must be specified when spec.workloadPort.port is unset",
+		},
+		{
+			name: "valid model server with connection pool",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxIdleConnections:        ptrInt32(100),
+							MaxIdleConnectionsPerHost: ptrInt32(64),
+							MaxConnectionsPerHost:     ptrInt32(0),
+							IdleTimeout:               &metav1.Duration{Duration: 90 * time.Second},
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "invalid connection pool - negative max idle per host",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxIdleConnectionsPerHost: ptrInt32(-1),
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.connectionPool.maxIdleConnectionsPerHost: Invalid value: -1: must be non-negative",
+		},
+		{
+			name: "invalid connection pool - non-positive idle timeout",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							IdleTimeout: &metav1.Duration{Duration: 0},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.connectionPool.idleTimeout: Invalid value: 0: must be a positive duration",
+		},
+		{
+			// SGLang with no explicit kvConnector uses the SGLang connector (concurrent
+			// prefill-decode); a capped maxConnectionsPerHost would deadlock.
+			name: "SGLang with maxConnectionsPerHost cap rejected",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "sglang-capped", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.SGLang,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "sglang-capped"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxConnectionsPerHost: ptrInt32(1),
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.connectionPool.maxConnectionsPerHost: Invalid value: 1: not supported for SGLang: concurrent prefill-decode requires unlimited per-host connections to avoid deadlock",
+		},
+		{
+			// SGLang with maxConnectionsPerHost unset (0/unlimited) is fine.
+			name: "SGLang without maxConnectionsPerHost cap accepted",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "sglang-uncapped", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.SGLang,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "sglang-uncapped"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxIdleConnectionsPerHost: ptrInt32(64),
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			// SGLang engine with an explicit nixl connector uses serial prefill-decode,
+			// so a capped maxConnectionsPerHost is allowed (no deadlock).
+			name: "SGLang with explicit nixl connector and maxConnectionsPerHost cap accepted",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "sglang-nixl", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.SGLang,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "sglang-nixl"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					KVConnector:  &networkingv1alpha1.KVConnectorSpec{Type: networkingv1alpha1.ConnectorTypeNIXL},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxConnectionsPerHost: ptrInt32(1),
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			// vLLM with a capped maxConnectionsPerHost is fine (serial prefill-decode).
+			name: "vLLM with maxConnectionsPerHost cap accepted",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "vllm-capped", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "vllm-capped"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxConnectionsPerHost: ptrInt32(1),
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "valid model server with session sticky",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						SessionSticky: &networkingv1alpha1.SessionSticky{
+							Sources: []networkingv1alpha1.SessionKeySource{
+								{Type: networkingv1alpha1.SessionKeySourceHeader, Name: "X-S"},
+							},
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "invalid session sticky empty sources",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						SessionSticky: &networkingv1alpha1.SessionSticky{
+							Sources: []networkingv1alpha1.SessionKeySource{},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.sessionSticky.sources: Required value: sources must be non-empty when sessionSticky is set",
+		},
+		{
+			name: "invalid session affinity seconds",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						SessionSticky: &networkingv1alpha1.SessionSticky{
+							SessionAffinitySeconds: func() *int32 { v := int32(0); return &v }(),
+							Sources: []networkingv1alpha1.SessionKeySource{
+								{Type: networkingv1alpha1.SessionKeySourceQuery, Name: "s"},
+							},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.sessionSticky.sessionAffinitySeconds: Invalid value: 0: must be >= 1",
+		},
 	}
-
-	kubeClient := fake.NewSimpleClientset()
-	validator := NewKthenaRouterValidator(kubeClient, 8080)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			allowed, reason := validator.validateModelServer(tt.modelServer)
+			allowed, reason := ValidateModelServer(tt.modelServer)
 
 			assert.Equal(t, tt.expectValid, allowed, "Expected validation result should match")
 
@@ -991,7 +1355,22 @@ func TestValidateExternalModelProvider(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:\n  - spec.headers[X-Tenant]: Invalid value: \"tenant-a\\r\\nX-Injected: true\": header value must not contain CR or LF",
+			expectedReason: "validation failed:\n  - spec.headers[X-Tenant]: Invalid value: \"tenant-a\\r\\nX-Injected: true\": header value must be a valid HTTP header field value",
+		},
+		{
+			name: "invalid provider - static header value contains DEL",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					BaseURL:      "https://api.example.com/v1",
+					Headers: map[string]string{
+						"X-Tenant": "tenant-a\x7f",
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.headers[X-Tenant]: Invalid value: \"tenant-a\\x7f\": header value must be a valid HTTP header field value",
 		},
 		{
 			name: "invalid provider - optional secret ref",
@@ -1031,12 +1410,9 @@ func TestValidateExternalModelProvider(t *testing.T) {
 		},
 	}
 
-	kubeClient := fake.NewSimpleClientset()
-	validator := NewKthenaRouterValidator(kubeClient, 8080)
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			allowed, reason := validator.validateExternalModelProvider(tt.provider)
+			allowed, reason := ValidateExternalModelProvider(tt.provider)
 
 			assert.Equal(t, tt.expectValid, allowed, "Expected validation result should match")
 			if !tt.expectValid {

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ from fastapi import BackgroundTasks
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from kthena.downloader.app import load_config
 from kthena.downloader.downloader import download_model
@@ -36,10 +37,30 @@ from kthena.runtime.kv_cache_manager import (
     get_vllm_kv_cache_handler,
     get_sglang_kv_cache_handler,
 )
+from kthena.runtime.memory_kv_manager import (
+    MemoryKVCacheManager,
+    RouterStream,
+    RouterStreamUnavailable,
+    get_memory_kv_manager,
+)
 from kthena.runtime.redis_client import get_redis_client
 from kthena.runtime.standard import MetricStandard, EngineType
 from kthena.runtime.zmq_subscriber import get_vllm_zmq_subscriber
 from kthena.runtime.sglang_zmq_subscriber import get_sglang_zmq_subscriber
+
+# KV event sync backend: "redis" writes standardized block hashes to Redis;
+# "memory" streams them directly to registered router instances.
+KV_SYNC_MODE_REDIS = "redis"
+KV_SYNC_MODE_MEMORY = "memory"
+
+
+def get_kv_event_sync_mode() -> str:
+    mode = os.getenv("KV_EVENT_SYNC_MODE", KV_SYNC_MODE_REDIS).lower()
+    if mode not in (KV_SYNC_MODE_REDIS, KV_SYNC_MODE_MEMORY):
+        logging.getLogger(__name__).warning(
+            "Invalid KV_EVENT_SYNC_MODE %r, falling back to %r", mode, KV_SYNC_MODE_REDIS)
+        return KV_SYNC_MODE_REDIS
+    return mode
 
 
 class AppState:
@@ -53,6 +74,8 @@ class AppState:
         self.engine_metrics_url: Optional[str] = None
         self.pod_identifier: Optional[str] = None
         self.model_name: Optional[str] = None
+        self.kv_sync_mode: str = KV_SYNC_MODE_REDIS
+        self.memory_kv_manager = None
 
 
 TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30.0"))
@@ -96,14 +119,20 @@ async def lifespan(app: FastAPI):
         follow_redirects=True,
     )
 
-    try:
-        redis_client = get_redis_client()
-        await redis_client.connect()
-        state.redis_client = redis_client
-        logger.info("Redis client initialized successfully")
-    except Exception as e:
-        logger.warning("Failed to initialize Redis client:%s",e)
+    state.kv_sync_mode = get_kv_event_sync_mode()
+    if state.kv_sync_mode == KV_SYNC_MODE_MEMORY:
+        state.memory_kv_manager = get_memory_kv_manager()
         state.redis_client = None
+        logger.info("KV event sync mode: memory (stream to registered routers)")
+    else:
+        try:
+            redis_client = get_redis_client()
+            await redis_client.connect()
+            state.redis_client = redis_client
+            logger.info("Redis client initialized successfully")
+        except Exception as e:
+            logger.warning("Failed to initialize Redis client:%s",e)
+            state.redis_client = None
 
     try:
         event_publisher = get_event_publisher()
@@ -115,7 +144,7 @@ async def lifespan(app: FastAPI):
         engine = state.metric_standard.engine if state.metric_standard else None
 
         if pod_identifier and model_name and engine == EngineType.VLLM:
-            vllm_kv_cache_handler = get_vllm_kv_cache_handler()
+            vllm_kv_cache_handler = get_vllm_kv_cache_handler(state.memory_kv_manager)
             for event_type in (
                 EventType.VLLM_BLOCK_STORED,
                 EventType.VLLM_BLOCK_REMOVED,
@@ -124,7 +153,7 @@ async def lifespan(app: FastAPI):
                 event_publisher.subscribe(event_type, vllm_kv_cache_handler)
             logger.info("vLLM KV-cache event handler registered")
         elif pod_identifier and model_name and engine == EngineType.SGLANG:
-            sglang_kv_cache_handler = get_sglang_kv_cache_handler()
+            sglang_kv_cache_handler = get_sglang_kv_cache_handler(state.memory_kv_manager)
             for event_type in (
                 EventType.SGLANG_BLOCK_STORED,
                 EventType.SGLANG_BLOCK_REMOVED,
@@ -190,6 +219,9 @@ async def lifespan(app: FastAPI):
     if state.event_publisher:
         cleanup_tasks.append(('Event system', state.event_publisher.stop()))
 
+    if state.memory_kv_manager:
+        cleanup_tasks.append(('Memory KV manager', state.memory_kv_manager.close()))
+
     if state.redis_client:
         cleanup_tasks.append(('Redis client', state.redis_client.disconnect()))
 
@@ -212,6 +244,67 @@ async def health_check() -> JSONResponse:
         content={"status": "healthy", "service": "runtime"},
         status_code=200
     )
+
+
+@router.post("/kvcache/routers/register", tags=["KVCache"])
+async def register_router(request: Request) -> StreamingResponse:
+    """Register a router instance and stream KV events to it.
+
+    Request body:
+    - router_id: str - Unique identifier of the router instance; a new
+      registration replaces the stream of the same router
+
+    The response is an application/x-ndjson stream that stays open until the
+    router closes it. Every line is a JSON object
+    {"model_name": str, "events": [...]} with stored/removed/cleared events of
+    standardized block hashes. The stream starts with the full block set as
+    stored events, and carries an empty heartbeat line when it is otherwise
+    idle. Events always belong to this runtime's pod: the router attributes
+    them to the pod it connected to.
+    """
+    state = get_app_state(request.app)
+    if state.kv_sync_mode != KV_SYNC_MODE_MEMORY or state.memory_kv_manager is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Runtime is not in memory KV event sync mode "
+                   "(set KV_EVENT_SYNC_MODE=memory)")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail="Request body must be a JSON object")
+
+    router_id = body.get("router_id")
+    if not isinstance(router_id, str) or not router_id:
+        raise HTTPException(
+            status_code=400, detail="router_id must be a non-empty string")
+
+    manager = state.memory_kv_manager
+    try:
+        stream = manager.open_stream(router_id)
+    except RouterStreamUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return _RouterStreamResponse(manager, stream)
+
+
+class _RouterStreamResponse(StreamingResponse):
+    """Sends a router stream through MemoryKVCacheManager.serve, which
+    cancels the response once the stream has ended but the response has
+    not."""
+
+    def __init__(self, manager: MemoryKVCacheManager, stream: RouterStream):
+        super().__init__(manager.iter_stream(stream),
+                         media_type="application/x-ndjson")
+        self._manager = manager
+        self._stream = stream
+
+    async def __call__(self, scope, receive, send) -> None:
+        await self._manager.serve(
+            self._stream,
+            functools.partial(super().__call__, scope, receive, send))
 
 
 @router.get("/metrics", tags=["Metrics"])
@@ -325,6 +418,26 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Bound of the graceful shutdown. Connections whose client does not read
+# never close: closing them waits until the pending response data is sent.
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 10
+
+
+class _Server(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config):
+        if config.timeout_graceful_shutdown is None:
+            config.timeout_graceful_shutdown = GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+        super().__init__(config)
+
+    async def shutdown(self, sockets=None) -> None:
+        # Router KV event streams never end on their own, and the server
+        # waits for open requests to finish before shutting down.
+        app_state = getattr(self.config.app.state, "app_state", None)
+        if app_state is not None and app_state.memory_kv_manager is not None:
+            await app_state.memory_kv_manager.close()
+        await super().shutdown(sockets=sockets)
+
+
 def main() -> None:
     try:
         args = parse_arguments()
@@ -332,12 +445,12 @@ def main() -> None:
 
         logger.info("Starting service on %s:%s", args.host, args.port)
 
-        uvicorn.run(
+        _Server(uvicorn.Config(
             app,
             host=args.host,
             port=args.port,
             log_level="info"
-        )
+        )).run()
 
     except KeyboardInterrupt:
         logger.info("Service stopped by user")

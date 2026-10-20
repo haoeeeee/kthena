@@ -16,6 +16,10 @@ customized with your specific values. This command will:
 3. Ask for confirmation
 4. Apply the resources to Kubernetes (unless --dry-run is specified)
 
+ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster remains supported during the deprecation period and will be removed no earlier than Kthena v1.5.
+
 Examples:
   kthena create manifest --template basic-inference --name my-model --image my-registry/model:v1.0
   kthena create manifest --template basic-inference --values-file values.yaml

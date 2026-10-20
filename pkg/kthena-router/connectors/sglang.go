@@ -25,6 +25,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/klog/v2"
@@ -79,7 +80,8 @@ func (s *SGLangConnector) Name() string {
 // prefill to time out and abort with "KVTransferError: Aborted by AbortReq".
 // The decode request carries bootstrap_host = prefillHost so the decode receiver can
 // locate the prefill's bootstrap server; both requests carry the same bootstrap_room.
-func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *OnFlightHooks) (int, error) {
+func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, timeout time.Duration, hooks *OnFlightHooks) (int, error) {
+	rt := upstreamRoundTripper(c)
 	// A bootstrap room identifies one prefill/decode attempt. Generate it here
 	// so retries cannot observe state left behind by an earlier worker pair.
 	bootstrapRoom := s.newBootstrapRoom()
@@ -126,7 +128,7 @@ func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, 
 	// The prefill sender uses bootstrap_room to track the ZMQ metadata sent by the
 	// decode receiver; it does not need bootstrap_host.
 	prefillBody := cloneReqBody(reqBody)
-	preparePrefillBody(prefillBody)
+	preparePrefillBody(prefillBody, responsesPrefillPath(c, req))
 	prefillBody["bootstrap_room"] = bootstrapRoom
 	prefillRequest, err := buildRequest(req, prefillBody)
 	if err != nil {
@@ -150,17 +152,21 @@ func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, 
 		hooks.IncrDecode()
 	}
 
-	// prefillCtx is cancelled if decode fails, which aborts the prefill HTTP
-	// request immediately instead of letting it hang waiting for a bootstrap
-	// connection from a decode receiver that is already gone.
+	// Cancel either phase if the other fails so neither request is left waiting
+	// for a peer that is already gone.
 	prefillCtx, cancelPrefill := context.WithCancel(c.Request.Context())
 	defer cancelPrefill()
+	decodeCtx, cancelDecode := context.WithCancel(c.Request.Context())
+	defer cancelDecode()
 
 	type prefillOutcome struct{ err error }
 	prefillCh := make(chan prefillOutcome, 1)
 
 	go func() {
-		err := s.prefill(prefillRequest.WithContext(prefillCtx), prefillAddr, bootstrapRoom)
+		err := s.prefill(prefillRequest.WithContext(prefillCtx), prefillAddr, bootstrapRoom, timeout, rt)
+		if err != nil {
+			cancelDecode()
+		}
 		// Decrement the prefill pod's on-flight counter as soon as prefill finishes,
 		// so the scheduler gets an accurate view even while decode is still running.
 		if hooks != nil && hooks.DecrPrefill != nil {
@@ -171,7 +177,7 @@ func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, 
 
 	// Run decode in the current goroutine so that streaming writes reach the
 	// gin.Context from the request-handling goroutine.
-	result, decodeErr := s.decode(c, decodeRequest, decodeAddr, bootstrapRoom)
+	result, decodeErr := s.decode(c, decodeRequest.WithContext(decodeCtx), decodeAddr, bootstrapRoom, timeout, rt)
 
 	if hooks != nil && hooks.DecrDecode != nil {
 		hooks.DecrDecode()
@@ -210,18 +216,18 @@ func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, 
 	return result, decodeErr
 }
 
-func (s *SGLangConnector) prefill(req *http.Request, prefillAddr string, bootstrapRoom int64) error {
+func (s *SGLangConnector) prefill(req *http.Request, prefillAddr string, bootstrapRoom int64, timeout time.Duration, rt http.RoundTripper) error {
 	req.URL.Host = prefillAddr
 	req.URL.Scheme = "http"
 	klog.V(4).Infof("sglang prefill: sending to %s (bootstrap_room=%d)", req.URL.String(), bootstrapRoom)
-	return prefillerProxy(nil, req)
+	return prefillerProxy(req, timeout, rt)
 }
 
-func (s *SGLangConnector) decode(c *gin.Context, req *http.Request, decodeAddr string, bootstrapRoom int64) (int, error) {
+func (s *SGLangConnector) decode(c *gin.Context, req *http.Request, decodeAddr string, bootstrapRoom int64, timeout time.Duration, rt http.RoundTripper) (int, error) {
 	req.URL.Host = decodeAddr
 	req.URL.Scheme = "http"
 	klog.V(4).Infof("sglang decode: sending to %s (bootstrap_room=%d)", req.URL.String(), bootstrapRoom)
-	return decoderProxy(c, req)
+	return decoderProxy(c, req, timeout, rt)
 }
 
 func buildRequest(req *http.Request, reqBody map[string]interface{}) (*http.Request, error) {

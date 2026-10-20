@@ -18,9 +18,11 @@ package utils
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -166,6 +168,70 @@ func TestSetCondition(t *testing.T) {
 		assert.Equal(t, metav1.ConditionTrue, cond.Status)
 		assert.Contains(t, cond.Message, SomeGroupsAreProgressing)
 	})
+
+	t.Run("superseded condition reports the state that replaced it", func(t *testing.T) {
+		wentTrue := metav1.NewTime(time.Now().Add(-time.Hour))
+		ms := &workloadv1alpha1.ModelServing{
+			Spec: workloadv1alpha1.ModelServingSpec{},
+			Status: workloadv1alpha1.ModelServingStatus{
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(workloadv1alpha1.ModelServingAvailable),
+						Status:             metav1.ConditionTrue,
+						Reason:             "AllGroupsReady",
+						Message:            AllGroupsIsReady,
+						LastTransitionTime: wentTrue,
+					},
+				},
+			},
+		}
+
+		// A rollout starts, so UpdateInProgress goes True and Available has to go False.
+		shouldUpdate := SetCondition(ms, []int{3}, []int{2, 3}, []int{0, 1})
+		assert.True(t, shouldUpdate)
+		assert.Len(t, ms.Status.Conditions, 2)
+
+		available := meta.FindStatusCondition(ms.Status.Conditions, string(workloadv1alpha1.ModelServingAvailable))
+		if assert.NotNil(t, available) {
+			assert.Equal(t, metav1.ConditionFalse, available.Status)
+			// The reason and message have to explain the False state, not the True one it left.
+			assert.Equal(t, "GroupsUpdating", available.Reason)
+			assert.Contains(t, available.Message, SomeGroupsAreProgressing)
+			assert.NotEqual(t, AllGroupsIsReady, available.Message)
+			// metav1.Condition requires LastTransitionTime to move when Status does.
+			assert.True(t, available.LastTransitionTime.After(wentTrue.Time))
+		}
+	})
+
+	t.Run("superseded UpdateInProgress reports completion", func(t *testing.T) {
+		wentTrue := metav1.NewTime(time.Now().Add(-time.Hour))
+		ms := &workloadv1alpha1.ModelServing{
+			Spec: workloadv1alpha1.ModelServingSpec{},
+			Status: workloadv1alpha1.ModelServingStatus{
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(workloadv1alpha1.ModelServingUpdateInProgress),
+						Status:             metav1.ConditionTrue,
+						Reason:             "GroupsUpdating",
+						Message:            SomeGroupsAreProgressing + ": [0 4], " + SomeGroupsAreUpdated + ": [0]",
+						LastTransitionTime: wentTrue,
+					},
+				},
+			},
+		}
+
+		// The rollout finishes: nothing is progressing, so Available goes True.
+		shouldUpdate := SetCondition(ms, []int{}, []int{0, 1, 2, 3}, []int{})
+		assert.True(t, shouldUpdate)
+
+		updating := meta.FindStatusCondition(ms.Status.Conditions, string(workloadv1alpha1.ModelServingUpdateInProgress))
+		if assert.NotNil(t, updating) {
+			assert.Equal(t, metav1.ConditionFalse, updating.Status)
+			assert.Equal(t, "AllGroupsReady", updating.Reason)
+			assert.Equal(t, AllGroupsIsReady, updating.Message)
+			assert.True(t, updating.LastTransitionTime.After(wentTrue.Time))
+		}
+	})
 }
 
 func TestGetMaxUnavailable(t *testing.T) {
@@ -310,6 +376,43 @@ func TestGetMaxUnavailable(t *testing.T) {
 	}
 }
 
+func TestGetMaxSurge(t *testing.T) {
+	tests := []struct {
+		name     string
+		replicas int32
+		maxSurge *intstr.IntOrString
+		want     int
+		wantErr  bool
+	}{
+		{name: "defaults to zero", replicas: 5, want: 0},
+		{name: "absolute value", replicas: 5, maxSurge: ptr.To(intstr.FromInt(2)), want: 2},
+		{name: "percentage rounds up", replicas: 5, maxSurge: ptr.To(intstr.FromString("25%")), want: 2},
+		{name: "zero percent", replicas: 5, maxSurge: ptr.To(intstr.FromString("0%")), want: 0},
+		{name: "invalid percentage", replicas: 5, maxSurge: ptr.To(intstr.FromString("invalid")), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ms := &workloadv1alpha1.ModelServing{
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Replicas: &tt.replicas,
+					RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+						Type:                       workloadv1alpha1.ServingGroupRollingUpdate,
+						RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{MaxSurge: tt.maxSurge},
+					},
+				},
+			}
+			got, err := GetMaxSurge(ms)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestGetMaxUnavailableForRole(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -370,6 +473,75 @@ func TestGetMaxUnavailableForRole(t *testing.T) {
 			}
 			assert.Equal(t, tt.wantValue, gotValue)
 			assert.Equal(t, tt.wantConfigured, gotConfigured)
+		})
+	}
+}
+
+func TestGetMaxSurgeForRole(t *testing.T) {
+	tests := []struct {
+		name    string
+		role    workloadv1alpha1.Role
+		want    int
+		wantErr bool
+	}{
+		{
+			name: "unset defaults to zero",
+			role: workloadv1alpha1.Role{Name: "decode", Replicas: ptr.To[int32](4)},
+		},
+		{
+			name: "absolute value",
+			role: workloadv1alpha1.Role{
+				Name:     "decode",
+				Replicas: ptr.To[int32](4),
+				RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+					MaxSurge: ptr.To(intstr.FromInt(2)),
+				},
+			},
+			want: 2,
+		},
+		{
+			name: "percentage rounds up",
+			role: workloadv1alpha1.Role{
+				Name:     "decode",
+				Replicas: ptr.To[int32](5),
+				RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+					MaxSurge: ptr.To(intstr.FromString("25%")),
+				},
+			},
+			want: 2,
+		},
+		{
+			name: "nil replicas defaults to one",
+			role: workloadv1alpha1.Role{
+				Name: "decode",
+				RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+					MaxSurge: ptr.To(intstr.FromString("50%")),
+				},
+			},
+			want: 1,
+		},
+		{
+			name: "invalid percentage",
+			role: workloadv1alpha1.Role{
+				Name:     "decode",
+				Replicas: ptr.To[int32](4),
+				RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+					MaxSurge: ptr.To(intstr.FromString("invalid")),
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := GetMaxSurgeForRole(tt.role)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

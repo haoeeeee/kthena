@@ -63,22 +63,22 @@ func (autoscaler *Autoscaler) UpdateAutoscalePolicy(autoscalePolicy *workload.Au
 }
 
 func (autoscaler *Autoscaler) Scale(ctx context.Context, podLister listerv1.PodLister, autoscalePolicy *workload.AutoscalingPolicy, currentInstancesCount int32) (int32, error) {
-	unreadyInstancesCount, readyInstancesMetrics, externalMetrics, err := autoscaler.Collector.UpdateMetrics(ctx, podLister, autoscaler.Meta.Config.Target.MetricSources)
+	unreadyInstancesCountByMetric, readyInstancesMetrics, externalMetrics, err := autoscaler.Collector.UpdateMetrics(ctx, podLister, autoscaler.Meta.Config.Target.MetricSources)
 	if err != nil {
 		klog.Errorf("update metrics error: %v", err)
 		return -1, err
 	}
 	result := scaleOneTarget(scaleOneTargetInput{
-		Status:                autoscaler.Status,
-		Behavior:              &autoscalePolicy.Spec.Behavior,
-		MinReplicas:           autoscaler.Meta.Config.MinReplicas,
-		MaxReplicas:           autoscaler.Meta.Config.MaxReplicas,
-		CurrentReplicas:       currentInstancesCount,
-		TolerancePercent:      autoscalePolicy.Spec.TolerancePercent,
-		MetricTargets:         autoscaler.Collector.MetricTargets,
-		UnreadyInstancesCount: unreadyInstancesCount,
-		ReadyInstancesMetrics: readyInstancesMetrics,
-		ExternalMetrics:       externalMetrics,
+		Status:                        autoscaler.Status,
+		Behavior:                      &autoscalePolicy.Spec.Behavior,
+		MinReplicas:                   autoscaler.Meta.Config.MinReplicas,
+		MaxReplicas:                   autoscaler.Meta.Config.MaxReplicas,
+		CurrentReplicas:               currentInstancesCount,
+		TolerancePercent:              autoscalePolicy.Spec.TolerancePercent,
+		MetricTargets:                 autoscaler.Collector.MetricTargets,
+		UnreadyInstancesCountByMetric: unreadyInstancesCountByMetric,
+		ReadyInstancesMetrics:         readyInstancesMetrics,
+		ExternalMetrics:               externalMetrics,
 	})
 	if result.Skip {
 		klog.InfoS("skip recommended instances")
@@ -91,16 +91,16 @@ func (autoscaler *Autoscaler) Scale(ctx context.Context, podLister listerv1.PodL
 }
 
 type scaleOneTargetInput struct {
-	Status                *Status
-	Behavior              *workload.AutoscalingPolicyBehavior
-	MinReplicas           int32
-	MaxReplicas           int32
-	CurrentReplicas       int32
-	TolerancePercent      int32
-	MetricTargets         algorithm.Metrics
-	UnreadyInstancesCount int32
-	ReadyInstancesMetrics algorithm.Metrics
-	ExternalMetrics       algorithm.Metrics
+	Status                        *Status
+	Behavior                      *workload.AutoscalingPolicyBehavior
+	MinReplicas                   int32
+	MaxReplicas                   int32
+	CurrentReplicas               int32
+	TolerancePercent              int32
+	MetricTargets                 algorithm.Metrics
+	UnreadyInstancesCountByMetric map[string]int32
+	ReadyInstancesMetrics         map[string][]algorithm.Metrics
+	ExternalMetrics               algorithm.Metrics
 }
 
 type scaleOneTargetResult struct {
@@ -112,14 +112,14 @@ type scaleOneTargetResult struct {
 
 func scaleOneTarget(input scaleOneTargetInput) scaleOneTargetResult {
 	instancesAlgorithm := algorithm.RecommendedInstancesAlgorithm{
-		MinInstances:          input.MinReplicas,
-		MaxInstances:          input.MaxReplicas,
-		CurrentInstancesCount: input.CurrentReplicas,
-		Tolerance:             float64(input.TolerancePercent) * 0.01,
-		MetricTargets:         input.MetricTargets,
-		UnreadyInstancesCount: input.UnreadyInstancesCount,
-		ReadyInstancesMetrics: []algorithm.Metrics{input.ReadyInstancesMetrics},
-		ExternalMetrics:       input.ExternalMetrics,
+		MinInstances:                  input.MinReplicas,
+		MaxInstances:                  input.MaxReplicas,
+		CurrentInstancesCount:         input.CurrentReplicas,
+		Tolerance:                     float64(input.TolerancePercent) * 0.01,
+		MetricTargets:                 input.MetricTargets,
+		UnreadyInstancesCountByMetric: input.UnreadyInstancesCountByMetric,
+		ReadyInstancesMetrics:         input.ReadyInstancesMetrics,
+		ExternalMetrics:               input.ExternalMetrics,
 	}
 	recommendedReplicas, skip := instancesAlgorithm.GetRecommendedInstances()
 	if skip {

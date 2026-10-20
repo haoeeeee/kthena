@@ -17,6 +17,7 @@ limitations under the License.
 package auth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/lestrrat-go/jwx/v3/jwt"
 	"github.com/stretchr/testify/assert"
+	"k8s.io/klog/v2"
 
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins/conf"
 )
@@ -118,6 +120,46 @@ func TestNewJWTAuthenticatorConfig(t *testing.T) {
 		assert.True(t, validator.IsEnabled())
 		// Clean up the validator
 		validator.Close()
+	})
+
+	t.Run("neither issuer nor audiences set", func(t *testing.T) {
+		state := klog.CaptureState()
+		defer state.Restore()
+		var logBuffer bytes.Buffer
+		klog.LogToStderr(false)
+		klog.SetOutput(&logBuffer)
+
+		config := &conf.RouterConfiguration{
+			Auth: conf.AuthenticationConfig{
+				JwksUri: "invalid-url",
+			},
+		}
+		validator := NewJWTAuthenticator(config)
+		defer validator.Close()
+		klog.Flush()
+
+		assert.Contains(t, logBuffer.String(), "auth.issuer and auth.audiences are both unset",
+			"a router that scopes tokens by nothing but the JWKS should say so at startup")
+	})
+
+	t.Run("audiences alone is enough to stay quiet", func(t *testing.T) {
+		state := klog.CaptureState()
+		defer state.Restore()
+		var logBuffer bytes.Buffer
+		klog.LogToStderr(false)
+		klog.SetOutput(&logBuffer)
+
+		config := &conf.RouterConfiguration{
+			Auth: conf.AuthenticationConfig{
+				JwksUri:   "invalid-url",
+				Audiences: []string{"kthena"},
+			},
+		}
+		validator := NewJWTAuthenticator(config)
+		defer validator.Close()
+		klog.Flush()
+
+		assert.NotContains(t, logBuffer.String(), "auth.issuer and auth.audiences are both unset")
 	})
 }
 
@@ -345,6 +387,21 @@ func TestValidateIssuer(t *testing.T) {
 		err := authenticator.validateIssuer(token, jwks)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid issuer")
+	})
+
+	t.Run("issuer not configured", func(t *testing.T) {
+		token := jwt.New()
+		token.Set("iss", "https://any-issuer.example.com")
+		jwks := &Jwks{}
+		err := authenticator.validateIssuer(token, jwks)
+		assert.NoError(t, err)
+	})
+
+	t.Run("issuer not configured and token has no issuer claim", func(t *testing.T) {
+		token := jwt.New()
+		jwks := &Jwks{}
+		err := authenticator.validateIssuer(token, jwks)
+		assert.NoError(t, err)
 	})
 }
 

@@ -6,7 +6,7 @@ metadata:
 spec:
   workloadSelector:
     matchLabels:
-      app: deepseek-r1-1-5b
+      modelserving.volcano.sh/name: deepseek-r1-1-5b
     pdGroup:
       groupKey: "modelserving.volcano.sh/group-name"
       prefillLabels:

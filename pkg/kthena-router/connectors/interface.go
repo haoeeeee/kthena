@@ -17,6 +17,8 @@ limitations under the License.
 package connectors
 
 import (
+	"time"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -26,8 +28,9 @@ type KVConnector interface {
 	Name() string
 
 	// Proxy executes the complete prefill-decode flow with KV cache coordination.
+	// timeout bounds upstream requests without truncating streaming decode responses.
 	// hooks carries optional on-flight counter callbacks for the prefill and decode
 	// pods; pass nil when not needed.
 	// Returns the number of output tokens consumed, or error if the operation fails.
-	Proxy(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *OnFlightHooks) (int, error)
+	Proxy(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, timeout time.Duration, hooks *OnFlightHooks) (int, error)
 }

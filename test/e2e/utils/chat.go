@@ -271,7 +271,7 @@ func SendRouterChatRequests(t *testing.T, routerChatURL, modelName, prompt strin
 	messages := []ChatMessage{NewChatMessage("user", prompt)}
 	for i := 0; i < count; i++ {
 		resp := SendChatRequestWithRetryQuiet(t, routerChatURL, modelName, messages, nil)
-		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", resp.Body)
 	}
 }
 

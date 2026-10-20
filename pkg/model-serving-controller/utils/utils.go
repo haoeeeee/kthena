@@ -84,6 +84,10 @@ func GenerateRoleID(roleName string, idx int) string {
 }
 
 func GenerateControllerRevisionName(msName, revision string) string {
+	// Match the prefix bound used by Kubernetes controller history.
+	if len(msName) > 223 {
+		msName = msName[:223]
+	}
 	return msName + "-" + revision
 }
 
@@ -415,43 +419,48 @@ func newCondition(condType workloadv1alpha1.ModelServingConditionType, message s
 }
 
 func SetCondition(ms *workloadv1alpha1.ModelServing, progressingGroups, updatedGroups, currentGroups []int) bool {
-	var newCond metav1.Condition
-	found := false
-	shouldUpdate := false
-
 	partition := 0
 	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.RollingUpdateConfiguration != nil && ms.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition != nil {
 		p := ms.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition
 		if p.Type == intstr.Int {
 			partition = int(p.IntVal)
 		} else if ms.Spec.Replicas != nil {
-			replicas := int(*ms.Spec.Replicas)
-			partitionValue, err := intstr.GetScaledValueFromIntOrPercent(p, replicas, true)
-			if err != nil {
-				klog.ErrorS(err, "Failed to get partition from RollingUpdateConfiguration; defaulting to 0",
-					"modelServingNamespace", ms.Namespace,
-					"modelServingName", ms.Name,
-					"partition", p.String())
-			} else {
-				partition = partitionValue
-			}
+			partition, _ = intstr.GetScaledValueFromIntOrPercent(p, int(*ms.Spec.Replicas), true)
 		}
 	}
+	return SetConditionWithRolloutState(ms, progressingGroups, updatedGroups, currentGroups, len(progressingGroups) > 0 && len(currentGroups) > partition)
+}
 
-	// If progressingGroups is empty, all groups are running. In addition, we still need to check revision.
-	// But if the group's revision doesn't meet the requirements, then the group's status will change to deleting,
-	// so when all groups are running, it means that the revision meets the requirements as well.
-	if len(progressingGroups) == 0 {
+// SetConditionWithRolloutState updates the mutually exclusive availability and
+// progress conditions using the controller's ordinal-aware rollout predicate.
+func SetConditionWithRolloutState(ms *workloadv1alpha1.ModelServing, progressingGroups, updatedGroups, currentGroups []int, rolloutActive bool) bool {
+	return SetConditionWithRolloutAndProgressState(
+		ms, progressingGroups, updatedGroups, currentGroups, rolloutActive, len(progressingGroups) > 0,
+	)
+}
+
+// SetConditionWithRolloutAndProgressState distinguishes a template rollout
+// from other reconciliation work such as initial creation or replica scaling.
+func SetConditionWithRolloutAndProgressState(
+	ms *workloadv1alpha1.ModelServing,
+	progressingGroups, updatedGroups, currentGroups []int,
+	rolloutActive, progressActive bool,
+) bool {
+	var newCond metav1.Condition
+	found := false
+	shouldUpdate := false
+
+	if rolloutActive {
+		message := SomeGroupsAreUpdated + ": " + fmt.Sprintf("%v", updatedGroups)
+		if len(progressingGroups) > 0 {
+			message = SomeGroupsAreProgressing + ": " + fmt.Sprintf("%v", progressingGroups) + ", " + message
+		}
+		newCond = newCondition(workloadv1alpha1.ModelServingUpdateInProgress, message)
+	} else if !progressActive {
 		newCond = newCondition(workloadv1alpha1.ModelServingAvailable, AllGroupsIsReady)
 	} else {
 		message := SomeGroupsAreProgressing + ": " + fmt.Sprintf("%v", progressingGroups)
-		// If the number of current groups is greater than the Partition, modelServing is still updating.
-		if len(currentGroups) > partition {
-			message = message + ", " + SomeGroupsAreUpdated + ": " + fmt.Sprintf("%v", updatedGroups)
-			newCond = newCondition(workloadv1alpha1.ModelServingUpdateInProgress, message)
-		} else {
-			newCond = newCondition(workloadv1alpha1.ModelServingProgressing, message)
-		}
+		newCond = newCondition(workloadv1alpha1.ModelServingProgressing, message)
 	}
 
 	newCond.LastTransitionTime = metav1.Now()
@@ -466,6 +475,9 @@ func SetCondition(ms *workloadv1alpha1.ModelServing, progressingGroups, updatedG
 			// Available and progressing/updateInprogress are not allowed to be true at the same time.
 			if exclusiveConditionTypes(curCondition, newCond) && curCondition.Status == metav1.ConditionTrue && newCond.Status == metav1.ConditionTrue {
 				ms.Status.Conditions[i].Status = metav1.ConditionFalse
+				ms.Status.Conditions[i].LastTransitionTime = newCond.LastTransitionTime
+				ms.Status.Conditions[i].Reason = newCond.Reason
+				ms.Status.Conditions[i].Message = newCond.Message
 				shouldUpdate = true
 			}
 		}
@@ -601,6 +613,22 @@ func GetMaxUnavailable(ms *workloadv1alpha1.ModelServing) (int, error) {
 	return intstr.GetScaledValueFromIntOrPercent(&maxUnavailable, replicas, false)
 }
 
+// GetMaxSurge resolves the ServingGroup surge budget against the latest
+// desired replica count. Percentage values are rounded up.
+func GetMaxSurge(ms *workloadv1alpha1.ModelServing) (int, error) {
+	maxSurge := intstr.FromInt(0)
+	if ms.Spec.Replicas == nil {
+		return 0, fmt.Errorf("replicas must be set")
+	}
+	replicas := int(*ms.Spec.Replicas)
+	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.RollingUpdateConfiguration != nil {
+		if ms.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxSurge != nil {
+			maxSurge = *ms.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxSurge
+		}
+	}
+	return intstr.GetScaledValueFromIntOrPercent(&maxSurge, replicas, true)
+}
+
 func GetMaxUnavailableForRole(role workloadv1alpha1.Role) (int, bool, error) {
 	if role.MaxUnavailable == nil {
 		return 0, false, nil
@@ -611,4 +639,21 @@ func GetMaxUnavailableForRole(role workloadv1alpha1.Role) (int, bool, error) {
 	}
 	maxUnavailable, err := intstr.GetScaledValueFromIntOrPercent(role.MaxUnavailable, replicas, false)
 	return maxUnavailable, true, err
+}
+
+// GetMaxSurgeForRole resolves a Role's surge budget against its latest desired
+// replica count. Percentage values are rounded up.
+func GetMaxSurgeForRole(role workloadv1alpha1.Role) (int, error) {
+	if role.MaxSurge == nil {
+		return 0, nil
+	}
+	replicas := roleReplicas(role)
+	return intstr.GetScaledValueFromIntOrPercent(role.MaxSurge, replicas, true)
+}
+
+func roleReplicas(role workloadv1alpha1.Role) int {
+	if role.Replicas == nil {
+		return 1
+	}
+	return int(*role.Replicas)
 }
