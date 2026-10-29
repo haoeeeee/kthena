@@ -65,7 +65,11 @@ func (n *NIXLConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, pr
 
 	req := c.Request
 	prefillBody := cloneReqBody(reqBody)
-	n.prefillRequest = n.buildPrefillRequest(c, req, prefillBody)
+	var buildErr error
+	n.prefillRequest, buildErr = n.buildPrefillRequest(c, req, prefillBody)
+	if buildErr != nil {
+		return 0, &NonRetryableError{Err: fmt.Errorf("failed to build prefill request: %w", buildErr)}
+	}
 	decodeBody := cloneReqBody(reqBody)
 	n.decodeRequestBody = AddTokenUsage(c, decodeBody)
 
@@ -97,6 +101,12 @@ func (n *NIXLConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, pr
 		return 0, err
 	}
 
+	// 2. send decode request
+	decodeReq, buildErr := n.buildDecodeRequest(c, n.decodeRequestBody, kvTransferParams)
+	if buildErr != nil {
+		return 0, &NonRetryableError{Err: fmt.Errorf("failed to build decode request: %w", buildErr)}
+	}
+
 	// --- Decode phase ---
 	if metricsRecorder != nil {
 		metricsRecorder.StartDecodePhase()
@@ -106,8 +116,6 @@ func (n *NIXLConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, pr
 		hooks.IncrDecode()
 	}
 
-	// 2. send decode request
-	decodeReq := n.buildDecodeRequest(c, n.decodeRequestBody, kvTransferParams)
 	result, decodeErr := n.decode(c, decodeReq, decodeAddr, timeout, rt)
 
 	if hooks != nil && hooks.DecrDecode != nil {
@@ -164,20 +172,19 @@ func (n *NIXLConnector) prefill(req *http.Request, prefillAddr string, timeout t
 	return kvTransferParams, nil
 }
 
-func (n *NIXLConnector) buildDecodeRequest(c *gin.Context, reqBody map[string]interface{}, kvTransferParams interface{}) *http.Request {
+func (n *NIXLConnector) buildDecodeRequest(c *gin.Context, reqBody map[string]interface{}, kvTransferParams interface{}) (*http.Request, error) {
 	reqBody["kv_transfer_params"] = kvTransferParams
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to marshal decode request body: %w", err)
 	}
 
-	// build request
 	reqCopy := c.Request.Clone(c.Request.Context())
 	reqCopy.URL.Scheme = "http"
 	reqCopy.Body = io.NopCloser(bytes.NewBuffer(body))
 	reqCopy.ContentLength = int64(len(body))
 
-	return reqCopy
+	return reqCopy, nil
 }
 
 // decode send decode request with streaming response
@@ -199,7 +206,7 @@ func cloneReqBody(reqBody map[string]interface{}) map[string]interface{} {
 	return clone
 }
 
-func (n *NIXLConnector) buildPrefillRequest(c *gin.Context, req *http.Request, reqBody map[string]interface{}) *http.Request {
+func (n *NIXLConnector) buildPrefillRequest(c *gin.Context, req *http.Request, reqBody map[string]interface{}) (*http.Request, error) {
 	// Prepare the body for a generic prefill request.
 	preparePrefillBody(reqBody, responsesPrefillPath(c, req))
 
@@ -211,8 +218,7 @@ func (n *NIXLConnector) buildPrefillRequest(c *gin.Context, req *http.Request, r
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		klog.Errorf("Failed to marshal prefill request body: %v", err)
-		return nil
+		return nil, fmt.Errorf("failed to marshal prefill request body: %w", err)
 	}
 
 	prefillReq := req.Clone(req.Context())
@@ -220,5 +226,5 @@ func (n *NIXLConnector) buildPrefillRequest(c *gin.Context, req *http.Request, r
 	prefillReq.Body = io.NopCloser(bytes.NewBuffer(body))
 	prefillReq.ContentLength = int64(len(body))
 
-	return prefillReq
+	return prefillReq, nil
 }

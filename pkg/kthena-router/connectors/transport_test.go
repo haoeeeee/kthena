@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -270,13 +271,15 @@ func TestBuildPrefillRequest(t *testing.T) {
 			// Create a test HTTP request
 			originalReq := httptest.NewRequest("POST", "/test", nil)
 
-			result := buildPrefillRequest(nil, originalReq, tt.modelRequest)
+			result, err := buildPrefillRequest(nil, originalReq, tt.modelRequest)
 
 			if tt.expectNil {
+				assert.Error(t, err)
 				assert.Nil(t, result)
 				return
 			}
 
+			require.NoError(t, err)
 			require.NotNil(t, result)
 
 			// Verify the request body was modified correctly
@@ -325,6 +328,18 @@ func TestPreparePrefillBodyProtocolAware(t *testing.T) {
 			want: map[string]interface{}{"model": "m", "max_tokens": 1, "max_completion_tokens": 1},
 		},
 		{
+			name: "chat completions caps min_tokens alongside max_tokens",
+			path: "/v1/chat/completions",
+			in:   map[string]interface{}{"model": "m", "max_tokens": 512, "min_tokens": 512},
+			want: map[string]interface{}{"model": "m", "max_tokens": 1, "min_tokens": 1},
+		},
+		{
+			name: "chat completions caps min_completion_tokens when present",
+			path: "/v1/chat/completions",
+			in:   map[string]interface{}{"model": "m", "min_completion_tokens": 100},
+			want: map[string]interface{}{"model": "m", "max_tokens": 1, "min_completion_tokens": 1},
+		},
+		{
 			name: "legacy/non-v1 path keeps chat completions behavior",
 			path: "/test",
 			in:   map[string]interface{}{"model": "m", "stream": true},
@@ -363,7 +378,8 @@ func TestBuildPrefillRequestResponsesAPI(t *testing.T) {
 		"previous_response_id": "resp_1",
 	}
 
-	result := buildPrefillRequest(nil, req, modelRequest)
+	result, err := buildPrefillRequest(nil, req, modelRequest)
+	require.NoError(t, err)
 	require.NotNil(t, result)
 
 	body, err := io.ReadAll(result.Body)
@@ -398,7 +414,8 @@ func TestBuildPrefillRequestResponsesAPIRewrittenToCanonicalPath(t *testing.T) {
 		"model": "m", "input": "hi", "stream": true,
 	}
 
-	result := buildPrefillRequest(c, req, modelRequest)
+	result, err := buildPrefillRequest(c, req, modelRequest)
+	require.NoError(t, err)
 	require.NotNil(t, result)
 
 	body, err := io.ReadAll(result.Body)
@@ -509,7 +526,8 @@ func TestBuildDecodeRequest(t *testing.T) {
 			// Create a test HTTP request
 			originalReq := httptest.NewRequest("POST", "/test", nil)
 
-			result := BuildDecodeRequest(c, originalReq, tt.modelRequest)
+			result, err := BuildDecodeRequest(c, originalReq, tt.modelRequest)
+			require.NoError(t, err)
 			require.NotNil(t, result)
 
 			// Verify the request body was modified correctly
@@ -551,10 +569,11 @@ func TestBuildDecodeRequestChatCompletionsInjectsUsage(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	originalReq := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 
-	result := BuildDecodeRequest(c, originalReq, map[string]interface{}{
+	result, err := BuildDecodeRequest(c, originalReq, map[string]interface{}{
 		"model":  "test-model",
 		"stream": true,
 	})
+	require.NoError(t, err)
 	require.NotNil(t, result)
 
 	body, err := io.ReadAll(result.Body)
@@ -595,7 +614,8 @@ func TestBuildDecodeRequestResponsesAPI(t *testing.T) {
 			req := httptest.NewRequest("POST", "/v1/responses", nil)
 
 			modelRequest := map[string]interface{}{"model": "gpt-4o", "input": "hello", "stream": stream}
-			result := BuildDecodeRequest(c, req, modelRequest)
+			result, err := BuildDecodeRequest(c, req, modelRequest)
+			require.NoError(t, err)
 			require.NotNil(t, result)
 
 			body, err := io.ReadAll(result.Body)
@@ -618,7 +638,8 @@ func TestBuildDecodeRequestResponsesAPI(t *testing.T) {
 		// modelRequest mirrors the parsed raw body; model is unchanged.
 		modelRequest := decode(t, rawBody)
 
-		result := BuildDecodeRequest(c, req, modelRequest)
+		result, err := BuildDecodeRequest(c, req, modelRequest)
+		require.NoError(t, err)
 		require.NotNil(t, result)
 
 		body, err := io.ReadAll(result.Body)
@@ -636,7 +657,8 @@ func TestBuildDecodeRequestResponsesAPI(t *testing.T) {
 		modelRequest := decode(t, rawBody)
 		modelRequest["model"] = "upstream-model" // router rewrote the model
 
-		result := BuildDecodeRequest(c, req, modelRequest)
+		result, err := BuildDecodeRequest(c, req, modelRequest)
+		require.NoError(t, err)
 		require.NotNil(t, result)
 
 		body, err := io.ReadAll(result.Body)
@@ -663,7 +685,8 @@ func TestBuildDecodeRequestResponsesAPI(t *testing.T) {
 		req := httptest.NewRequest("POST", "/v1/responses", nil)
 
 		modelRequest := map[string]interface{}{"model": "gpt-4o", "input": "hello", "previous_response_id": "resp_1"}
-		result := BuildDecodeRequest(c, req, modelRequest)
+		result, err := BuildDecodeRequest(c, req, modelRequest)
+		require.NoError(t, err)
 		require.NotNil(t, result)
 
 		body, err := io.ReadAll(result.Body)
@@ -1236,4 +1259,86 @@ func TestDecoderProxyTimeoutDoesNotTruncateStream(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Contains(t, w.Body.String(), "data: [DONE]")
+}
+
+type marshalFailer struct{}
+
+func (marshalFailer) MarshalJSON() ([]byte, error) {
+	return nil, fmt.Errorf("intentional marshal failure")
+}
+
+func TestBuildPrefillRequestMarshalError(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	modelRequest := map[string]interface{}{
+		"model": marshalFailer{},
+	}
+
+	result, err := buildPrefillRequest(nil, req, modelRequest)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to marshal prefill request body")
+	assert.Nil(t, result)
+}
+
+func TestBuildDecodeRequestMarshalError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "chat completions path", path: "/v1/chat/completions"},
+		{name: "responses path", path: "/v1/responses"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			req := httptest.NewRequest("POST", tt.path, nil)
+
+			modelRequest := map[string]interface{}{
+				"model": marshalFailer{},
+			}
+
+			result, err := BuildDecodeRequest(c, req, modelRequest)
+
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "failed to marshal decode request body")
+			assert.Nil(t, result)
+		})
+	}
+}
+
+func TestBuildPrefillRequestContextPreservation(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "sentinel")
+	req, err := http.NewRequestWithContext(ctx, "POST", "/v1/chat/completions", nil)
+	require.NoError(t, err)
+
+	result, err := buildPrefillRequest(nil, req, map[string]interface{}{"model": "m"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	assert.Equal(t, "sentinel", result.Context().Value(contextKey{}),
+		"request context must be preserved by buildPrefillRequest")
+}
+
+func TestBuildDecodeRequestContextPreservation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "sentinel")
+	req, err := http.NewRequestWithContext(ctx, "POST", "/v1/chat/completions", nil)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	result, buildErr := BuildDecodeRequest(c, req, map[string]interface{}{"model": "m"})
+	require.NoError(t, buildErr)
+	require.NotNil(t, result)
+
+	assert.Equal(t, "sentinel", result.Context().Value(contextKey{}),
+		"request context must be preserved by BuildDecodeRequest")
 }

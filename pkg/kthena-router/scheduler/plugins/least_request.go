@@ -17,6 +17,7 @@ limitations under the License.
 package plugins
 
 import (
+	"fmt"
 	"math"
 	"slices"
 
@@ -45,6 +46,25 @@ type LeastRequestArgs struct {
 	MaxWaitingRequests int `yaml:"maxWaitingRequests,omitempty"`
 }
 
+// ValidateLeastRequestArgs validates least-request plugin arguments supplied
+// through router configuration.
+func ValidateLeastRequestArgs(pluginArg runtime.RawExtension) error {
+	if len(pluginArg.Raw) == 0 {
+		return nil
+	}
+
+	var leastRequestArgs LeastRequestArgs
+	if err := yaml.Unmarshal(pluginArg.Raw, &leastRequestArgs); err != nil {
+		return fmt.Errorf("unmarshal least-request arguments: %w", err)
+	}
+
+	if leastRequestArgs.MaxWaitingRequests < 0 {
+		return fmt.Errorf("maxWaitingRequests must not be negative, got %d",
+			leastRequestArgs.MaxWaitingRequests)
+	}
+	return nil
+}
+
 func NewLeastRequest(pluginArg runtime.RawExtension) *LeastRequest {
 	var leastRequestArgs LeastRequestArgs
 	if pluginArg.Raw == nil || yaml.Unmarshal(pluginArg.Raw, &leastRequestArgs) != nil {
@@ -53,7 +73,7 @@ func NewLeastRequest(pluginArg runtime.RawExtension) *LeastRequest {
 			MaxWaitingRequests: 10,
 		}
 	}
-	if leastRequestArgs.MaxWaitingRequests == 0 {
+	if leastRequestArgs.MaxWaitingRequests <= 0 {
 		leastRequestArgs.MaxWaitingRequests = 10
 	}
 

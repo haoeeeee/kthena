@@ -190,7 +190,9 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration, rt h
 // request: it disables streaming and caps the prefill output to a single token.
 // The output-cap field is protocol-specific: the OpenAI Responses API uses
 // max_output_tokens, while Chat Completions uses max_tokens (and
-// max_completion_tokens when the client already set it).
+// max_completion_tokens when the client already set it). min_tokens (and
+// min_completion_tokens when set) are capped to 1 as well to avoid a
+// min_tokens > max_tokens conflict.
 func preparePrefillBody(reqBody map[string]interface{}, path string) {
 	delete(reqBody, "stream")
 	delete(reqBody, "stream_options")
@@ -201,18 +203,24 @@ func preparePrefillBody(reqBody map[string]interface{}, path string) {
 	}
 
 	reqBody["max_tokens"] = 1
+	if reqBody["min_tokens"] != nil {
+		reqBody["min_tokens"] = 1
+	}
 	if reqBody["max_completion_tokens"] != nil {
 		reqBody["max_completion_tokens"] = 1
 	}
+	if reqBody["min_completion_tokens"] != nil {
+		reqBody["min_completion_tokens"] = 1
+	}
 }
 
-func buildPrefillRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) *http.Request {
+func buildPrefillRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) (*http.Request, error) {
 	// In PD disaggregated mode, we need to send a prefill request to the prefill pod with non stream mode.
 	preparePrefillBody(modelRequest, responsesPrefillPath(c, req))
 
 	body, err := json.Marshal(modelRequest)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to marshal prefill request body: %w", err)
 	}
 
 	// build request
@@ -221,10 +229,10 @@ func buildPrefillRequest(c *gin.Context, req *http.Request, modelRequest map[str
 	reqCopy.Body = io.NopCloser(bytes.NewBuffer(body))
 	reqCopy.ContentLength = int64(len(body))
 
-	return reqCopy
+	return reqCopy, nil
 }
 
-func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) *http.Request {
+func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) (*http.Request, error) {
 	var body []byte
 	if isResponsesRequest(c, req) {
 		// Chat Completions can opt into usage reporting via stream_options.include_usage.
@@ -235,14 +243,14 @@ func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[stri
 		// re-marshalling it preserves all Responses fields, including opaque ones.
 		marshaled, err := json.Marshal(modelRequest)
 		if err != nil {
-			return nil
+			return nil, fmt.Errorf("failed to marshal decode request body: %w", err)
 		}
 		body = marshaled
 	} else {
 		modelRequest = AddTokenUsage(c, modelRequest)
 		marshaled, err := json.Marshal(modelRequest)
 		if err != nil {
-			return nil
+			return nil, fmt.Errorf("failed to marshal decode request body: %w", err)
 		}
 		body = marshaled
 	}
@@ -252,7 +260,7 @@ func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[stri
 	reqCopy.Body = io.NopCloser(bytes.NewBuffer(body))
 	reqCopy.ContentLength = int64(len(body))
 
-	return reqCopy
+	return reqCopy, nil
 }
 
 // isResponsesPath reports whether p targets the OpenAI Responses API endpoint.

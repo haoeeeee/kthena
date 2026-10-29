@@ -1025,6 +1025,7 @@ func (r *Router) proxyModelEndpoint(
 ) error {
 	// Mark start of upstream processing
 	accesslog.MarkUpstreamStart(c)
+	defer accesslog.MarkUpstreamEnd(c)
 
 	// Get metrics recorder from context
 	var metricsRecorder *metrics.RequestMetricsRecorder
@@ -1049,11 +1050,14 @@ func (r *Router) proxyModelEndpoint(
 			effRT = rt
 		}
 		// build request
-		decodeRequest := connectors.BuildDecodeRequest(c, req, modelRequest)
+		decodeRequest, err := connectors.BuildDecodeRequest(c, req, modelRequest)
+		if err != nil {
+			return fmt.Errorf("failed to build decode request: %w", err)
+		}
 		stream := isStreaming(modelRequest)
 		modelName := ctx.Model
 		userID := c.GetString(common.UserIdKey)
-		err := r.proxy(c, decodeRequest, ctx, stream, port, timeout, effRT, func(usage providers.TokenUsage) {
+		err = r.proxy(c, decodeRequest, ctx, stream, port, timeout, effRT, func(usage providers.TokenUsage) {
 			if usage.TotalTokens <= 0 {
 				return
 			}
@@ -1077,8 +1081,6 @@ func (r *Router) proxyModelEndpoint(
 			_ = r.store.UpdateTokenCount(userID, modelName, float64(usage.PromptTokens), float64(usage.CompletionTokens))
 		})
 
-		// Mark end of upstream processing
-		accesslog.MarkUpstreamEnd(c)
 		return err
 	}
 
@@ -1573,6 +1575,10 @@ func (r *Router) proxyToPDDisaggregated(
 			klog.Errorf("proxy failed for prefill pod %s, decode pod %s: %v",
 				prefillPod.Name, decodePod.Name, err)
 			if c.Writer.Written() {
+				return err
+			}
+			var nonRetryable *connectors.NonRetryableError
+			if errors.As(err, &nonRetryable) {
 				return err
 			}
 			var responsesErr *connectors.DecodeUpstreamError

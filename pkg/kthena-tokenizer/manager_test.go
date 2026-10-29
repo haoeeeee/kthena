@@ -185,3 +185,20 @@ func TestRendererManagerStartupRestartBudget(t *testing.T) {
 	require.Len(t, infos, 1)
 	assert.Equal(t, 2, infos[0].Restarts)
 }
+
+func TestRendererManagerUnloadsRendererThatNeverStarted(t *testing.T) {
+	// Removing a model whose renderer failed to spawn must not panic: the
+	// renderer has no process, so there is nothing to cancel.
+	cfg := testConfig(t, 18360, map[string]string{"served": "some/source"})
+	cfg.RendererCommand = []string{filepath.Join(t.TempDir(), "no-such-renderer")}
+	m := NewRendererManager(cfg)
+	defer m.shutdown()
+
+	m.SetModels(map[string]struct{}{"served": {}})
+	waitForStatus(t, m, "served", StatusFailed)
+
+	require.NotPanics(t, func() {
+		m.SetModels(map[string]struct{}{})
+	})
+	assert.Empty(t, m.Snapshot())
+}

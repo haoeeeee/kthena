@@ -84,6 +84,10 @@ curl -v http://$ROUTER_IP:80/v1/chat/completions \
   -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+:::tip Full ModelServing configuration reference
+To see every field that `ModelServing` supports in one place, refer to the [full configuration example](https://github.com/volcano-sh/kthena/blob/main/examples/model-serving/full-configuration.yaml) to explore how the controller works.
+:::
+
 ## ModelBooster
 
 :::warning Deprecated example

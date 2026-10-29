@@ -127,7 +127,10 @@ func (m *RendererManager) SetModels(models map[string]struct{}) {
 	for model, r := range m.renderers {
 		if _, ok := models[model]; !ok {
 			klog.Infof("Unloading tokenizer for model %s", model)
-			r.cancel()
+			// cancel is unset when the renderer never spawned.
+			if r.cancel != nil {
+				r.cancel()
+			}
 			delete(m.renderers, model)
 		}
 	}

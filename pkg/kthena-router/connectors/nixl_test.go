@@ -19,6 +19,7 @@ package connectors
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -429,7 +430,10 @@ func TestNIXLBuildPrefillRequestResponsesAPIURLRewrite(t *testing.T) {
 			reqBody := map[string]interface{}{"model": "m", "stream": true}
 
 			connector := NewNIXLConnector().(*NIXLConnector)
-			result := connector.buildPrefillRequest(c, req, reqBody)
+			result, err := connector.buildPrefillRequest(c, req, reqBody)
+			if err != nil {
+				t.Fatalf("buildPrefillRequest returned error: %v", err)
+			}
 			if result == nil {
 				t.Fatal("buildPrefillRequest returned nil")
 			}
@@ -568,5 +572,124 @@ func TestNIXLConnectorReqBodyNotMutated(t *testing.T) {
 		if _, existed := keysBefore[k]; !existed {
 			t.Errorf("Proxy() mutated caller reqBody by adding key %q", k)
 		}
+	}
+}
+
+func TestNIXLBuildDecodeRequestMarshalError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	req, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+
+	connector := NewNIXLConnector().(*NIXLConnector)
+	result, err := connector.buildDecodeRequest(c, map[string]interface{}{"model": marshalFailer{}}, nil)
+
+	if err == nil {
+		t.Fatal("expected error from buildDecodeRequest on marshal failure, got nil")
+	}
+	if result != nil {
+		t.Errorf("expected nil request on error, got %v", result)
+	}
+}
+
+func TestNIXLProxyPrefillBuildErrorIsNonRetryable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	req, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+
+	connector := NewNIXLConnector()
+	reqBody := map[string]interface{}{"model": marshalFailer{}}
+
+	_, err := connector.Proxy(c, reqBody, "127.0.0.1:1", "127.0.0.1:2", 0, nil)
+	if err == nil {
+		t.Fatal("expected error from Proxy when prefill request build fails")
+	}
+	var nonRetryable *NonRetryableError
+	if !errors.As(err, &nonRetryable) {
+		t.Errorf("expected NonRetryableError, got %T: %v", err, err)
+	}
+}
+
+func TestNIXLProxyPrefillBuildErrorDoesNotLeakHooks(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	req, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+
+	var prefillIncr, prefillDecr, decodeIncr, decodeDecr int
+	hooks := &OnFlightHooks{
+		IncrPrefill: func() { prefillIncr++ },
+		DecrPrefill: func() { prefillDecr++ },
+		IncrDecode:  func() { decodeIncr++ },
+		DecrDecode:  func() { decodeDecr++ },
+	}
+
+	connector := NewNIXLConnector()
+	reqBody := map[string]interface{}{"model": marshalFailer{}}
+
+	_, err := connector.Proxy(c, reqBody, "127.0.0.1:1", "127.0.0.1:2", 0, hooks)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if prefillIncr != 0 {
+		t.Errorf("IncrPrefill called %d times, want 0", prefillIncr)
+	}
+	if prefillDecr != 0 {
+		t.Errorf("DecrPrefill called %d times, want 0", prefillDecr)
+	}
+	if decodeIncr != 0 {
+		t.Errorf("IncrDecode called %d times, want 0", decodeIncr)
+	}
+	if decodeDecr != 0 {
+		t.Errorf("DecrDecode called %d times, want 0", decodeDecr)
+	}
+}
+
+func TestNIXLProxyDecodePhaseHooksAreCalledAndBalanced(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	prefillServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"kv_transfer_params": nil})
+	}))
+	defer prefillServer.Close()
+
+	req, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+
+	var prefillIncr, prefillDecr, decodeIncr, decodeDecr int
+	hooks := &OnFlightHooks{
+		IncrPrefill: func() { prefillIncr++ },
+		DecrPrefill: func() { prefillDecr++ },
+		IncrDecode:  func() { decodeIncr++ },
+		DecrDecode:  func() { decodeDecr++ },
+	}
+
+	connector := NewNIXLConnector()
+	reqBody := map[string]interface{}{"model": "test-model"}
+
+	_, err := connector.Proxy(c, reqBody, prefillServer.Listener.Addr().String(), "127.0.0.1:1", 0, hooks)
+	if err == nil {
+		t.Fatal("expected error (decode addr unreachable)")
+	}
+	if prefillIncr != 1 {
+		t.Errorf("IncrPrefill called %d times, want 1", prefillIncr)
+	}
+	if prefillDecr != 1 {
+		t.Errorf("DecrPrefill called %d times, want 1", prefillDecr)
+	}
+	if decodeIncr != 1 {
+		t.Errorf("IncrDecode called %d times, want 1 (decode phase must be entered)", decodeIncr)
+	}
+	if decodeDecr != 1 {
+		t.Errorf("DecrDecode called %d times, want 1 (decode cleanup must run)", decodeDecr)
 	}
 }

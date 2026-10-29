@@ -201,6 +201,11 @@ func unmarshalPluginsConfig(schedulerConfig *SchedulerConfiguration) (map[string
 					return nil, fmt.Errorf("invalid %s plugin configuration: %w", pluginArg.Name, err)
 				}
 			}
+			if pluginArg.Name == plugins.LeastRequestPluginName {
+				if err := plugins.ValidateLeastRequestArgs(pluginArg.Args); err != nil {
+					return nil, fmt.Errorf("invalid %s plugin configuration: %w", pluginArg.Name, err)
+				}
+			}
 			pluginsArgMap[pluginArg.Name] = pluginArg.Args
 		}
 	}

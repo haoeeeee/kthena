@@ -261,3 +261,49 @@ func TestHandleRandomPluginConflicts(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadSchedulerConfigRejectsNegativeMaxWaitingRequests(t *testing.T) {
+	tt := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "negative", value: "-1", wantErr: true},
+		{name: "large negative", value: "-100", wantErr: true},
+		{name: "zero keeps the default", value: "0", wantErr: false},
+		{name: "positive", value: "4", wantErr: false},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "routerConfiguration.yaml")
+			config := fmt.Sprintf(`scheduler:
+  pluginConfig:
+    - name: least-request
+      args:
+        maxWaitingRequests: %s
+`, tc.value)
+			if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+				t.Fatalf("write router configuration: %v", err)
+			}
+
+			routerConfig, err := ParseRouterConfig(configPath)
+			if err != nil {
+				t.Fatalf("parse router configuration: %v", err)
+			}
+			_, _, _, err = LoadSchedulerConfig(&routerConfig.Scheduler)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected maxWaitingRequests %q to be rejected", tc.value)
+				}
+				if !strings.Contains(err.Error(), "must not be negative") {
+					t.Errorf("unexpected error %q", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("load scheduler configuration: %v", err)
+			}
+		})
+	}
+}

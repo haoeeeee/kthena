@@ -17,6 +17,7 @@ limitations under the License.
 package plugins
 
 import (
+	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -114,6 +115,53 @@ func TestLeastRequestScore(t *testing.T) {
 				if actual != expected {
 					t.Errorf("pod %s: expected score %d, got %d", podName, expected, actual)
 				}
+			}
+		})
+	}
+}
+
+func makePodWithWaiting(name string, waiting float64) *datastore.PodInfo {
+	return &datastore.PodInfo{
+		Pod:               &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}},
+		RequestWaitingNum: waiting,
+	}
+}
+
+func TestLeastRequestFilterMaxWaitingRequests(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      string
+		wantNames []string
+	}{
+		{
+			name:      "negative value falls back to the default",
+			args:      "maxWaitingRequests: -1",
+			wantNames: []string{"idle", "light"},
+		},
+		{
+			name:      "positive value is honoured",
+			args:      "maxWaitingRequests: 1",
+			wantNames: []string{"idle"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pods := []*datastore.PodInfo{
+				makePodWithWaiting("idle", 0),
+				makePodWithWaiting("light", 1),
+				makePodWithWaiting("busy", 50),
+			}
+
+			plugin := NewLeastRequest(runtime.RawExtension{Raw: []byte(tt.args)})
+			got := plugin.Filter(nil, pods)
+
+			gotNames := make([]string, 0, len(got))
+			for _, pod := range got {
+				gotNames = append(gotNames, pod.Pod.Name)
+			}
+			if !slices.Equal(gotNames, tt.wantNames) {
+				t.Errorf("expected %v to survive, got %v", tt.wantNames, gotNames)
 			}
 		})
 	}

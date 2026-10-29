@@ -4024,3 +4024,69 @@ func TestRouter_ProxyToPDDisaggregated_DecodeUpstreamError(t *testing.T) {
 		assert.Equal(t, "pod-2", w.Header().Get("X-Upstream-Pod"))
 	})
 }
+
+func TestRouter_ProxyToPDDisaggregated_NonRetryableError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.1"},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-2", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.2"},
+	}
+	info1 := &datastore.PodInfo{Pod: pod1}
+	info2 := &datastore.PodInfo{Pod: pod2}
+
+	t.Run("non-retryable error is returned immediately without retrying", func(t *testing.T) {
+		store := datastore.New()
+		router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
+		ctx := &framework.Context{
+			Model:       "test-model",
+			PrefillPods: []*datastore.PodInfo{info1, info2},
+			DecodePods:  []*datastore.PodInfo{info1, info2},
+		}
+
+		mockConnector := &mockKVConnector{}
+		buildErr := &connectors.NonRetryableError{Err: fmt.Errorf("failed to marshal request body: json: unsupported type")}
+		mockConnector.proxyHandler = func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+			return 0, buildErr
+		}
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model"}`))
+
+		err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "test-model"}, 8000, 2*time.Second)
+
+		assert.Error(t, err)
+		var nonRetryable *connectors.NonRetryableError
+		assert.ErrorAs(t, err, &nonRetryable, "error must be a NonRetryableError")
+		assert.Equal(t, int32(1), mockConnector.calls.Load(), "must not retry a non-retryable error")
+	})
+
+	t.Run("transient upstream error is still retried", func(t *testing.T) {
+		store := datastore.New()
+		router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
+		ctx := &framework.Context{
+			Model:       "test-model",
+			PrefillPods: []*datastore.PodInfo{info1, info2},
+			DecodePods:  []*datastore.PodInfo{info1, info2},
+		}
+
+		mockConnector := &mockKVConnector{}
+		mockConnector.proxyHandler = func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+			return 0, fmt.Errorf("connection refused")
+		}
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model"}`))
+
+		err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "test-model"}, 8000, 2*time.Second)
+
+		assert.Error(t, err)
+		assert.Equal(t, int32(2), mockConnector.calls.Load(), "transient errors must still be retried across all pod pairs")
+	})
+}
