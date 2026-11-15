@@ -289,9 +289,9 @@ func (c *ModelServingController) updateModelServing(old, cur interface{}) {
 		return
 	}
 
-	if reflect.DeepEqual(oldms.Spec, curms.Spec) {
-		// If the spec has not changed, we do not need to reconcile.
-		klog.V(4).InfoS("Spec has not changed, skipping update", "modelServing", klog.KObj(curms))
+	if reflect.DeepEqual(oldms.Spec, curms.Spec) && !rolloutVersionChanged(oldms, curms) {
+		// Skip updates when neither the spec nor rollout protection changed.
+		klog.V(4).InfoS("Spec and rollout-version have not changed, skipping update", "modelServing", klog.KObj(curms))
 		return
 	}
 
@@ -679,10 +679,21 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 	if err := c.resumePodDeletionPlans(ctx, ms); err != nil {
 		return err
 	}
+	ms, revision, err := c.guardModelServingRollout(ctx, ms)
+	if err != nil {
+		return err
+	}
 	ctx = c.withRevisionHistory(ctx, ms)
-	revision, err := c.revisionHistory(ctx, ms).desiredRevision(ctx)
+	history := c.revisionHistory(ctx, ms)
+	history.target = revision
+	if revision == "" {
+		revision, err = history.desiredRevision(ctx)
+	}
 	if err != nil {
 		return errors.Join(fmt.Errorf("resolve desired revision: %w", err), c.scaleDownOnRevisionError(ctx, ms))
+	}
+	if err := c.saveRolloutProtectionState(ctx, ms, revision); err != nil {
+		return errors.Join(fmt.Errorf("persist rollout protection: %w", err), c.scaleDownOnRevisionError(ctx, ms))
 	}
 	if err := c.persistCoordinatedRoleRevision(ctx, ms, revision); err != nil {
 		return fmt.Errorf("failed to persist coordinated Role revision: %v", err)
@@ -2978,6 +2989,10 @@ func (c *ModelServingController) updateModelServingStatus(
 
 		if latestMS.UID != ms.UID || latestMS.Generation != ms.Generation {
 			return fmt.Errorf("ModelServing changed during status update")
+		}
+		if _, protected := rolloutVersion(ms); protected {
+			// Keep the selected template and the resourceVersion from an earlier status write.
+			latestMS = ms
 		}
 
 		// Calculate status based on latestMS
