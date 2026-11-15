@@ -169,6 +169,10 @@ func TestDisabledRecoveryNeedsNoPersistentEpisode(t *testing.T) {
 			t.Cleanup(cancel)
 			failed := pods[0].DeepCopy()
 			failed.Status.Phase = corev1.PodFailed
+			if policy == workloadv1alpha1.NoneRestartPolicy {
+				failed.Status.Phase = corev1.PodRunning
+				failed.Status.ContainerStatuses = []corev1.ContainerStatus{{RestartCount: 1}}
+			}
 			failed.Status.Conditions[0].Status = corev1.ConditionFalse
 			updateRecoveryPod(t, c, failed)
 			require.NoError(t, c.schedulePodRecovery(ctx, ms, failed))
@@ -246,7 +250,7 @@ func TestRecoveryFailedPodCreationDoesNotBypassPolicy(t *testing.T) {
 		policy workloadv1alpha1.RecoveryPolicy
 		grace  int64
 	}{
-		{workloadv1alpha1.NoneRestartPolicy, 0},
+		{workloadv1alpha1.NoneRestartPolicy, 30},
 		{workloadv1alpha1.RoleRecreate, -1},
 		{workloadv1alpha1.ServingGroupRecreate, -1},
 		{workloadv1alpha1.RoleRecreate, 30},
@@ -303,17 +307,18 @@ func TestRecoveryPolicyUnhealthyPods(t *testing.T) {
 					require.Equal(t, datastore.RoleCreating, c.store.GetRoleStatus(utils.GetNamespaceName(ms), "ms-0", "prefill", "prefill-0"))
 					require.Equal(t, datastore.ServingGroupCreating, c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), "ms-0"))
 					key := getPodGracePeriodKey(pod)
-					if policy != workloadv1alpha1.NoneRestartPolicy && grace == 0 {
+					recoveryEnabled := grace != -1 && (policy != workloadv1alpha1.NoneRestartPolicy || failure == "failed")
+					if recoveryEnabled && grace == 0 {
 						require.Eventually(t, func() bool { _, ok := c.graceMap.Load(key); return !ok }, 2*time.Second, 10*time.Millisecond)
 						require.Equal(t, []string{pod.Name}, recoveryDeletedPods(kube))
 						return
 					}
 					require.Empty(t, recoveryDeletedPods(kube))
 					_, waiting := c.graceMap.Load(key)
-					require.Equal(t, policy != workloadv1alpha1.NoneRestartPolicy && grace > 0, waiting)
+					require.Equal(t, recoveryEnabled && grace > 0, waiting)
 					// Cancel any finite wait and verify the real asynchronous task exits.
 					latest := ms.DeepCopy()
-					latest.Spec.RecoveryPolicy = workloadv1alpha1.NoneRestartPolicy
+					latest.Spec.Template.RestartGracePeriodSeconds = ptr.To[int64](-1)
 					require.NoError(t, c.modelServingsInformer.GetIndexer().Update(latest))
 					require.Eventually(t, func() bool { _, ok := c.graceMap.Load(key); return !ok }, 2*time.Second, 10*time.Millisecond)
 					require.Empty(t, recoveryDeletedPods(kube))

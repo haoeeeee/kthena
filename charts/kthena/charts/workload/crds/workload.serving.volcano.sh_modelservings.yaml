@@ -106,8 +106,8 @@ spec:
                 default: RoleRecreate
                 description: |-
                   RecoveryPolicy defines the scope of recovery after a Pod is deleted or fails
-                  to recover within restartGracePeriodSeconds. None disables proactive recovery
-                  while still allowing missing Pods to be replaced.
+                  to recover within restartGracePeriodSeconds. None leaves restarted non-failed
+                  Pods to kubelet and replaces only missing Pods.
                 enum:
                 - ServingGroupRecreate
                 - RoleRecreate
@@ -668,7 +668,8 @@ spec:
                       immediate recovery. A positive value preserves the Pod if it becomes Ready
                       before recovery is attempted. -1 disables proactive recovery, including for
                       Failed Pods; only Pod deletion triggers Role or ServingGroup recreation.
-                      Ignored when recoveryPolicy is None. Pod deletion is never delayed by this field.
+                      For recoveryPolicy None, only Failed Pods use this grace period.
+                      Pod deletion is never delayed by this field.
                     format: int64
                     minimum: -1
                     type: integer

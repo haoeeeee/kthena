@@ -60,8 +60,8 @@ type ModelServingSpec struct {
 	RolloutStrategy *RolloutStrategy `json:"rolloutStrategy,omitempty"`
 
 	// RecoveryPolicy defines the scope of recovery after a Pod is deleted or fails
-	// to recover within restartGracePeriodSeconds. None disables proactive recovery
-	// while still allowing missing Pods to be replaced.
+	// to recover within restartGracePeriodSeconds. None leaves restarted non-failed
+	// Pods to kubelet and replaces only missing Pods.
 	// +kubebuilder:default=RoleRecreate
 	// +kubebuilder:validation:Enum={ServingGroupRecreate,RoleRecreate,None}
 	// +optional
@@ -136,8 +136,8 @@ const (
 	// only the affected Role instance, including its entry and worker Pods.
 	RoleRecreate RecoveryPolicy = "RoleRecreate"
 
-	// NoneRestartPolicy disables proactive recovery, including deletion of Failed
-	// Pods. Kubelet handles container restarts according to the Pod's restartPolicy.
+	// NoneRestartPolicy leaves restarted non-failed Pods to kubelet's restartPolicy.
+	// Failed Pods are deleted after restartGracePeriodSeconds unless it is -1.
 	// Missing Pods are still replaced without restarting other Pods.
 	NoneRestartPolicy RecoveryPolicy = "None"
 )

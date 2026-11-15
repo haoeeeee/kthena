@@ -136,7 +136,8 @@ type ServingGroup struct {
 	// immediate recovery. A positive value preserves the Pod if it becomes Ready
 	// before recovery is attempted. -1 disables proactive recovery, including for
 	// Failed Pods; only Pod deletion triggers Role or ServingGroup recreation.
-	// Ignored when recoveryPolicy is None. Pod deletion is never delayed by this field.
+	// For recoveryPolicy None, only Failed Pods use this grace period.
+	// Pod deletion is never delayed by this field.
 	// +optional
 	// +kubebuilder:default=0
 	// +kubebuilder:validation:Minimum=-1

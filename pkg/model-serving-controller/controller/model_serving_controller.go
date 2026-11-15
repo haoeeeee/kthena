@@ -2184,10 +2184,11 @@ func (c *ModelServingController) handleObservedReadyPod(ms *workloadv1alpha1.Mod
 	return nil
 }
 
-// podRecoveryDisabled leaves existing Pods to kubelet or external deletion.
+// podRecoveryDisabled leaves restarted non-failed Pods to kubelet under None,
+// and preserves all Pods when restartGracePeriodSeconds is -1.
 // Missing Pods are still reconciled independently of this setting.
-func podRecoveryDisabled(ms *workloadv1alpha1.ModelServing) bool {
-	return ms.Spec.RecoveryPolicy == workloadv1alpha1.NoneRestartPolicy ||
+func podRecoveryDisabled(ms *workloadv1alpha1.ModelServing, pod *corev1.Pod) bool {
+	return (ms.Spec.RecoveryPolicy == workloadv1alpha1.NoneRestartPolicy && !utils.IsPodFailed(pod)) ||
 		(ms.Spec.Template.RestartGracePeriodSeconds != nil && *ms.Spec.Template.RestartGracePeriodSeconds == -1)
 }
 
@@ -2256,7 +2257,7 @@ func (c *ModelServingController) schedulePodRecovery(ctx context.Context, ms *wo
 		observed = current.(time.Time)
 	}
 	started := observed
-	if podRecoveryDisabled(ms) {
+	if podRecoveryDisabled(ms, errPod) {
 		c.graceMap.Delete(key)
 		return nil
 	}
@@ -2327,7 +2328,11 @@ func (c *ModelServingController) handlePodAfterGraceTime(ms *workloadv1alpha1.Mo
 			return
 		}
 		latestMS, err := c.modelServingLister.ModelServings(ms.Namespace).Get(ms.Name)
-		if err != nil || latestMS.UID != ms.UID || latestMS.DeletionTimestamp != nil || podRecoveryDisabled(latestMS) {
+		if err != nil || latestMS.UID != ms.UID || latestMS.DeletionTimestamp != nil {
+			return
+		}
+		latestPod, err := c.podsLister.Pods(ms.Namespace).Get(errPod.Name)
+		if err != nil || podRecoveryDisabled(latestMS, latestPod) {
 			return
 		}
 		delay := min(restartGraceRemaining(latestMS, started), time.Second)
@@ -2365,7 +2370,7 @@ func (c *ModelServingController) recoverPodAfterGrace(ctx context.Context, ms *w
 	if err != nil {
 		return 0, err
 	}
-	if latestMS.UID != ms.UID || latestMS.DeletionTimestamp != nil || podRecoveryDisabled(latestMS) {
+	if latestMS.UID != ms.UID || latestMS.DeletionTimestamp != nil {
 		return 0, nil
 	}
 	if remaining := restartGraceRemaining(latestMS, started); remaining > 0 {
@@ -2378,7 +2383,7 @@ func (c *ModelServingController) recoverPodAfterGrace(ctx context.Context, ms *w
 	if err != nil {
 		return 0, err
 	}
-	if latestPod.UID != pod.UID || latestPod.DeletionTimestamp != nil ||
+	if latestPod.UID != pod.UID || latestPod.DeletionTimestamp != nil || podRecoveryDisabled(latestMS, latestPod) ||
 		!utils.IsOwnedByModelServingWithUID(latestPod, ms.UID) || utils.IsPodRunningAndReady(latestPod) ||
 		(!utils.IsPodFailed(latestPod) && !utils.ContainerRestarted(latestPod)) {
 		return 0, nil

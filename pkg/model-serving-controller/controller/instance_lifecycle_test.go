@@ -509,12 +509,15 @@ func TestInstanceLifecycle_ColdStartRetainsFailedInstanceForRollout(t *testing.T
 			for _, recovery := range []string{"none", "grace-minus-one"} {
 				for _, health := range []string{"failed", "restarting", "plain-not-ready"} {
 					t.Run(fmt.Sprintf("changed=%t/%s/%s/%s", changed, mode, recovery, health), func(t *testing.T) {
-						ctx := context.Background()
+						ctx, cancel := context.WithCancel(context.Background())
+						t.Cleanup(cancel)
 						old := lifecycleMS("cold-fault", 1, 1, 0)
 						old.ResourceVersion = "1"
 						old.Spec.RolloutStrategy.Type = mode
 						old.Spec.Template.Roles[0].MaxUnavailable = ptr.To(intstr.FromInt(1))
 						old.Spec.RecoveryPolicy = api.NoneRestartPolicy
+						// Keep the Failed Pod in grace while testing rollout selection.
+						old.Spec.Template.RestartGracePeriodSeconds = ptr.To[int64](60)
 						if recovery == "grace-minus-one" {
 							old.Spec.RecoveryPolicy = api.RoleRecreate
 							old.Spec.Template.RestartGracePeriodSeconds = ptr.To[int64](-1)
@@ -527,6 +530,7 @@ func TestInstanceLifecycle_ColdStartRetainsFailedInstanceForRollout(t *testing.T
 						ms.Status.CurrentRevision = utils.ModelServingRevision(old)
 						ms.Status.UpdateRevision = utils.ModelServingRevision(ms)
 						c := lifecycleController(t, ms, old)
+						c.recoveryCtx = ctx
 						role := *old.Spec.Template.Roles[0].DeepCopy()
 						pod := utils.GenerateEntryPod(role, ms, "cold-fault-0", "prefill-0", utils.ModelServingRevision(old), utils.CalRoleTemplateHash(role))
 						pod.UID, pod.ResourceVersion = "old-fault", "5"
@@ -550,7 +554,7 @@ func TestInstanceLifecycle_ColdStartRetainsFailedInstanceForRollout(t *testing.T
 							}
 						}
 						t.Logf("health=%s observedGroup=%s reconcileError=%v", health, c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), "cold-fault-0"), lastErr)
-						require.Equal(t, changed, lifecycleDeletionMatches(c, pod), "rollout must recognize an existing unhealthy old instance after restart; None/-1 only disable proactive failure recovery")
+						require.Equal(t, changed, lifecycleDeletionMatches(c, pod), "rollout must recognize an existing unhealthy old instance during grace or disabled recovery")
 					})
 				}
 			}
@@ -567,6 +571,8 @@ func TestInstanceLifecycle_EnablingRecoveryRevisitsExistingFault(t *testing.T) {
 				ms := lifecycleMS("enable-recovery", 1, 1, 0)
 				ms.ResourceVersion = "1"
 				ms.Spec.RecoveryPolicy = api.NoneRestartPolicy
+				// A Failed Pod under None now also needs grace to remain for this transition.
+				ms.Spec.Template.RestartGracePeriodSeconds = ptr.To[int64](10000)
 				if initial != "none" {
 					ms.Spec.RecoveryPolicy = api.RoleRecreate
 					ms.Spec.Template.RestartGracePeriodSeconds = ptr.To[int64](-1)
