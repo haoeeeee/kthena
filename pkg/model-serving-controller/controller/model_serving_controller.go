@@ -2236,9 +2236,8 @@ func (c *ModelServingController) handleReadyPod(ms *workloadv1alpha1.ModelServin
 	return revisionErr
 }
 
-// recoveryDisabled reports whether the controller must never delete a faulty Pod:
-// recoveryPolicy is None or restartGracePeriodSeconds is -1. A Pod deleted by
-// others is still handled by handleDeletedPod.
+// recoveryDisabled reports whether recovery of restarted Pods and in-place
+// update timeouts is disabled. Failed Pods are handled separately in handleErrorPod.
 func recoveryDisabled(ms *workloadv1alpha1.ModelServing) bool {
 	grace := ms.Spec.Template.RestartGracePeriodSeconds
 	return ms.Spec.RecoveryPolicy == workloadv1alpha1.NoneRestartPolicy || (grace != nil && *grace == -1)
@@ -2246,7 +2245,9 @@ func recoveryDisabled(ms *workloadv1alpha1.ModelServing) bool {
 
 func (c *ModelServingController) handleErrorPod(ms *workloadv1alpha1.ModelServing, servingGroupName string, errPod *corev1.Pod) error {
 	// Recovery disabled: leave the pod to the kubelet (do not delete it), but mark it unavailable.
-	if recoveryDisabled(ms) {
+	grace := ms.Spec.Template.RestartGracePeriodSeconds
+	if (grace != nil && *grace == -1) ||
+		(ms.Spec.RecoveryPolicy == workloadv1alpha1.NoneRestartPolicy && inplace.UnexpectedRestart(errPod) && !utils.IsPodFailed(errPod)) {
 		if err := c.markPodUnavailable(ms, servingGroupName, errPod); err != nil {
 			klog.Warningf("mark pod %s unavailable: %v", errPod.Name, err)
 		}

@@ -914,7 +914,7 @@ _Appears in:_
 | --- | --- |
 | `ServingGroupRecreate` | ServingGroupRecreate will recreate all the pods in the ServingGroup if<br />1. Any individual pod in the group is recreated; 2. Any containers/init-containers<br />in a pod is restarted. This is to ensure all pods/containers in the group will be<br />started in the same time.<br /> |
 | `RoleRecreate` | RoleRecreate will recreate all pods in one Role if<br />1. Any individual pod in the group is recreated; 2. Any containers/init-containers<br />in a pod is restarted.<br /> |
-| `None` | NoneRestartPolicy never deletes a failed or restarted Pod; the kubelet handles it<br />according to the Pod's restartPolicy. A Pod deleted by others is recreated on its own.<br /> |
+| `None` | NoneRestartPolicy leaves restarted, non-failed Pods to the kubelet's restartPolicy.<br />Failed Pods are deleted after restartGracePeriodSeconds unless it is -1.<br />Only missing Pods are recreated.<br /> |
 
 
 #### Role

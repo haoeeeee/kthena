@@ -6798,9 +6798,9 @@ func TestHandleErrorPodTracksReplacementByUID(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
-// TestHandleErrorPodRecoveryDisabledLeavesPod verifies that with RecoveryPolicy=None
-// or restartGracePeriodSeconds=-1, a failed or restarted pod is NOT deleted — it is
-// left to the pod's own restartPolicy — while the failure is still bookkept:
+// TestHandleErrorPodRecoveryDisabledLeavesPod verifies that None retains restarted
+// non-failed Pods and restartGracePeriodSeconds=-1 also retains failed Pods,
+// while the failure is still bookkept:
 // role/group transition out of Running and the pod leaves the running set, so
 // AvailableReplicas reflects the unavailable replica.
 func TestHandleErrorPodRecoveryDisabledLeavesPod(t *testing.T) {
@@ -6824,7 +6824,7 @@ func TestHandleErrorPodRecoveryDisabledLeavesPod(t *testing.T) {
 		status corev1.PodStatus
 	}{
 		{name: "None leaves a restarted pod", policy: workloadv1alpha1.NoneRestartPolicy, status: restarted},
-		{name: "None leaves a failed pod", policy: workloadv1alpha1.NoneRestartPolicy, status: failed},
+		{name: "None with grace -1 leaves a failed pod", policy: workloadv1alpha1.NoneRestartPolicy, grace: ptr.To[int64](-1), status: failed},
 		{name: "grace -1 leaves a failed pod under RoleRecreate", policy: workloadv1alpha1.RoleRecreate, grace: ptr.To[int64](-1), status: failed},
 		{name: "grace -1 leaves a restarted pod under ServingGroupRecreate", policy: workloadv1alpha1.ServingGroupRecreate, grace: ptr.To[int64](-1), status: restarted},
 	}
