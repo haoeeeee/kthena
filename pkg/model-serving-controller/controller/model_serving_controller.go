@@ -286,9 +286,11 @@ func (c *ModelServingController) updateModelServing(old, cur interface{}) {
 		return
 	}
 
-	if reflect.DeepEqual(oldms.Spec, curms.Spec) {
-		// If the spec has not changed, we do not need to reconcile.
-		klog.V(4).InfoS("Spec has not changed, skipping update", "modelServing", klog.KObj(curms))
+	oldVersion, oldProtected := rolloutVersion(oldms)
+	newVersion, newProtected := rolloutVersion(curms)
+	if reflect.DeepEqual(oldms.Spec, curms.Spec) && oldVersion == newVersion && oldProtected == newProtected {
+		// Skip updates when neither the spec nor rollout protection changed.
+		klog.V(4).InfoS("Spec and rollout-version have not changed, skipping update", "modelServing", klog.KObj(curms))
 		return
 	}
 
@@ -606,6 +608,15 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 		return err
 	}
 
+	var revision string
+	if _, protected := rolloutVersion(ms); protected {
+		source := ms
+		ms, revision, err = c.resolveModelServingRollout(ctx, source)
+		if err != nil {
+			return errors.Join(fmt.Errorf("resolve rollout protection: %w", err), c.scaleDownOnRevisionError(ctx, source))
+		}
+	}
+
 	// Recover orphan cleanup independently of migration errors in surviving Roles.
 	orphanErr := c.cleanupOrphanServices(ctx, ms)
 	defer func() { syncErr = errors.Join(syncErr, orphanErr) }()
@@ -615,13 +626,20 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 	ctx = c.withRevisionHistory(ctx, ms)
 	ctx = withCoordinatedRound(ctx, ms)
 	history := c.revisionHistory(ctx, ms)
-	revision, err := history.desiredRevision(ctx)
+	history.targetRevision = revision
+	if revision == "" {
+		revision, err = history.desiredRevision(ctx)
+	}
 	if err != nil {
 		// Revision persistence is required before creating or replacing Pods. An
 		// explicit replica decrease is safe without a new template, so retain that
 		// path and return the revision error to keep workqueue retries active.
 		return errors.Join(fmt.Errorf("resolve desired revision: %w", err), c.scaleDownOnRevisionError(ctx, ms))
 	}
+	if err := c.persistRolloutVersion(ctx, ms, revision); err != nil {
+		return errors.Join(fmt.Errorf("persist rollout protection: %w", err), c.scaleDownOnRevisionError(ctx, ms))
+	}
+
 	if err := c.persistCoordinatedRoleRevision(ctx, ms, revision); err != nil {
 		return fmt.Errorf("failed to persist coordinated Role revision: %v", err)
 	}
@@ -2527,10 +2545,13 @@ func (c *ModelServingController) updateModelServingStatusInRound(ctx context.Con
 	rolloutPolicy *roleRolloutPolicy,
 ) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Get latest modelserving from informer store
-		latestMS, getErr := c.modelServingLister.ModelServings(ms.Namespace).Get(ms.Name)
-		if getErr != nil {
-			return getErr
+		latestMS := ms
+		if _, protected := rolloutVersion(ms); !protected {
+			var getErr error
+			latestMS, getErr = c.modelServingLister.ModelServings(ms.Namespace).Get(ms.Name)
+			if getErr != nil {
+				return getErr
+			}
 		}
 
 		// Calculate status based on latestMS
