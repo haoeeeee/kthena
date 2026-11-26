@@ -679,7 +679,7 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 	if err := c.resumePodDeletionPlans(ctx, ms); err != nil {
 		return err
 	}
-	ms, revision, err := c.guardModelServingRollout(ctx, ms)
+	ctx, ms, revision, err := c.guardModelServingRollout(ctx, ms)
 	if err != nil {
 		return err
 	}
@@ -2991,8 +2991,9 @@ func (c *ModelServingController) updateModelServingStatus(
 			return fmt.Errorf("ModelServing changed during status update")
 		}
 		if _, protected := rolloutVersion(ms); protected {
-			// Keep the selected template and the resourceVersion from an earlier status write.
-			latestMS = ms
+			// Keep fresh status and metadata, but calculate against this round's selected spec.
+			latestMS = latestMS.DeepCopy()
+			latestMS.Spec = ms.DeepCopy().Spec
 		}
 
 		// Calculate status based on latestMS
@@ -3111,6 +3112,9 @@ func (c *ModelServingController) updateModelServingStatus(
 		)
 		coordinationConditionChanged, coordinationCondition := rolloutPolicy.setCondition(copy)
 		shouldUpdate = shouldUpdate || coordinationConditionChanged
+		if updateRolloutBlockedCondition(ctx, copy) {
+			shouldUpdate = true
+		}
 
 		// CurrentRevision records the last completed baseline, even when no
 		// live group uses it. A protected intermediate revision becoming Ready

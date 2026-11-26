@@ -30,6 +30,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -213,8 +214,9 @@ func TestRolloutGuardSelectTemplate(t *testing.T) {
 				require.NoError(t, err)
 				require.NotNil(t, originalCR)
 			}
-			selected, revision, err := c.resolveModelServingRollout(ctx, ms)
+			selected, revision, blocked, err := c.resolveModelServingRollout(ctx, ms)
 			require.NoError(t, err)
+			require.Equal(t, tt.blocked, blocked)
 			require.Equal(t, before.Spec, ms.Spec, "must not mutate submitted spec")
 			require.Equal(t, before.Spec.Replicas, selected.Spec.Replicas)
 			require.Equal(t, before.Spec.RolloutStrategy, selected.Spec.RolloutStrategy)
@@ -587,9 +589,9 @@ func TestRolloutGuardStatusUsesSelectedTemplate(t *testing.T) {
 			ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "entry:v2"
 			c := newRolloutGuardController(t, ms, old, ptr.To("A"))
 			seedRolloutGuardPods(t, c, ms, old)
-			selected, revision, err := c.resolveModelServingRollout(context.Background(), ms)
+			ctx, selected, revision, err := c.guardModelServingRollout(context.Background(), ms)
 			require.NoError(t, err)
-			ctx := c.withRevisionHistory(context.Background(), selected)
+			ctx = c.withRevisionHistory(ctx, selected)
 			c.revisionHistory(ctx, selected).target = revision
 			require.NoError(t, c.updateModelServingStatus(ctx, selected, revision, nil))
 			stored, err := c.modelServingClient.WorkloadV1alpha1().ModelServings(ms.Namespace).Get(ctx, ms.Name, metav1.GetOptions{})
@@ -600,6 +602,113 @@ func TestRolloutGuardStatusUsesSelectedTemplate(t *testing.T) {
 			cached, err := c.modelServingLister.ModelServings(ms.Namespace).Get(ms.Name)
 			require.NoError(t, err)
 			require.Equal(t, "entry:v2", cached.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image)
+		})
+	}
+}
+
+func TestRolloutGuardStatusConflictUsesFreshStatus(t *testing.T) {
+	ctx := context.Background()
+	old := rolloutGuardFixture()
+	old.Spec.Template.Roles[0].WorkerReplicas = 0
+	old.Spec.Template.Roles[0].WorkerTemplate = nil
+	ms := old.DeepCopy()
+	ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "entry:v2"
+	c := newRolloutGuardController(t, ms, old, ptr.To("A"))
+	seedRolloutGuardPods(t, c, ms, old)
+	ctx, selected, revision, err := c.guardModelServingRollout(ctx, ms)
+	require.NoError(t, err)
+	ctx = c.withRevisionHistory(ctx, selected)
+	c.revisionHistory(ctx, selected).target = revision
+
+	// Another writer updates Status and the informer observes it after our first conflict.
+	concurrent := ms.DeepCopy()
+	concurrent.ResourceVersion = "11"
+	condition := metav1.Condition{Type: "ExternalCondition", Status: metav1.ConditionTrue}
+	concurrent.Status.Conditions = append(concurrent.Status.Conditions, condition)
+	attempts := 0
+	var written *api.ModelServing
+	client := c.modelServingClient.(*kthenafake.Clientset)
+	client.PrependReactor("update", "modelservings", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		require.Equal(t, "status", action.GetSubresource())
+		proposed := action.(kubetesting.UpdateAction).GetObject().(*api.ModelServing)
+		attempts++
+		if attempts == 1 {
+			require.NoError(t, c.modelServingsInformer.GetIndexer().Update(concurrent))
+		}
+		if proposed.ResourceVersion != concurrent.ResourceVersion {
+			return true, nil, apierrors.NewConflict(action.GetResource().GroupResource(), ms.Name, errors.New("stale resourceVersion"))
+		}
+		written = proposed.DeepCopy()
+		return true, written, nil
+	})
+
+	require.NoError(t, c.updateModelServingStatus(ctx, selected, revision, nil))
+	require.Equal(t, 2, attempts)
+	require.Equal(t, "11", written.ResourceVersion)
+	require.Contains(t, written.Status.Conditions, condition)
+	require.EqualValues(t, 1, written.Status.UpdatedReplicas)
+	require.Equal(t, rolloutGuardAcceptedRevision, written.Status.UpdateRevision)
+	cached, err := c.modelServingLister.ModelServings(ms.Namespace).Get(ms.Name)
+	require.NoError(t, err)
+	require.Equal(t, "entry:v2", cached.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image)
+}
+
+func TestRolloutGuardBlockedCondition(t *testing.T) {
+	for _, resolution := range []string{"approve template", "restore template", "remove annotation"} {
+		t.Run(resolution, func(t *testing.T) {
+			ctx := context.Background()
+			old := rolloutGuardFixture()
+			old.Spec.Template.Roles[0].WorkerReplicas = 0
+			old.Spec.Template.Roles[0].WorkerTemplate = nil
+			old.Spec.RecoveryPolicy = api.NoneRestartPolicy
+			c := newRolloutGuardController(t, old, old, ptr.To("A"))
+			seedRolloutGuardPods(t, c, old, old)
+			client := c.modelServingClient.WorkloadV1alpha1().ModelServings(old.Namespace)
+			key := namespacedKey(old.Namespace, old.Name)
+			reconcile := func(ms *api.ModelServing) *api.ModelServing {
+				t.Helper()
+				_, err := client.Update(ctx, ms, metav1.UpdateOptions{})
+				require.NoError(t, err)
+				require.NoError(t, c.modelServingsInformer.GetIndexer().Update(ms))
+				require.NoError(t, c.syncModelServing(ctx, key))
+				stored, err := client.Get(ctx, ms.Name, metav1.GetOptions{})
+				require.NoError(t, err)
+				return stored
+			}
+
+			baseline := reconcile(old)
+			require.Nil(t, apiMeta.FindStatusCondition(baseline.Status.Conditions, rolloutBlockedCondition))
+
+			requested := baseline.DeepCopy()
+			requested.Generation++
+			requested.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "entry:v2"
+			blocked := reconcile(requested)
+			condition := apiMeta.FindStatusCondition(blocked.Status.Conditions, rolloutBlockedCondition)
+			require.NotNil(t, condition)
+			require.Equal(t, metav1.ConditionTrue, condition.Status)
+			require.Equal(t, "RolloutVersionUnchanged", condition.Reason)
+			require.Equal(t, requested.Generation, condition.ObservedGeneration)
+			require.True(t, apiMeta.IsStatusConditionTrue(blocked.Status.Conditions, string(api.ModelServingAvailable)))
+			require.Equal(t, rolloutGuardAcceptedRevision, blocked.Status.UpdateRevision)
+
+			resolved := requested.DeepCopy()
+			resolved.Status = blocked.Status
+			switch resolution {
+			case "approve template":
+				resolved.Annotations[rolloutVersionAnnotation] = "B"
+			case "restore template":
+				resolved.Spec = old.Spec
+				resolved.Generation++
+			case "remove annotation":
+				delete(resolved.Annotations, rolloutVersionAnnotation)
+			}
+			stored := reconcile(resolved)
+			require.True(t, apiMeta.IsStatusConditionFalse(stored.Status.Conditions, rolloutBlockedCondition))
+			if resolution == "restore template" {
+				require.Equal(t, rolloutGuardAcceptedRevision, stored.Status.UpdateRevision)
+			} else {
+				require.Equal(t, utils.ModelServingRevision(resolved), stored.Status.UpdateRevision)
+			}
 		})
 	}
 }
