@@ -33,6 +33,7 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
 
 func TestRoleTemplateChangedExcludesUnchangedAndNewRoles(t *testing.T) {
@@ -54,10 +55,10 @@ func TestRoleTemplateChangedExcludesUnchangedAndNewRoles(t *testing.T) {
 		},
 	}
 	kubeClient := kubefake.NewSimpleClientset()
-	_, err := utils.CreateControllerRevision(context.Background(), kubeClient, ms, "old-revision", oldRoles)
+	_, err := utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, "old-revision", oldRoles)
 	require.NoError(t, err)
 
-	controller := &ModelServingController{kubeClientSet: kubeClient}
+	controller := &ModelServingController{kubeClientSet: kubeClient, controllerRevisionLister: revisiontest.ControllerRevisions(kubeClient)}
 	oldRoleByName, err := controller.roleSpecsFromRevision(ms, "old-revision")
 	require.NoError(t, err)
 	assert.True(t, roleTemplateChanged(oldRoleByName, ms.Spec.Template.Roles[0]))
@@ -80,7 +81,8 @@ func TestPersistCoordinatedRoleRevisionRefreshesReplicaBaseline(t *testing.T) {
 			}}},
 		},
 	}
-	controller := &ModelServingController{kubeClientSet: kubefake.NewSimpleClientset()}
+	revisionClient := kubefake.NewSimpleClientset()
+	controller := &ModelServingController{kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 	revision := utils.ModelServingRevision(ms)
 	require.NoError(t, controller.persistCoordinatedRoleRevision(context.Background(), ms, revision))
 	initialRevision, err := utils.GetControllerRevision(context.Background(), controller.kubeClientSet, ms, revision)
@@ -204,7 +206,8 @@ func TestTerminatingRoleReplicasReadsPodInformerAfterRestart(t *testing.T) {
 		},
 	}}
 	require.NoError(t, informer.GetStore().Add(pod))
-	controller := &ModelServingController{podsInformer: informer, kubeClientSet: kubefake.NewSimpleClientset()}
+	revisionClient := kubefake.NewSimpleClientset()
+	controller := &ModelServingController{podsInformer: informer, kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 	ms := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-ms", UID: "test-uid"}, Spec: workloadv1alpha1.ModelServingSpec{Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{Name: "a"}}}}}
 	recordDifferentRevision(t, controller, ms, "legacy")
 
@@ -557,9 +560,9 @@ func TestResolveRoleRolloutPolicyAppliesDependencyAndSkew(t *testing.T) {
 		},
 	}
 	kubeClient := kubefake.NewSimpleClientset()
-	_, err := utils.CreateControllerRevision(context.Background(), kubeClient, ms, "old-revision", oldRoles)
+	_, err := utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, "old-revision", oldRoles)
 	require.NoError(t, err)
-	controller := &ModelServingController{kubeClientSet: kubeClient, store: datastore.New()}
+	controller := &ModelServingController{kubeClientSet: kubeClient, store: datastore.New(), controllerRevisionLister: revisiontest.ControllerRevisions(kubeClient)}
 	nsn := utils.GetNamespaceName(ms)
 	controller.store.AddServingGroup(nsn, 0, "old-revision")
 	for _, roleName := range []string{"a", "b"} {
@@ -628,7 +631,8 @@ func TestCoordinatedRoleSelectionCountsStartedReplicasOutsideEffectiveRange(t *t
 			require.NoError(t, store.UpdateRoleStatus(nsn, "test-ms-0", roleSpec.Name, roleID, datastore.RoleRunning))
 		}
 	}
-	controller := &ModelServingController{store: store, kubeClientSet: kubefake.NewSimpleClientset()}
+	revisionClient := kubefake.NewSimpleClientset()
+	controller := &ModelServingController{store: store, kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 	states := []coordinatedRoleState{
 		newCoordinatedRoleStateForTest("a", 10, 1, 1),
 		newCoordinatedRoleStateForTest("b", 10, 0, 0),

@@ -25,6 +25,7 @@ import (
 	api "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	kubefake "k8s.io/client-go/kubernetes/fake"
@@ -48,7 +49,8 @@ func TestCoordinatedVersionRatioIncludesPartitionAndCompletedRoles(t *testing.T)
 func TestCoordinatedVersionCountsProtectedTargetAndFormalExpansion(t *testing.T) {
 	role := api.Role{Name: "a", Replicas: ptr.To[int32](4)}
 	ms := &api.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ratios", Namespace: "default", UID: "ratios"}, Spec: api.ModelServingSpec{Template: api.ServingGroup{Roles: []api.Role{role}}}}
-	c := &ModelServingController{kubeClientSet: kubefake.NewSimpleClientset()}
+	revisionClient := kubefake.NewSimpleClientset()
+	c := &ModelServingController{kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 	recordDifferentRevision(t, c, ms, "old")
 	hash := utils.CalRoleTemplateHash(role)
 	state := c.resolveRoleRolloutState(context.Background(), ms, datastore.ServingGroup{Name: "ratios-0"}, role, 3,
@@ -134,7 +136,8 @@ func TestFullTailReleasesDependenciesOnlyAfterCallerDisappears(t *testing.T) {
 func TestFullTailRequiresObservedReadyKnownCapacity(t *testing.T) {
 	role := api.Role{Name: "a", Replicas: ptr.To[int32](2)}
 	ms := &api.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "tail", Namespace: "default", UID: "tail"}, Spec: api.ModelServingSpec{Template: api.ServingGroup{Roles: []api.Role{role}}}}
-	c := &ModelServingController{kubeClientSet: kubefake.NewSimpleClientset()}
+	revisionClient := kubefake.NewSimpleClientset()
+	c := &ModelServingController{kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 	recordDifferentRevision(t, c, ms, "old")
 	for _, tc := range []struct {
 		name  string
@@ -165,7 +168,8 @@ func TestLegacyPartitionConflictStopsFurtherStableDeletions(t *testing.T) {
 		{Name: "a", Replicas: ptr.To[int32](4), RollingUpdateConfiguration: api.RollingUpdateConfiguration{Partition: ptr.To(intstr.FromInt(2))}},
 		{Name: "b", Replicas: ptr.To[int32](4)},
 	}}}}
-	c := &ModelServingController{kubeClientSet: kubefake.NewSimpleClientset(), store: datastore.New()}
+	revisionClient := kubefake.NewSimpleClientset()
+	c := &ModelServingController{kubeClientSet: revisionClient, store: datastore.New(), controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 	recordDifferentRevision(t, c, ms, "old")
 	nsn := utils.GetNamespaceName(ms)
 	c.store.AddServingGroup(nsn, 0, "old")

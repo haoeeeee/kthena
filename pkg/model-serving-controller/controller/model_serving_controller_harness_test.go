@@ -54,7 +54,7 @@ func newTestController(t *testing.T, modelServings ...*workloadv1alpha1.ModelSer
 	volcanoClient := volcanofake.NewSimpleClientset()
 	apiextClient := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
 
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())

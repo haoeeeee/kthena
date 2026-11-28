@@ -31,6 +31,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
 
 func TestRecordModelServingRevisionLifecycle(t *testing.T) {
@@ -40,7 +41,7 @@ func TestRecordModelServingRevisionLifecycle(t *testing.T) {
 	dataA := []byte(`{"spec":{"schedulerName":"a","plugins":[],"template":{"roles":[{"name":"role","entryTemplate":{},"workerReplicas":0}]}}}`)
 	dataB := []byte(`{"spec":{"schedulerName":"b","plugins":[],"template":{"roles":[{"name":"role","entryTemplate":{},"workerReplicas":0}]}}}`)
 
-	revisionA, collisionCount, err := RecordModelServingRevision(ctx, client, ms, dataA)
+	revisionA, collisionCount, err := RecordModelServingRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, dataA)
 	if err != nil {
 		t.Fatalf("record A error = %v", err)
 	}
@@ -57,7 +58,7 @@ func TestRecordModelServingRevisionLifecycle(t *testing.T) {
 		t.Fatalf("A.Data = %s, want %s", revisionA.Data.Raw, dataA)
 	}
 
-	reusedA, _, err := RecordModelServingRevision(ctx, client, ms, dataA)
+	reusedA, _, err := RecordModelServingRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, dataA)
 	if err != nil {
 		t.Fatalf("reuse latest A error = %v", err)
 	}
@@ -65,7 +66,7 @@ func TestRecordModelServingRevisionLifecycle(t *testing.T) {
 		t.Fatalf("reused latest A = %s/%d, want %s/1", reusedA.Name, reusedA.Revision, revisionA.Name)
 	}
 
-	revisionB, _, err := RecordModelServingRevision(ctx, client, ms, dataB)
+	revisionB, _, err := RecordModelServingRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, dataB)
 	if err != nil {
 		t.Fatalf("record B error = %v", err)
 	}
@@ -73,7 +74,7 @@ func TestRecordModelServingRevisionLifecycle(t *testing.T) {
 		t.Fatalf("B.Revision = %d, want 2", revisionB.Revision)
 	}
 
-	promotedA, _, err := RecordModelServingRevision(ctx, client, ms, dataA)
+	promotedA, _, err := RecordModelServingRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, dataA)
 	if err != nil {
 		t.Fatalf("promote historical A error = %v", err)
 	}
@@ -105,7 +106,7 @@ func TestRecordModelServingRevisionRejectsInvalidDataBeforeAPIAccess(t *testing.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := kubefake.NewSimpleClientset()
-			if _, _, err := RecordModelServingRevision(context.Background(), client, lifecycleTestModelServing(), tt.data); err == nil {
+			if _, _, err := RecordModelServingRevision(context.Background(), client, revisiontest.ControllerRevisions(client), lifecycleTestModelServing(), tt.data); err == nil {
 				t.Fatal("RecordModelServingRevision() error = nil")
 			}
 			if actions := client.Actions(); len(actions) != 0 {
@@ -143,7 +144,7 @@ func TestRecordModelServingRevisionResolvesNameCollisionWithoutMutatingData(t *t
 		t.Fatalf("create colliding revision error = %v", err)
 	}
 
-	created, collisionCount, err := RecordModelServingRevision(ctx, client, ms, desiredData)
+	created, collisionCount, err := RecordModelServingRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, desiredData)
 	if err != nil {
 		t.Fatalf("RecordModelServingRevision() error = %v", err)
 	}
@@ -188,7 +189,7 @@ func TestRecordModelServingRevisionIgnoresForeignOwnedHistory(t *testing.T) {
 	}
 	client := kubefake.NewSimpleClientset(foreign)
 
-	created, _, err := RecordModelServingRevision(ctx, client, ms, data)
+	created, _, err := RecordModelServingRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, data)
 	if err != nil {
 		t.Fatalf("RecordModelServingRevision() error = %v", err)
 	}
@@ -224,7 +225,7 @@ func TestRecordModelServingRevisionDoesNotReuseUnownedCollision(t *testing.T) {
 			}
 			client := kubefake.NewSimpleClientset(unowned)
 
-			created, collisionCount, err := RecordModelServingRevision(ctx, client, ms, data)
+			created, collisionCount, err := RecordModelServingRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, data)
 			if err != nil {
 				t.Fatalf("RecordModelServingRevision() error = %v", err)
 			}
@@ -252,7 +253,7 @@ func TestRecordModelServingRevisionBreaksRevisionTiesByCreationTime(t *testing.T
 	newer.CreationTimestamp = metav1.NewTime(time.Unix(200, 0))
 	client := kubefake.NewSimpleClientset(older, newer)
 
-	got, _, err := RecordModelServingRevision(ctx, client, ms, desiredData)
+	got, _, err := RecordModelServingRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, desiredData)
 	if err != nil {
 		t.Fatalf("RecordModelServingRevision() error = %v", err)
 	}
@@ -281,9 +282,9 @@ func TestUpdateControllerRevisionRetriesConflict(t *testing.T) {
 		return false, nil, nil
 	})
 
-	updated, err := updateControllerRevision(ctx, client, revision, 2)
+	updated, err := UpdateControllerRevision(ctx, client, revision, 2)
 	if err != nil {
-		t.Fatalf("updateControllerRevision() error = %v", err)
+		t.Fatalf("UpdateControllerRevision() error = %v", err)
 	}
 	if updateAttempts != 2 {
 		t.Fatalf("update attempts = %d, want 2", updateAttempts)
@@ -314,12 +315,12 @@ func TestUpdateControllerRevisionReturnsRefreshErrorAfterConflict(t *testing.T) 
 		return true, nil, refreshErr
 	})
 
-	updated, err := updateControllerRevision(ctx, client, revision, 2)
+	updated, err := UpdateControllerRevision(ctx, client, revision, 2)
 	if err == nil {
-		t.Fatal("updateControllerRevision() error = nil, want refresh error")
+		t.Fatal("UpdateControllerRevision() error = nil, want refresh error")
 	}
 	if !errors.Is(err, refreshErr) {
-		t.Fatalf("updateControllerRevision() error = %v, want refresh error", err)
+		t.Fatalf("UpdateControllerRevision() error = %v, want refresh error", err)
 	}
 	if updated != nil {
 		t.Fatalf("updated = %#v, want nil", updated)
@@ -355,9 +356,9 @@ func TestUpdateControllerRevisionDoesNotDecreaseAfterConflict(t *testing.T) {
 		)
 	})
 
-	updated, err := updateControllerRevision(ctx, client, revision, 2)
+	updated, err := UpdateControllerRevision(ctx, client, revision, 2)
 	if err != nil {
-		t.Fatalf("updateControllerRevision() error = %v", err)
+		t.Fatalf("UpdateControllerRevision() error = %v", err)
 	}
 	if updateAttempts != 1 {
 		t.Fatalf("update attempts = %d, want 1", updateAttempts)

@@ -160,6 +160,7 @@ rules:
       - create
       - get
       - list
+      - watch
       - update
       - delete
   - apiGroups:

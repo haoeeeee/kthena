@@ -67,7 +67,7 @@ func recoveryController(t *testing.T, ms *workloadv1alpha1.ModelServing, pods ..
 		objects = append(objects, pod.DeepCopy())
 	}
 	kube := kubefake.NewSimpleClientset(objects...)
-	c, err := NewModelServingController(kube, kthenafake.NewSimpleClientset(ms.DeepCopy()), volcanofake.NewSimpleClientset(), apiextfake.NewSimpleClientset())
+	c, err := newControllerWithRevisionHistory(t, kube, kthenafake.NewSimpleClientset(ms.DeepCopy()), volcanofake.NewSimpleClientset(), apiextfake.NewSimpleClientset())
 	require.NoError(t, err)
 	c.recorder = record.NewFakeRecorder(1000)
 	require.NoError(t, c.modelServingsInformer.GetIndexer().Add(ms.DeepCopy()))

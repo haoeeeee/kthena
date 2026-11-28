@@ -25,6 +25,7 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -34,7 +35,7 @@ import (
 )
 
 func TestDesiredRevisionFailureStopsRoleRollout(t *testing.T) {
-	for _, verb := range []string{"list", "create"} {
+	for _, verb := range []string{"list", "create", "update"} {
 		t.Run(verb, func(t *testing.T) {
 			ctx := context.Background()
 			old := createStandardModelServing("history-first", 1, 1)
@@ -46,12 +47,22 @@ func TestDesiredRevisionFailureStopsRoleRollout(t *testing.T) {
 			ms.Status.CurrentRevision, ms.Status.UpdateRevision = "legacy", "legacy"
 			c := newRevisionTestController(t, ms)
 			client := c.kubeClientSet.(*kubefake.Clientset)
-			_, err := utils.CreateControllerRevision(ctx, client, ms, "legacy", old.Spec.Template.Roles)
+			if verb == "update" {
+				// The desired template already exists as older history: rollback
+				// must persist its promoted number before touching Pods.
+				_, err := utils.CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, utils.ModelServingRevision(ms), ms.Spec.Template.Roles)
+				require.NoError(t, err)
+			}
+			_, err := utils.CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, "legacy", old.Spec.Template.Roles)
 			require.NoError(t, err)
 			pod := addReadyLegacyGroupToController(t, c, ms, old.Spec.Template.Roles[0], 0, "legacy")
 			_, err = client.CoreV1().Pods(ms.Namespace).Create(ctx, pod.DeepCopy(), metav1.CreateOptions{})
 			require.NoError(t, err)
 			fail := true
+			originalLister := c.controllerRevisionLister
+			if verb == "list" {
+				c.controllerRevisionLister = revisiontest.FailingControllerRevisions(fmt.Errorf("injected history list failure"))
+			}
 			client.PrependReactor(verb, "controllerrevisions", func(kubetesting.Action) (bool, runtime.Object, error) {
 				if fail {
 					return true, nil, fmt.Errorf("injected history %s failure", verb)
@@ -70,22 +81,30 @@ func TestDesiredRevisionFailureStopsRoleRollout(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, "legacy", status.Status.UpdateRevision)
 			fail = false
+			c.controllerRevisionLister = originalLister
 			client.ClearActions()
 			require.NoError(t, c.syncModelServing(ctx, ms.Namespace+"/"+ms.Name))
-			historyCreated, podDeletion := -1, -1
+			historySaved, podDeletion := -1, -1
+			saveVerb := "create"
+			if verb == "update" {
+				saveVerb = "update"
+			}
 			for index, action := range client.Actions() {
-				if action.Matches("create", "controllerrevisions") {
-					historyCreated = index
+				if action.Matches(saveVerb, "controllerrevisions") {
+					historySaved = index
 				}
 				if action.Matches("delete", "pods") {
 					podDeletion = index
 				}
 			}
-			require.GreaterOrEqual(t, historyCreated, 0)
-			require.Greater(t, podDeletion, historyCreated)
+			require.GreaterOrEqual(t, historySaved, 0)
+			require.Greater(t, podDeletion, historySaved)
 			target, err := utils.GetControllerRevision(ctx, client, ms, utils.ModelServingRevision(ms))
 			require.NoError(t, err)
 			require.NotNil(t, target)
+			if verb == "update" {
+				require.EqualValues(t, 3, target.Revision)
+			}
 		})
 	}
 }
@@ -106,10 +125,10 @@ func TestRevisionCleanupRetriesAfterStatusConverges(t *testing.T) {
 	c := newRevisionTestController(t, ms)
 	client := c.kubeClientSet.(*kubefake.Clientset)
 	for _, revision := range []string{"legacy", "unused"} {
-		_, err := utils.CreateControllerRevision(ctx, client, ms, revision, old.Spec.Template.Roles)
+		_, err := utils.CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, revision, old.Spec.Template.Roles)
 		require.NoError(t, err)
 	}
-	_, err := utils.CreateControllerRevision(ctx, client, ms, newRevision, ms.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, newRevision, ms.Spec.Template.Roles)
 	require.NoError(t, err)
 	for i, role := range ms.Spec.Template.Roles {
 		revision := newRevision
@@ -166,7 +185,7 @@ func TestProtectedRoleRecoveryRequiresHistoricalSnapshot(t *testing.T) {
 				if state == "missing-role" {
 					old.Spec.Template.Roles[0].Name = "different"
 				}
-				cr, err := utils.CreateControllerRevision(ctx, client, ms, "old", old.Spec.Template.Roles)
+				cr, err := utils.CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, "old", old.Spec.Template.Roles)
 				require.NoError(t, err)
 				if state == "malformed" {
 					cr.Data.Raw = []byte(`{"data":"broken"}`)
@@ -214,7 +233,7 @@ func TestProtectedRoleCreationUsesCurrentNotArbitraryHistory(t *testing.T) {
 	ctx := context.Background()
 	old := ms.DeepCopy()
 	old.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "obsolete:v0"
-	_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, "arbitrary-old", old.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "arbitrary-old", old.Spec.Template.Roles)
 	require.NoError(t, err)
 	revision, err := c.revisionHistory(ctx, ms).desiredRevision(ctx)
 	require.NoError(t, err)
@@ -260,7 +279,7 @@ func TestRevisionCleanupPreservesRoleHistoryWithoutLivePod(t *testing.T) {
 	ms.Status.CurrentRevision, ms.Status.UpdateRevision = revision, revision
 	c := newRevisionTestController(t, ms)
 	for _, name := range []string{revision, "role-history", "unused"} {
-		_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, name, ms.Spec.Template.Roles)
+		_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, name, ms.Spec.Template.Roles)
 		require.NoError(t, err)
 	}
 	key, groupName := utils.GetNamespaceName(ms), ms.Name+"-0"

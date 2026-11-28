@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,6 +27,7 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 	corev1 "k8s.io/api/core/v1"
 	apiextfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -51,13 +53,13 @@ func recordDifferentRevision(t *testing.T, c *ModelServingController, ms *worklo
 			Annotations: map[string]string{"test.kthena.io/template-version": revision},
 		}
 	}
-	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, revision, old.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, revision, old.Spec.Template.Roles)
 	require.NoError(t, err)
 }
 
 func newRevisionTestController(t *testing.T, ms *workloadv1alpha1.ModelServing) *ModelServingController {
 	t.Helper()
-	c, err := NewModelServingController(kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(ms.DeepCopy()), nil, apiextfake.NewSimpleClientset())
+	c, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(ms.DeepCopy()), nil, apiextfake.NewSimpleClientset())
 	require.NoError(t, err)
 	require.NoError(t, c.modelServingsInformer.GetIndexer().Add(ms))
 	return c
@@ -73,7 +75,7 @@ func TestRevisionComparisonPartialRoleUpdate(t *testing.T) {
 	ms.Spec.RolloutStrategy = &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate}
 	ms.Spec.Template.Roles[1].EntryTemplate.Spec.Containers[0].Image = "decode:v2"
 	c := newRevisionTestController(t, ms)
-	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "legacy", old.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "legacy", old.Spec.Template.Roles)
 	require.NoError(t, err)
 	for _, role := range old.Spec.Template.Roles {
 		addReadyLegacyGroupToController(t, c, ms, role, 0, "legacy")
@@ -101,7 +103,7 @@ func TestRevisionComparisonIgnoresLifecycleAndReplicaCounts(t *testing.T) {
 			ms := old.DeepCopy()
 			ms.Spec.Template.Roles[0].Replicas = ptr.To[int32](2)
 			c := newRevisionTestController(t, ms)
-			_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "legacy", old.Spec.Template.Roles)
+			_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "legacy", old.Spec.Template.Roles)
 			require.NoError(t, err)
 			pod := addReadyLegacyGroupToController(t, c, ms, old.Spec.Template.Roles[0], 4, "legacy")
 			pod.Status.Conditions = nil
@@ -125,7 +127,7 @@ func TestRevisionComparisonUnknownHistoryDoesNotAuthorizeRollout(t *testing.T) {
 			ms.UID = "current-uid"
 			c := newRevisionTestController(t, ms)
 			if kind != "missing" {
-				cr, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "legacy", ms.Spec.Template.Roles)
+				cr, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "legacy", ms.Spec.Template.Roles)
 				require.NoError(t, err)
 				if kind == "foreign" {
 					cr.OwnerReferences[0].UID = types.UID("foreign-uid")
@@ -156,7 +158,7 @@ func TestRevisionComparisonMixedRoleRevisionsAndRestart(t *testing.T) {
 	for attempt := 0; attempt < 2; attempt++ {
 		c := newRevisionTestController(t, ms)
 		for _, rev := range []string{"legacy-a", "legacy-b"} {
-			_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, rev, ms.Spec.Template.Roles)
+			_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, rev, ms.Spec.Template.Roles)
 			require.NoError(t, err)
 		}
 		// Either event order must produce the same comparison; no process-local
@@ -186,7 +188,7 @@ func TestRevisionComparisonDoesNotExemptScaleDown(t *testing.T) {
 		RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{MaxSurge: ptr.To(intstr.FromInt(1))},
 	}
 	c := newRevisionTestController(t, ms)
-	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "legacy", ms.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "legacy", ms.Spec.Template.Roles)
 	require.NoError(t, err)
 	for _, ordinal := range []int{0, 3, 4} {
 		pod := addReadyLegacyGroupToController(t, c, ms, ms.Spec.Template.Roles[0], ordinal, "legacy")
@@ -204,7 +206,7 @@ func TestSyncLegacyRevisionWhileScalingRoleDoesNotRollExistingPod(t *testing.T) 
 	ms := old.DeepCopy()
 	ms.Spec.Template.Roles[0].Replicas = ptr.To[int32](2)
 	c := newRevisionTestController(t, ms)
-	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "legacy", old.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "legacy", old.Spec.Template.Roles)
 	require.NoError(t, err)
 	pod := addReadyLegacyGroupToController(t, c, ms, old.Spec.Template.Roles[0], 4, "legacy")
 	_, err = c.kubeClientSet.CoreV1().Pods(ms.Namespace).Create(context.Background(), pod.DeepCopy(), metav1.CreateOptions{})
@@ -232,7 +234,7 @@ func TestDesiredRevisionReuseIsDeterministicAndCachesHistory(t *testing.T) {
 	ms.Status.UpdateRevision = "legacy-b"
 	c := newRevisionTestController(t, ms)
 	for _, revision := range []string{"legacy-a", "legacy-b"} {
-		_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, revision, ms.Spec.Template.Roles)
+		_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, revision, ms.Spec.Template.Roles)
 		require.NoError(t, err)
 	}
 	client := c.kubeClientSet.(*kubefake.Clientset)
@@ -246,15 +248,105 @@ func TestDesiredRevisionReuseIsDeterministicAndCachesHistory(t *testing.T) {
 		_, err := history.roles(ctx, desired)
 		require.NoError(t, err)
 	}
-	require.Len(t, client.Actions(), 1, "the listed snapshot is reused across comparison calls")
-	assert.True(t, client.Actions()[0].Matches("list", "controllerrevisions"))
+	require.Empty(t, client.Actions(), "the lister snapshot is reused without API reads")
 	// An unknown result only belongs to this reconcile, not the next one.
 	_, err = history.roles(ctx, "late")
 	require.Error(t, err)
-	_, err = utils.CreateControllerRevision(context.Background(), client, ms, "late", ms.Spec.Template.Roles)
+	_, err = utils.CreateControllerRevision(context.Background(), client, revisiontest.ControllerRevisions(client), ms, "late", ms.Spec.Template.Roles)
 	require.NoError(t, err)
 	_, err = c.revisionHistory(context.Background(), ms).roles(context.Background(), "late")
 	require.NoError(t, err)
+}
+
+func TestDesiredRevisionPrefersNewestEquivalentHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		current string
+		update  string
+	}{
+		{name: "highest equivalent number"},
+		{name: "current status cannot pin an older identity", current: "lower"},
+		{name: "update status cannot pin an older identity", current: "higher", update: "lower"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			ms := createStandardModelServing("number-priority", 1, 1)
+			ms.UID = "owner"
+			ms.Status.CurrentRevision, ms.Status.UpdateRevision = tc.current, tc.update
+			c := newRevisionTestController(t, ms)
+			for i, revision := range []string{"lower", "higher"} {
+				cr, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, revision, ms.Spec.Template.Roles)
+				require.NoError(t, err)
+				// Reverse timestamp order to prove numeric ordering is used.
+				cr.CreationTimestamp = metav1.NewTime(time.Unix(int64(200-i*100), 0))
+				_, err = c.kubeClientSet.AppsV1().ControllerRevisions(ms.Namespace).Update(ctx, cr, metav1.UpdateOptions{})
+				require.NoError(t, err)
+			}
+			different := ms.DeepCopy()
+			different.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "different:v3"
+			_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "different", different.Spec.Template.Roles)
+			require.NoError(t, err)
+			desired, err := c.revisionHistory(ctx, ms).desiredRevision(ctx)
+			require.NoError(t, err)
+			require.Equal(t, "higher", desired, "reuse the newest equivalent history regardless of status")
+			selected, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, desired)
+			require.NoError(t, err)
+			require.EqualValues(t, 4, selected.Revision, "promote past the newer, different template")
+			require.Equal(t, tc.current, ms.Status.CurrentRevision, "history selection does not change observed status")
+			require.Equal(t, tc.update, ms.Status.UpdateRevision)
+		})
+	}
+}
+
+func TestDesiredRevisionStatefulSetLifecycle(t *testing.T) {
+	ctx := context.Background()
+	ms := createStandardModelServing("sts-history", 1, 1)
+	ms.UID = "owner"
+	ms.Spec.RevisionHistoryLimit = ptr.To[int32](0)
+	c := newRevisionTestController(t, ms)
+	client := c.kubeClientSet.(*kubefake.Clientset)
+	var originalName string
+	var originalData []byte
+	for i, image := range []string{"a:v1", "b:v2", "c:v3", "a:v1"} {
+		ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = image
+		history := c.revisionHistory(ctx, ms)
+		desired, err := history.desiredRevision(ctx)
+		require.NoError(t, err)
+		cr, err := utils.GetControllerRevision(ctx, client, ms, desired)
+		require.NoError(t, err)
+		require.EqualValues(t, i+1, cr.Revision)
+		if i == 0 {
+			originalName, originalData = cr.Name, append([]byte(nil), cr.Data.Raw...)
+		}
+		if i == 3 {
+			require.Equal(t, originalName, cr.Name, "rollback preserves snapshot identity")
+			require.Equal(t, originalData, cr.Data.Raw, "rollback never rewrites historical data")
+			require.EqualValues(t, 4, history.snapshots[desired].revision.Revision, "cache reflects the promoted number")
+		}
+		// A fresh reconcile must not increment again even before status catches up.
+		client.ClearActions()
+		repeated := c.revisionHistory(ctx, ms)
+		reused, err := repeated.desiredRevision(ctx)
+		require.NoError(t, err)
+		require.Equal(t, desired, reused)
+		require.EqualValues(t, i+1, repeated.snapshots[reused].revision.Revision)
+		for _, action := range client.Actions() {
+			require.Contains(t, []string{"list", "get"}, action.GetVerb(), "unchanged desired template must not mutate history")
+		}
+		ms.Status.CurrentRevision, ms.Status.UpdateRevision = desired, desired
+	}
+	require.NoError(t, utils.CleanupOldControllerRevisions(ctx, client, revisiontest.ControllerRevisions(client), ms))
+	remaining, err := client.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, remaining.Items, 1)
+	require.Equal(t, originalName, remaining.Items[0].Name)
+	require.EqualValues(t, 4, remaining.Items[0].Revision)
+	ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "d:v5"
+	desired, err := c.revisionHistory(ctx, ms).desiredRevision(ctx)
+	require.NoError(t, err)
+	next, err := utils.GetControllerRevision(ctx, client, ms, desired)
+	require.NoError(t, err)
+	require.EqualValues(t, 5, next.Revision, "continue after rollback and zero-history cleanup")
 }
 
 func TestRevisionRecoveryUsesCompletedRoleTemplate(t *testing.T) {
@@ -271,7 +363,7 @@ func TestRevisionRecoveryUsesCompletedRoleTemplate(t *testing.T) {
 		old := ms.DeepCopy()
 		old.Spec.Template.Roles[0].Replicas = &replicas
 		old.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = revision
-		_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, revision, old.Spec.Template.Roles)
+		_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, revision, old.Spec.Template.Roles)
 		require.NoError(t, err)
 	}
 	key := utils.GetNamespaceName(ms)
@@ -305,7 +397,7 @@ func TestSemanticTemplateComparisonPreservesQuantityEquivalentInstances(t *testi
 			require.True(t, utils.EqualRoleTemplatesForRevision(old.Spec.Template.Roles, ms.Spec.Template.Roles))
 			require.NotEqual(t, utils.CalRoleTemplateHash(old.Spec.Template.Roles[0]), utils.CalRoleTemplateHash(ms.Spec.Template.Roles[0]))
 			c := newRevisionTestController(t, ms)
-			_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "legacy", old.Spec.Template.Roles)
+			_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "legacy", old.Spec.Template.Roles)
 			require.NoError(t, err)
 			pod := addReadyLegacyGroupToController(t, c, ms, old.Spec.Template.Roles[0], 0, "legacy")
 			_, err = c.kubeClientSet.CoreV1().Pods(ms.Namespace).Create(context.Background(), pod.DeepCopy(), metav1.CreateOptions{})
@@ -343,7 +435,7 @@ func TestSemanticComparisonCacheSeparatesDesiredTemplatesAndRetriesHistory(t *te
 	ms := old.DeepCopy()
 	ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "new:v2"
 	c := newRevisionTestController(t, ms)
-	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "old", old.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "old", old.Spec.Template.Roles)
 	require.NoError(t, err)
 	group := datastore.ServingGroup{Name: "semantic-cache-0", Revision: "old"}
 	observed := datastore.Role{Name: "prefill-0", Revision: "old", RoleTemplateHash: "opaque"}
@@ -364,7 +456,7 @@ func TestSemanticComparisonCacheSeparatesDesiredTemplatesAndRetriesHistory(t *te
 	assert.Len(t, history.comparisons, 2)
 	observed.Revision = "late"
 	assert.Equal(t, templateUnknown, c.compareRoleTemplate(ctx, ms, group, "prefill", observed))
-	_, err = utils.CreateControllerRevision(ctx, client, ms, "late", ms.Spec.Template.Roles)
+	_, err = utils.CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, "late", ms.Spec.Template.Roles)
 	require.NoError(t, err)
 	assert.Equal(t, templateUnknown, c.compareRoleTemplate(ctx, ms, group, "prefill", observed))
 	assert.Equal(t, templateEquivalent, c.compareRoleTemplate(context.Background(), ms, group, "prefill", observed), "the next reconcile must retry a previously missing history")
@@ -377,7 +469,7 @@ func TestSemanticTerminatingCapacityChecksEveryPod(t *testing.T) {
 	ms := old.DeepCopy()
 	ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("4194304")
 	c := newRevisionTestController(t, ms)
-	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, "equal", old.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "equal", old.Spec.Template.Roles)
 	require.NoError(t, err)
 	recordDifferentRevision(t, c, ms, "different")
 	pod := addReadyLegacyGroupToController(t, c, ms, old.Spec.Template.Roles[0], 0, "equal")
@@ -409,7 +501,7 @@ func TestDesiredRevisionCollisionPreservesHistoryAndWorkload(t *testing.T) {
 	revision := utils.ModelServingRevision(ms)
 	different := ms.DeepCopy()
 	different.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "other:v2"
-	original, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, revision, different.Spec.Template.Roles)
+	original, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, revision, different.Spec.Template.Roles)
 	require.NoError(t, err)
 	client := c.kubeClientSet.(*kubefake.Clientset)
 	client.ClearActions()
@@ -456,7 +548,7 @@ func TestZeroReplicaRoleTemplateCompletion(t *testing.T) {
 			c := newRevisionTestController(t, ms)
 			ctx := context.Background()
 			if !tc.missingHistory {
-				_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, "legacy", old.Spec.Template.Roles)
+				_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "legacy", old.Spec.Template.Roles)
 				require.NoError(t, err)
 			}
 			target, err := c.revisionHistory(ctx, ms).desiredRevision(ctx)

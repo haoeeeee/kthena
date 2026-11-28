@@ -35,7 +35,7 @@ func TestModelServingCanceledCacheSyncDoesNotInitialize(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			kubeClient := kubefake.NewSimpleClientset()
-			c, err := NewModelServingController(kubeClient, clientfake.NewSimpleClientset(), volcanofake.NewSimpleClientset(), apiextfake.NewSimpleClientset())
+			c, err := newControllerWithRevisionHistory(t, kubeClient, clientfake.NewSimpleClientset(), volcanofake.NewSimpleClientset(), apiextfake.NewSimpleClientset())
 			require.NoError(t, err)
 			if beforeStart {
 				cancel()

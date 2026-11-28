@@ -326,7 +326,7 @@ func (c *ModelServingController) persistCoordinatedRoleRevision(
 		return err
 	}
 	if controllerRevision == nil {
-		controllerRevision, err = utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, revision, ms.Spec.Template.Roles)
+		controllerRevision, err = utils.CreateControllerRevision(ctx, c.kubeClientSet, c.controllerRevisionLister, ms, revision, ms.Spec.Template.Roles)
 		if err != nil {
 			return err
 		}

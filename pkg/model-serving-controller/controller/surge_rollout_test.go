@@ -106,7 +106,7 @@ func newSurgeCompletionController(t *testing.T, scope string) (*ModelServingCont
 	}
 	revision := utils.ModelServingRevision(ms)
 	ms.Status.UpdateRevision = revision
-	c, err := NewModelServingController(kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(ms), nil, apiextfake.NewSimpleClientset())
+	c, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(ms), nil, apiextfake.NewSimpleClientset())
 	require.NoError(t, err)
 	t.Cleanup(c.workqueue.ShutDown)
 	require.NoError(t, c.modelServingsInformer.GetIndexer().Add(ms))

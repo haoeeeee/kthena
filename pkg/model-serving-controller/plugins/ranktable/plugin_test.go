@@ -33,6 +33,7 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/plugins"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
 
 func TestOnPodRunningGeneratesRanktableBeforePodReady(t *testing.T) {
@@ -134,20 +135,20 @@ devices:
 		_, err := client.CoreV1().Pods(ms.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
 		require.NoError(t, err)
 	}
-	_, err := utils.CreateControllerRevision(context.Background(), client, ms, "test-revision", ms.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(context.Background(), client, revisiontest.ControllerRevisions(client), ms, "test-revision", ms.Spec.Template.Roles)
 	require.NoError(t, err)
 	return &RanktablePlugin{
-		cfg:             RanktableConfig{Template: templateCM.Name},
-		templateManager: NewTemplateManager(),
-	}, &plugins.HookRequest{
-		ModelServing:    ms,
-		ServingGroup:    "test-ms-0",
-		RoleName:        "worker",
-		RoleID:          "worker-0",
-		PodLister:       listerv1.NewPodLister(podIndexer),
-		ConfigMapLister: listerv1.NewConfigMapLister(configMapIndexer),
-		KubeClient:      client,
-	}, client
+			cfg:             RanktableConfig{Template: templateCM.Name},
+			templateManager: NewTemplateManager(),
+		}, &plugins.HookRequest{
+			ModelServing:    ms,
+			ServingGroup:    "test-ms-0",
+			RoleName:        "worker",
+			RoleID:          "worker-0",
+			PodLister:       listerv1.NewPodLister(podIndexer),
+			ConfigMapLister: listerv1.NewConfigMapLister(configMapIndexer),
+			KubeClient:      client,
+		}, client
 }
 
 func ranktableTestPod(groupName, roleName, roleID, name string) *corev1.Pod {

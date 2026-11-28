@@ -27,6 +27,7 @@ import (
 	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
 
 func TestCreateControllerRevision(t *testing.T) {
@@ -57,7 +58,7 @@ func TestCreateControllerRevision(t *testing.T) {
 	templateData := ms.Spec.Template.Roles
 
 	// Test creating a ControllerRevision
-	cr, err := CreateControllerRevision(ctx, client, ms, "revision-v1", templateData)
+	cr, err := CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, "revision-v1", templateData)
 	assert.NoError(t, err)
 	assert.NotNil(t, cr)
 	assert.Equal(t, "test-ms-revision-v1", cr.Name)
@@ -74,13 +75,13 @@ func TestCreateControllerRevision(t *testing.T) {
 	operationallyChanged[0].Replicas = &replicas
 	operationallyChanged[0].MaxSurge = &maxSurge
 	operationallyChanged[0].Partition = &partition
-	reused, err := CreateControllerRevision(ctx, client, ms, "revision-v1", operationallyChanged)
+	reused, err := CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, "revision-v1", operationallyChanged)
 	assert.NoError(t, err)
 	assert.Equal(t, cr.Name, reused.Name)
 
 	// A hash collision or corrupted historical snapshot must never be repaired
 	// by overwriting data referenced by live stable or surge resources.
-	_, err = CreateControllerRevision(ctx, client, ms, "revision-v1", []workloadv1alpha1.Role{{Name: "decode"}})
+	_, err = CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, "revision-v1", []workloadv1alpha1.Role{{Name: "decode"}})
 	assert.ErrorContains(t, err, "already exists with different template data")
 	persisted, err := GetControllerRevision(ctx, client, ms, "revision-v1")
 	assert.NoError(t, err)
@@ -119,7 +120,7 @@ func TestGetControllerRevision(t *testing.T) {
 	// Create multiple ControllerRevisions
 	revisions := []string{"revision-v1", "revision-v2", "revision-v3"}
 	for _, rev := range revisions {
-		_, err := CreateControllerRevision(ctx, client, ms, rev, templateData)
+		_, err := CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, rev, templateData)
 		assert.NoError(t, err)
 	}
 
@@ -172,12 +173,12 @@ func TestCleanupOldControllerRevisions_PreservesCurrentAndUpdateRevisions(t *tes
 	// The revisions that are not CurrentRevision or UpdateRevision should be deleted
 	revisions := []string{"revision-v1", "revision-v2", "revision-v3", "revision-v4", "revision-v5"}
 	for _, rev := range revisions {
-		_, err := CreateControllerRevision(ctx, client, ms, rev, templateData)
+		_, err := CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, rev, templateData)
 		assert.NoError(t, err)
 	}
 
 	// Manually run cleanup
-	err := CleanupOldControllerRevisions(ctx, client, ms)
+	err := CleanupOldControllerRevisions(ctx, client, revisiontest.ControllerRevisions(client), ms)
 	assert.NoError(t, err)
 
 	// List all remaining ControllerRevisions

@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	api "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 	corev1 "k8s.io/api/core/v1"
 	extensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,7 +42,7 @@ func TestRevisionIgnoresImmutableConfigurationAndKeepsRecordedCounts(t *testing.
 	ms := configurationFixture()
 	client := fake.NewSimpleClientset()
 	revision := ModelServingRevision(ms)
-	cr, err := CreateControllerRevision(ctx, client, ms, revision, ms.Spec.Template.Roles)
+	cr, err := CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, revision, ms.Spec.Template.Roles)
 	require.NoError(t, err)
 	require.NotContains(t, string(cr.Data.Raw), "schedulerName")
 	require.NotContains(t, string(cr.Data.Raw), "plugins")
@@ -54,14 +55,14 @@ func TestRevisionIgnoresImmutableConfigurationAndKeepsRecordedCounts(t *testing.
 		require.Equal(t, revision, ModelServingRevision(changed))
 		// Immutable owner configuration neither changes Role identity nor
 		// requires a second historical snapshot.
-		same, err := CreateControllerRevision(ctx, client, changed, revision, changed.Spec.Template.Roles)
+		same, err := CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), changed, revision, changed.Spec.Template.Roles)
 		require.NoError(t, err)
 		require.Equal(t, cr.Data.Raw, same.Data.Raw)
 	}
 	scaled := ms.DeepCopy()
 	scaled.Spec.Template.Roles[0].Replicas = ptr.To[int32](7)
 	require.Equal(t, revision, ModelServingRevision(scaled))
-	same, err := CreateControllerRevision(ctx, client, scaled, revision, scaled.Spec.Template.Roles)
+	same, err := CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), scaled, revision, scaled.Spec.Template.Roles)
 	require.NoError(t, err)
 	require.Equal(t, cr.Data.Raw, same.Data.Raw)
 	roles, err := GetRolesFromControllerRevision(same)
@@ -74,7 +75,7 @@ func TestRevisionIgnoresImmutableConfigurationAndKeepsRecordedCounts(t *testing.
 
 func TestRevisionRoleDecodeRejectsUnsupportedOrMalformedV1(t *testing.T) {
 	ms := configurationFixture()
-	cr, err := CreateControllerRevision(context.Background(), fake.NewSimpleClientset(), ms, "history", ms.Spec.Template.Roles)
+	cr, err := CreateControllerRevision(context.Background(), fake.NewSimpleClientset(), revisiontest.ControllerRevisions(fake.NewSimpleClientset()), ms, "history", ms.Spec.Template.Roles)
 	require.NoError(t, err)
 	cr.Annotations = map[string]string{ControllerRevisionDataVersionAnnotation: "v2"}
 	_, err = GetRolesFromControllerRevision(cr)

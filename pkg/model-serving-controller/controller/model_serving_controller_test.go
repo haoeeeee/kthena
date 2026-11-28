@@ -55,6 +55,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/plugins"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/plugins/ranktable"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
 
 type resourceSpec struct {
@@ -699,7 +700,7 @@ func TestGetPartition(t *testing.T) {
 			kthenaClient := kthenafake.NewSimpleClientset()
 			volcanoClient := volcanofake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
 			assert.NoError(t, err)
 
 			got, _, err := controller.getPartition(tt.partition, int(tt.replicas))
@@ -1505,7 +1506,7 @@ func TestModelServingControllerModelServingLifecycle(t *testing.T) {
 	kthenaInformerFactory := informersv1alpha1.NewSharedInformerFactory(kthenaClient, 0)
 
 	// Create controller
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake)
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake)
 	assert.NoError(t, err)
 
 	stop := make(chan struct{})
@@ -2505,7 +2506,7 @@ func TestScaleUpServingGroups(t *testing.T) {
 			apiextfake := apiextfake.NewSimpleClientset()
 
 			// Create controller without running it to avoid background sync interference
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake)
 			assert.NoError(t, err)
 
 			// Create a unique ModelServing for this test
@@ -2602,8 +2603,7 @@ func TestScaleUpServingGroupsStopsWhenControllerRevisionCreationFails(t *testing
 	kubeClient.PrependReactor("create", "controllerrevisions", func(kubetesting.Action) (bool, runtime.Object, error) {
 		return true, nil, fmt.Errorf("injected ControllerRevision creation failure")
 	})
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenafake.NewSimpleClientset(),
 		volcanofake.NewSimpleClientset(),
 		apiextfake.NewSimpleClientset(),
@@ -2731,7 +2731,7 @@ func TestScaleUpRoles(t *testing.T) {
 			apiextfake := apiextfake.NewSimpleClientset()
 
 			// Create controller without running it to avoid background sync interference
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake)
 			assert.NoError(t, err)
 
 			// Create a unique ModelServing for this test
@@ -2845,8 +2845,7 @@ func TestScaleUpRoles(t *testing.T) {
 
 func TestPartitionProtectedServingGroupUsesHistoricalTemplateWithLatestReplicas(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenafake.NewSimpleClientset(),
 		volcanofake.NewSimpleClientset(),
 		apiextfake.NewSimpleClientset(),
@@ -2931,7 +2930,7 @@ func TestPartitionProtectedServingGroupUsesHistoricalTemplateWithLatestReplicas(
 		},
 	}
 
-	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, oldRevision, oldRoles)
+	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, oldRevision, oldRoles)
 	require.NoError(t, err)
 
 	controller.store.AddServingGroup(utils.GetNamespaceName(ms), groupOrdinal, oldRevision)
@@ -3003,7 +3002,7 @@ func TestSyncRoleReplicasRecordedConfigurationBoundaries(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			kubeClient := kubefake.NewSimpleClientset()
-			controller, err := NewModelServingController(kubeClient, kthenafake.NewSimpleClientset(), volcanofake.NewSimpleClientset(), apiextfake.NewSimpleClientset())
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenafake.NewSimpleClientset(), volcanofake.NewSimpleClientset(), apiextfake.NewSimpleClientset())
 			require.NoError(t, err)
 			ms := &workloadv1alpha1.ModelServing{
 				ObjectMeta: metav1.ObjectMeta{Name: "recorded-boundary", Namespace: "default"},
@@ -3023,12 +3022,12 @@ func TestSyncRoleReplicasRecordedConfigurationBoundaries(t *testing.T) {
 			oldRoles[0].Replicas = ptr.To[int32](1)
 			oldRoles[0].EntryTemplate.Spec.Containers[0].Image = "old"
 			if !tt.missingHistory {
-				_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, "old", oldRoles)
+				_, err = utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, "old", oldRoles)
 				require.NoError(t, err)
 			}
 			revision := "old"
 			if tt.current {
-				_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, "new", ms.Spec.Template.Roles)
+				_, err = utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, "new", ms.Spec.Template.Roles)
 				require.NoError(t, err)
 				revision = "new"
 			}
@@ -3064,8 +3063,7 @@ func TestSyncRoleReplicasRecordedConfigurationBoundaries(t *testing.T) {
 
 func TestSyncRoleReplicasScalesOutdatedGroupWithRecordedTemplates(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenafake.NewSimpleClientset(),
 		volcanofake.NewSimpleClientset(),
 		apiextfake.NewSimpleClientset(),
@@ -3136,7 +3134,7 @@ func TestSyncRoleReplicasScalesOutdatedGroupWithRecordedTemplates(t *testing.T) 
 			}},
 		},
 	}
-	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, oldRevision, oldRoles)
+	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, oldRevision, oldRoles)
 	require.NoError(t, err)
 
 	key := utils.GetNamespaceName(ms)
@@ -3227,7 +3225,7 @@ func TestManageRoleReplicas(t *testing.T) {
 			volcanoClient := volcanofake.NewSimpleClientset()
 			apiextClient := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 			assert.NoError(t, err)
 
 			roleName := "default"
@@ -3460,8 +3458,7 @@ func TestReconcileDeletingRoleUsesLiveCheckWhenInformerIsStale(t *testing.T) {
 
 func TestManageRoleReplicasUsesMaxSurgeDuringRoleRollingUpdate(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -3537,8 +3534,7 @@ func TestManageRoleReplicasCombinesMaxSurgeAndCoordinationGate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			kubeClient := kubefake.NewSimpleClientset()
-			controller, err := NewModelServingController(
-				kubeClient,
+			controller, err := newControllerWithRevisionHistory(t, kubeClient,
 				kthenafake.NewSimpleClientset(),
 				nil,
 				apiextfake.NewSimpleClientset(),
@@ -3615,7 +3611,8 @@ func TestManageRoleReplicasCombinesMaxSurgeAndCoordinationGate(t *testing.T) {
 }
 
 func TestHasUpdateableOutdatedRole(t *testing.T) {
-	controller := &ModelServingController{kubeClientSet: kubefake.NewSimpleClientset()}
+	revisionClient := kubefake.NewSimpleClientset()
+	controller := &ModelServingController{kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 	partition := intstr.FromInt(1)
 	targetRole := workloadv1alpha1.Role{
 		Name:     "decode",
@@ -3734,7 +3731,7 @@ func TestScaleDownServingGroups(t *testing.T) {
 			volcanoClient := volcanofake.NewSimpleClientset()
 			apiextfake := apiextfake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake)
 			assert.NoError(t, err)
 
 			msName := fmt.Sprintf("test-scaledown-%d", idx)
@@ -3948,7 +3945,7 @@ func TestScaleDownServingGroupsWithPriorityAndDeletionCost(t *testing.T) {
 			kthenaClient := kthenafake.NewSimpleClientset()
 			volcanoClient := volcanofake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
 			assert.NoError(t, err)
 
 			msName := fmt.Sprintf("test-priority-scaledown-%d", idx)
@@ -4210,7 +4207,7 @@ func TestScaleDownServingGroupsWithPartition(t *testing.T) {
 			kthenaClient := kthenafake.NewSimpleClientset()
 			volcanoClient := volcanofake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
 			assert.NoError(t, err)
 
 			msName := fmt.Sprintf("test-partition-scaledown-%d", idx)
@@ -4422,7 +4419,7 @@ func TestModelServingVersionControl(t *testing.T) {
 			volcanoClient := volcanofake.NewSimpleClientset()
 			apiextfake := apiextfake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake)
 			assert.NoError(t, err)
 
 			msName := fmt.Sprintf("test-version-control-%d", idx)
@@ -4470,7 +4467,7 @@ func TestModelServingVersionControl(t *testing.T) {
 			if tt.partition != nil {
 				historicalRoles := ms.DeepCopy().Spec.Template.Roles
 				historicalRoles[0].EntryTemplate.Spec.Containers[0].Image = "historical-image:v1"
-				_, err := utils.CreateControllerRevision(context.Background(), kubeClient, ms, tt.initialRevision, historicalRoles)
+				_, err := utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, tt.initialRevision, historicalRoles)
 				assert.NoError(t, err, "Failed to create ControllerRevision for initial revision")
 			}
 
@@ -4606,7 +4603,7 @@ func TestScaleUpServingGroups_TemplateRecovery(t *testing.T) {
 			volcanoClient := volcanofake.NewSimpleClientset()
 			apiextfake := apiextfake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake)
 			assert.NoError(t, err)
 
 			// Use short name to avoid Kubernetes label length limits
@@ -4637,7 +4634,7 @@ func TestScaleUpServingGroups_TemplateRecovery(t *testing.T) {
 
 			// Create ControllerRevision with recovery template if needed
 			if tt.hasControllerRevision {
-				_, err := utils.CreateControllerRevision(ctx, kubeClient, ms, tt.currentRevision, tt.recoveryTemplateRoles)
+				_, err := utils.CreateControllerRevision(ctx, kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, tt.currentRevision, tt.recoveryTemplateRoles)
 				assert.NoError(t, err, "Failed to create ControllerRevision")
 			}
 
@@ -4776,7 +4773,7 @@ func TestUpdateModelServingStatusLabelSelector(t *testing.T) {
 			volcanoClient := volcanofake.NewSimpleClientset()
 			apiextClient := apiextfake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 			assert.NoError(t, err)
 
 			replicas := int32(len(tt.existingGroups))
@@ -4846,7 +4843,7 @@ func TestUpdateModelServingStatusLabelSelector(t *testing.T) {
 func TestUpdateModelServingStatusCountsAllServingGroups(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
 	kthenaClient := kthenafake.NewSimpleClientset()
-	controller, err := NewModelServingController(kubeClient, kthenaClient, nil, apiextfake.NewSimpleClientset())
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, nil, apiextfake.NewSimpleClientset())
 	require.NoError(t, err)
 
 	ms := &workloadv1alpha1.ModelServing{
@@ -4863,7 +4860,7 @@ func TestUpdateModelServingStatusCountsAllServingGroups(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, controller.modelServingsInformer.GetIndexer().Add(ms))
 
-	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, "new-revision", ms.Spec.Template.Roles)
+	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, "new-revision", ms.Spec.Template.Roles)
 	require.NoError(t, err)
 	key := utils.GetNamespaceName(ms)
 	for ordinal := 0; ordinal < 3; ordinal++ {
@@ -4924,7 +4921,7 @@ func TestUpdateModelServingStatusDistinguishesScalingFromRollingUpdate(t *testin
 		t.Run(tt.name, func(t *testing.T) {
 			kubeClient := kubefake.NewSimpleClientset()
 			kthenaClient := kthenafake.NewSimpleClientset()
-			controller, err := NewModelServingController(kubeClient, kthenaClient, nil, apiextfake.NewSimpleClientset())
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, nil, apiextfake.NewSimpleClientset())
 			require.NoError(t, err)
 
 			ms := &workloadv1alpha1.ModelServing{
@@ -5039,7 +5036,7 @@ func TestUpdateModelServingStatusRevisionFields(t *testing.T) {
 			volcanoClient := volcanofake.NewSimpleClientset()
 			apiextfake := apiextfake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake)
 			assert.NoError(t, err)
 
 			msName := fmt.Sprintf("test-revision-fields-%d", idx)
@@ -5084,7 +5081,7 @@ func TestUpdateModelServingStatusRevisionFields(t *testing.T) {
 			err = controller.modelServingsInformer.GetIndexer().Add(ms)
 			assert.NoError(t, err)
 
-			_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, tt.newRevision, ms.Spec.Template.Roles)
+			_, err = utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, tt.newRevision, ms.Spec.Template.Roles)
 			require.NoError(t, err)
 			seen := map[string]bool{tt.newRevision: true}
 			for _, revision := range tt.existingGroups {
@@ -5174,7 +5171,7 @@ func TestScaleDownRoles(t *testing.T) {
 			volcanoClient := volcanofake.NewSimpleClientset()
 			apiextfake := apiextfake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake)
 			assert.NoError(t, err)
 
 			msName := fmt.Sprintf("test-role-scaledown-%d", idx)
@@ -5258,7 +5255,7 @@ func TestScaleDownRolesSkipsDeletingRolesWhenActiveCountMatchesExpected(t *testi
 	kthenaClient := kthenafake.NewSimpleClientset()
 	volcanoClient := volcanofake.NewSimpleClientset()
 
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
 	assert.NoError(t, err)
 
 	ms := &workloadv1alpha1.ModelServing{
@@ -5476,7 +5473,7 @@ func TestScaleDownRolesWithPriorityAndDeletionCost(t *testing.T) {
 			kthenaClient := kthenafake.NewSimpleClientset()
 			volcanoClient := volcanofake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
 			assert.NoError(t, err)
 
 			msName := fmt.Sprintf("test-role-priority-scaledown-%d", idx)
@@ -5615,7 +5612,7 @@ func TestCalculateRoleScore(t *testing.T) {
 	kthenaClient := kthenafake.NewSimpleClientset()
 	volcanoClient := volcanofake.NewSimpleClientset()
 
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
 	assert.NoError(t, err)
 
 	ms := &workloadv1alpha1.ModelServing{
@@ -5832,7 +5829,7 @@ func TestScaleDownRolesRunningStatusDeprioritized(t *testing.T) {
 			volcanoClient := volcanofake.NewSimpleClientset()
 			apiextClient := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 			assert.NoError(t, err)
 
 			// Create ModelServing
@@ -5965,7 +5962,7 @@ func TestCalculateServingGroupScore(t *testing.T) {
 	kthenaClient := kthenafake.NewSimpleClientset()
 	volcanoClient := volcanofake.NewSimpleClientset()
 
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
 	assert.NoError(t, err)
 
 	ms := &workloadv1alpha1.ModelServing{
@@ -6199,7 +6196,7 @@ func TestCheckRoleReady(t *testing.T) {
 			kthenaClient := kthenafake.NewSimpleClientset()
 			volcanoClient := volcanofake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
 			assert.NoError(t, err)
 
 			groupName := utils.GenerateServingGroupName(ms.Name, 0)
@@ -6586,7 +6583,7 @@ func TestManageHeadlessService(t *testing.T) {
 			apiextClient := apiextfake.NewSimpleClientset()
 
 			// Create controller
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 			assert.NoError(t, err)
 
 			// Setup the datastore with serving groups and roles
@@ -6667,8 +6664,7 @@ func TestProductionPluginsCoexistOnPodCreate(t *testing.T) {
 	t.Setenv("POD_NAMESPACE", "default")
 
 	kubeClient := kubefake.NewSimpleClientset()
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenafake.NewSimpleClientset(),
 		volcanofake.NewSimpleClientset(),
 		apiextfake.NewSimpleClientset(),
@@ -6796,8 +6792,7 @@ func TestServingGroupDeletePluginsRunOnFastDeletionPath(t *testing.T) {
 	}}
 	ranktableCM.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(ms, workloadv1alpha1.SchemeGroupVersion.WithKind("ModelServing"))}
 	kubeClient := kubefake.NewSimpleClientset(ranktableCM)
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenafake.NewSimpleClientset(),
 		volcanofake.NewSimpleClientset(),
 		apiextfake.NewSimpleClientset(),
@@ -6854,8 +6849,7 @@ func TestCleanupHeadlessServices(t *testing.T) {
 	}
 
 	kubeClient := kubefake.NewSimpleClientset()
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenafake.NewSimpleClientset(),
 		volcanofake.NewSimpleClientset(),
 		apiextfake.NewSimpleClientset(),
@@ -6914,8 +6908,7 @@ func TestCleanupHeadlessServicesReturnsDeleteError(t *testing.T) {
 	kubeClient.PrependReactor("delete", "services", func(kubetesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewInternalError(fmt.Errorf("delete failed"))
 	})
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenafake.NewSimpleClientset(),
 		volcanofake.NewSimpleClientset(),
 		apiextfake.NewSimpleClientset(),
@@ -6946,7 +6939,7 @@ func TestSyncAllWithFailedPods(t *testing.T) {
 	apiextClient := apiextfake.NewSimpleClientset()
 
 	// Create controller first to get access to informers
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 	assert.NoError(t, err)
 
 	// Create the ModelServing resource with a UID for owner reference
@@ -7043,7 +7036,7 @@ func TestSyncAllWithContainerRestartedPods(t *testing.T) {
 	apiextClient := apiextfake.NewSimpleClientset()
 
 	// Create controller first to get access to informers
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 	assert.NoError(t, err)
 
 	// Create the ModelServing resource
@@ -7138,7 +7131,7 @@ func TestSyncAllWithMixedPods(t *testing.T) {
 	apiextClient := apiextfake.NewSimpleClientset()
 
 	// Create controller first to get access to informers
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 	assert.NoError(t, err)
 
 	// Create the ModelServing resource
@@ -7567,7 +7560,7 @@ func newGracePeriodTestController(t *testing.T, ms *workloadv1alpha1.ModelServin
 		kubeClientSet:      kubeClient,
 		modelServingClient: kthenafake.NewSimpleClientset(ms.DeepCopy()),
 		podsLister:         corelisters.NewPodLister(indexer),
-		modelServingLister: mslisters.NewModelServingLister(msIndexer),
+		modelServingLister: mslisters.NewModelServingLister(msIndexer), controllerRevisionLister: revisiontest.ControllerRevisions(kubeClient),
 	}
 	return controller, kubeClient
 }
@@ -7594,7 +7587,7 @@ func TestSyncAllBeforeFixBehavior(t *testing.T) {
 	apiextClient := apiextfake.NewSimpleClientset()
 
 	// Create controller first to get access to informers
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 	assert.NoError(t, err)
 
 	ms := &workloadv1alpha1.ModelServing{
@@ -7806,7 +7799,7 @@ func TestUpdateModelServingWithNilGangPolicy(t *testing.T) {
 			volcanoClient := volcanofake.NewSimpleClientset()
 			apiextClient := apiextfake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenaClient, volcanoClient, apiextClient)
 			assert.NoError(t, err)
 
 			// This should not panic - before fix it would panic with nil pointer dereference
@@ -7873,7 +7866,7 @@ func TestDeleteRolePreservesDeletionPhaseOnFailure(t *testing.T) {
 			apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
 
 			// Create controller
-			controller, err := NewModelServingController(client, kthenaClient, volcanoClient, apiextfake)
+			controller, err := newControllerWithRevisionHistory(t, client, kthenaClient, volcanoClient, apiextfake)
 			assert.NoError(t, err)
 
 			if tt.podDeletionError != nil {
@@ -8210,10 +8203,13 @@ func TestHandleReadyPodRoleStatusUpdate(t *testing.T) {
 				servicesInformer: serviceInformer.Informer(),
 				servicesLister:   serviceInformer.Lister(),
 				store:            store,
-				workqueue:        workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()), //nolint:staticcheck
+				workqueue:        workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()), controllerRevisionLister: //nolint:staticcheck
+				revisiontest.
+
+					// Start informers
+					ControllerRevisions(kubeClient),
 			}
 
-			// Start informers
 			stop := make(chan struct{})
 			defer close(stop)
 			kubeInformerFactory.Start(stop)
@@ -8406,7 +8402,7 @@ func TestHandleReadyPodEnqueuesIntermediateCoordinatedRole(t *testing.T) {
 				servicesInformer: serviceInformer.Informer(),
 				servicesLister:   serviceInformer.Lister(),
 				store:            store,
-				workqueue:        queue,
+				workqueue:        queue, controllerRevisionLister: revisiontest.ControllerRevisions(kubeClient),
 			}
 
 			pod := &corev1.Pod{
@@ -8503,7 +8499,7 @@ func TestDeleteServingGroupPreservesDeletionPhaseOnFailure(t *testing.T) {
 			apiextClient := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
 
 			// Create controller
-			controller, err := NewModelServingController(client, kthenaClient, volcanoClient, apiextClient)
+			controller, err := newControllerWithRevisionHistory(t, client, kthenaClient, volcanoClient, apiextClient)
 			assert.NoError(t, err)
 
 			podGroupManager := podgroupmanager.NewManager(client, volcanoClient, apiextClient, nil)
@@ -8742,7 +8738,7 @@ func TestDeleteOutdatedServingGroups(t *testing.T) {
 			modelServingClient := kthenafake.NewSimpleClientset()
 			apiextensionsClient := apiextfake.NewSimpleClientset()
 
-			controller, err := NewModelServingController(kubeClient, modelServingClient, nil, apiextensionsClient)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, modelServingClient, nil, apiextensionsClient)
 			assert.NoError(t, err)
 
 			ms := &workloadv1alpha1.ModelServing{
@@ -8780,8 +8776,7 @@ func TestDeleteOutdatedServingGroups(t *testing.T) {
 }
 
 func TestServingGroupMaxSurgeRestoresOrdinals(t *testing.T) {
-	controller, err := NewModelServingController(
-		kubefake.NewSimpleClientset(),
+	controller, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(),
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -8954,8 +8949,7 @@ func TestManageRollingUpdateIncludesSurgeStatusInMaxScaleDown(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			controller, err := NewModelServingController(
-				kubefake.NewSimpleClientset(),
+			controller, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(),
 				kthenafake.NewSimpleClientset(),
 				nil,
 				apiextfake.NewSimpleClientset(),
@@ -9079,11 +9073,11 @@ func TestHasUpdateableOutdatedServingGroup(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ms := createStandardModelServing("recovery", 2, 1)
-			controller, err := NewModelServingController(kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
+			controller, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
 			require.NoError(t, err)
 			old := ms.DeepCopy()
 			old.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "old-image"
-			_, err = utils.CreateControllerRevision(context.Background(), controller.kubeClientSet, ms, "old", old.Spec.Template.Roles)
+			_, err = utils.CreateControllerRevision(context.Background(), controller.kubeClientSet, revisiontest.ControllerRevisions(controller.kubeClientSet), ms, "old", old.Spec.Template.Roles)
 			require.NoError(t, err)
 			for _, group := range tt.groups {
 				_, ordinal := utils.GetParentNameAndOrdinal(group.Name)
@@ -9095,8 +9089,7 @@ func TestHasUpdateableOutdatedServingGroup(t *testing.T) {
 }
 
 func TestSyncServingGroupReplicasPreservesSparseOrdinals(t *testing.T) {
-	controller, err := NewModelServingController(
-		kubefake.NewSimpleClientset(),
+	controller, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(),
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -9137,15 +9130,14 @@ func TestSyncModelServingReusesEquivalentLegacySparseRevisionWithoutPodMutation(
 
 	kubeClient := kubefake.NewSimpleClientset()
 	kthenaClient := kthenafake.NewSimpleClientset(ms.DeepCopy())
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenaClient,
 		nil,
 		apiextfake.NewSimpleClientset(),
 	)
 	require.NoError(t, err)
 	require.NoError(t, controller.modelServingsInformer.GetIndexer().Add(ms))
-	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, legacyRevision, ms.Spec.Template.Roles)
+	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, legacyRevision, ms.Spec.Template.Roles)
 	require.NoError(t, err)
 
 	originalUIDs := make(map[string]types.UID)
@@ -9235,8 +9227,7 @@ func addReadyLegacyGroupToController(
 
 func TestSyncServingGroupReplicasPrunesDeletedGroupsBeforeScaleUp(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
-	controller, err := NewModelServingController(
-		kubeClient,
+	controller, err := newControllerWithRevisionHistory(t, kubeClient,
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -9299,8 +9290,7 @@ func TestSyncServingGroupReplicasPrunesDeletedGroupsBeforeScaleUp(t *testing.T) 
 }
 
 func TestServingGroupUpdateCreatesSurgeWithoutStoredPhase(t *testing.T) {
-	controller, err := NewModelServingController(
-		kubefake.NewSimpleClientset(),
+	controller, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(),
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -9335,8 +9325,7 @@ func TestServingGroupUpdateCreatesSurgeWithoutStoredPhase(t *testing.T) {
 }
 
 func TestServingGroupRollingUpdateCountsUnavailableProtectedGroups(t *testing.T) {
-	controller, err := NewModelServingController(
-		kubefake.NewSimpleClientset(),
+	controller, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(),
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -9381,8 +9370,7 @@ func TestServingGroupRollingUpdateCountsUnavailableProtectedGroups(t *testing.T)
 }
 
 func TestSyncServingGroupReplicasHonorsReducedMaxSurge(t *testing.T) {
-	controller, err := NewModelServingController(
-		kubefake.NewSimpleClientset(),
+	controller, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(),
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -9423,7 +9411,7 @@ func TestSyncServingGroupReplicasHonorsReducedMaxSurge(t *testing.T) {
 
 func TestServingGroupReadinessUsesOrdinalPartitionWithSparseGroups(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
-	controller, err := NewModelServingController(kubeClient, kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
+	controller, err := newControllerWithRevisionHistory(t, kubeClient, kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
 	require.NoError(t, err)
 
 	partition := intstr.FromInt(1)
@@ -9439,7 +9427,7 @@ func TestServingGroupReadinessUsesOrdinalPartitionWithSparseGroups(t *testing.T)
 		},
 	}
 	oldRoles := []workloadv1alpha1.Role{{Name: "decode", Replicas: ptr.To[int32](1)}}
-	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, "old-revision", oldRoles)
+	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, "old-revision", oldRoles)
 	require.NoError(t, err)
 
 	key := utils.GetNamespaceName(ms)
@@ -9474,7 +9462,7 @@ func TestCheckServingGroupReadyDefaultsNilRoleReplicas(t *testing.T) {
 
 func TestPartitionReadinessRejectsEmptyHistoricalRoles(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
-	controller := &ModelServingController{store: datastore.New(), kubeClientSet: kubeClient}
+	controller := &ModelServingController{store: datastore.New(), kubeClientSet: kubeClient, controllerRevisionLister: revisiontest.ControllerRevisions(kubeClient)}
 	partition := intstr.FromInt(1)
 	ms := &workloadv1alpha1.ModelServing{
 		ObjectMeta: metav1.ObjectMeta{Name: "empty-history", Namespace: "default", UID: types.UID("empty-history-uid")},
@@ -9492,7 +9480,7 @@ func TestPartitionReadinessRejectsEmptyHistoricalRoles(t *testing.T) {
 			}}},
 		},
 	}
-	_, err := utils.CreateControllerRevision(context.Background(), kubeClient, ms, "old-revision", []workloadv1alpha1.Role{})
+	_, err := utils.CreateControllerRevision(context.Background(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, "old-revision", []workloadv1alpha1.Role{})
 	require.NoError(t, err)
 	controller.store.AddServingGroup(utils.GetNamespaceName(ms), 0, "old-revision")
 
@@ -9547,7 +9535,7 @@ func TestDeleteOutdatedRolesForRoleRollingUpdateWithMaxUnavailable(t *testing.T)
 			kubeClient := kubefake.NewSimpleClientset()
 			modelServingClient := kthenafake.NewSimpleClientset()
 			apiextensionsClient := apiextfake.NewSimpleClientset()
-			controller, err := NewModelServingController(kubeClient, modelServingClient, nil, apiextensionsClient)
+			controller, err := newControllerWithRevisionHistory(t, kubeClient, modelServingClient, nil, apiextensionsClient)
 			require.NoError(t, err)
 			controller.store = datastore.New()
 
@@ -9872,7 +9860,8 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 			store := datastore.New()
 			tt.setupStore(t, store, ms)
 
-			controller := &ModelServingController{store: store, kubeClientSet: kubefake.NewSimpleClientset()}
+			revisionClient := kubefake.NewSimpleClientset()
+			controller := &ModelServingController{store: store, kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 			if !tt.missingHistory {
 				recordDifferentRevision(t, controller, ms, oldRevision)
 			}
@@ -9922,7 +9911,7 @@ func TestRolesToDeleteForRoleRollingUpdate_LegacyRoleTemplateHashFromControllerR
 	}
 
 	kubeClient := kubefake.NewSimpleClientset()
-	_, err := utils.CreateControllerRevision(context.TODO(), kubeClient, ms, oldRevision, []workloadv1alpha1.Role{oldRole})
+	_, err := utils.CreateControllerRevision(context.TODO(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, oldRevision, []workloadv1alpha1.Role{oldRole})
 	require.NoError(t, err)
 
 	store := datastore.New()
@@ -9930,7 +9919,7 @@ func TestRolesToDeleteForRoleRollingUpdate_LegacyRoleTemplateHashFromControllerR
 	store.AddRole(utils.GetNamespaceName(ms), groupName, roleName, "prefill-0", oldRevision, "")
 	require.NoError(t, store.UpdateRoleStatus(utils.GetNamespaceName(ms), groupName, roleName, "prefill-0", datastore.RoleRunning))
 
-	controller := &ModelServingController{store: store, kubeClientSet: kubeClient}
+	controller := &ModelServingController{store: store, kubeClientSet: kubeClient, controllerRevisionLister: revisiontest.ControllerRevisions(kubeClient)}
 	rolesToDelete, hasOutdatedRoles, err := controller.rolesToDeleteForRoleRollingUpdate(context.Background(),
 		ms,
 		datastore.ServingGroup{Name: groupName, Revision: oldRevision, Status: datastore.ServingGroupRunning},
@@ -10007,7 +9996,8 @@ func TestRolesToDeleteForRoleRollingUpdate_CoordinatedDependencyStartup(t *testi
 		}
 		decision, err := calculateRoleRolloutLimits(states, ms.Spec.RolloutStrategy.RoleCoordination)
 		require.NoError(t, err)
-		controller := &ModelServingController{store: store, kubeClientSet: kubefake.NewSimpleClientset()}
+		revisionClient := kubefake.NewSimpleClientset()
+		controller := &ModelServingController{store: store, kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 		recordDifferentRevision(t, controller, ms, "old-revision")
 		return controller, &decision
 	}
@@ -10425,8 +10415,9 @@ func TestFindOutdatedRolesInServingGroups(t *testing.T) {
 			}
 
 			// Create controller
+			revisionClient := kubefake.NewSimpleClientset()
 			controller := &ModelServingController{
-				store: store, kubeClientSet: kubefake.NewSimpleClientset(),
+				store: store, kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient),
 			}
 			recordDifferentRevision(t, controller, ms, oldRevision)
 
@@ -10538,10 +10529,10 @@ func TestCompareRoleTemplate_FromControllerRevision(t *testing.T) {
 	}
 
 	kubeClient := kubefake.NewSimpleClientset()
-	_, err := utils.CreateControllerRevision(context.TODO(), kubeClient, ms, oldRevision, []workloadv1alpha1.Role{oldRole})
+	_, err := utils.CreateControllerRevision(context.TODO(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, oldRevision, []workloadv1alpha1.Role{oldRole})
 	assert.NoError(t, err)
 
-	controller := &ModelServingController{kubeClientSet: kubeClient}
+	controller := &ModelServingController{kubeClientSet: kubeClient, controllerRevisionLister: revisiontest.ControllerRevisions(kubeClient)}
 	comparison := controller.compareRoleTemplate(context.Background(),
 		ms,
 		datastore.ServingGroup{Name: "test-ms-0", Revision: oldRevision},
@@ -10574,10 +10565,10 @@ func TestResolveRoleTemplateHash_UsesPodRevisionControllerRevision(t *testing.T)
 	}
 
 	kubeClient := kubefake.NewSimpleClientset()
-	_, err := utils.CreateControllerRevision(context.TODO(), kubeClient, ms, revision, []workloadv1alpha1.Role{oldRole})
+	_, err := utils.CreateControllerRevision(context.TODO(), kubeClient, revisiontest.ControllerRevisions(kubeClient), ms, revision, []workloadv1alpha1.Role{oldRole})
 	assert.NoError(t, err)
 
-	controller := &ModelServingController{kubeClientSet: kubeClient}
+	controller := &ModelServingController{kubeClientSet: kubeClient, controllerRevisionLister: revisiontest.ControllerRevisions(kubeClient)}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Namespace: ns,
 		Name:      "test-pod",
@@ -10600,7 +10591,8 @@ func TestResolveRoleTemplateHash_ReturnsEmptyWhenControllerRevisionNotFound(t *t
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: msName},
 	}
 
-	controller := &ModelServingController{kubeClientSet: kubefake.NewSimpleClientset()}
+	revisionClient := kubefake.NewSimpleClientset()
+	controller := &ModelServingController{kubeClientSet: revisionClient, controllerRevisionLister: revisiontest.ControllerRevisions(revisionClient)}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Namespace: ns,
 		Name:      "test-pod",

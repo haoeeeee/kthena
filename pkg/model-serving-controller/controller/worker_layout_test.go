@@ -27,6 +27,7 @@ import (
 	api "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 	corev1 "k8s.io/api/core/v1"
 	apiextfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -48,13 +49,13 @@ func workerLayoutFixture(t *testing.T, before, after int32, strategy api.Rollout
 	ms.Spec.Template.Roles[0].WorkerReplicas = after
 	ms.Status.CurrentRevision = utils.ModelServingRevision(old)
 	ms.Status.UpdateRevision = utils.ModelServingRevision(ms)
-	c, err := NewModelServingController(kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(ms.DeepCopy()), nil, apiextfake.NewSimpleClientset())
+	c, err := newControllerWithRevisionHistory(t, kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(ms.DeepCopy()), nil, apiextfake.NewSimpleClientset())
 	require.NoError(t, err)
 	c.podGroupManager = &fakePodGroupManager{}
 	t.Cleanup(c.workqueue.ShutDown)
 	require.NoError(t, c.modelServingsInformer.GetIndexer().Add(ms))
 	for _, version := range []*api.ModelServing{old, ms} {
-		_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, ms, utils.ModelServingRevision(version), version.Spec.Template.Roles)
+		_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, utils.ModelServingRevision(version), version.Spec.Template.Roles)
 		require.NoError(t, err)
 	}
 	for i := 0; i < 3; i++ {
@@ -295,7 +296,7 @@ func TestWorkerLayoutPreservesLiveHistoryAfterGroupRevisionReplay(t *testing.T) 
 	// revision must survive even when the SG has advanced ahead of its Roles.
 	unused := old.DeepCopy()
 	unused.Spec.Template.Roles[0].WorkerReplicas = 0
-	_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, utils.ModelServingRevision(unused), unused.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, utils.ModelServingRevision(unused), unused.Spec.Template.Roles)
 	require.NoError(t, err)
 	revision := utils.ModelServingRevision(ms)
 	require.NoError(t, c.store.UpdateServingGroupRevision(utils.GetNamespaceName(ms), "layout-0", revision))
@@ -340,7 +341,7 @@ func TestNewGroupRolePartitionMatchesRoleScaleUp(t *testing.T) {
 						return nil, 0
 					}}
 					for _, version := range []*api.ModelServing{old, ms} {
-						_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, version, utils.ModelServingRevision(version), version.Spec.Template.Roles)
+						_, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), version, utils.ModelServingRevision(version), version.Spec.Template.Roles)
 						require.NoError(t, err)
 					}
 					key := utils.GetNamespaceName(ms)

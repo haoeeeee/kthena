@@ -25,6 +25,7 @@ import (
 	api "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 	extensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,7 +40,7 @@ func TestImmutableOwnerConfigurationUsedWithHistoricalRole(t *testing.T) {
 	desired.Spec.Plugins[0].Config.Raw = []byte(`{"annotations":{"version":"owner"}}`)
 	desired.Spec.SchedulerName = "custom"
 	c := newRevisionTestController(t, desired)
-	cr, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, old, "historical", old.Spec.Template.Roles)
+	cr, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), old, "historical", old.Spec.Template.Roles)
 	require.NoError(t, err)
 	// Exercise a versioned snapshot as well as the controller's Roles-only
 	// format. Its global fields must not override the fixed owner inputs.
@@ -88,7 +89,7 @@ func TestLegacyConfigurationMigrationKeepsRevision(t *testing.T) {
 	ms.Status.CurrentRevision = "legacy"
 	ms.Status.UpdateRevision = "legacy"
 	c := newRevisionTestController(t, ms)
-	source, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, "legacy", ms.Spec.Template.Roles)
+	source, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), ms, "legacy", ms.Spec.Template.Roles)
 	require.NoError(t, err)
 	source.Annotations = nil
 	source.Data.Raw, err = json.Marshal(map[string]any{"data": ms.Spec.Template.Roles})

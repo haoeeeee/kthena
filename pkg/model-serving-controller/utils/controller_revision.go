@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	appslisters "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/klog/v2"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
@@ -49,8 +50,9 @@ const (
 // CreateControllerRevision maintains the legacy wrapped Role revision format
 // used by the current controller integration. New v1 revision paths must use
 // BuildRevisionData and RecordModelServingRevision so revision data remains
-// immutable.
-func CreateControllerRevision(ctx context.Context, client kubernetes.Interface, ms *workloadv1alpha1.ModelServing, revision string, templateData interface{}) (*appsv1.ControllerRevision, error) {
+// immutable. New snapshots use the highest owned history number plus one;
+// reusing an existing snapshot preserves its number and data.
+func CreateControllerRevision(ctx context.Context, client kubernetes.Interface, revisions appslisters.ControllerRevisionLister, ms *workloadv1alpha1.ModelServing, revision string, templateData interface{}) (*appsv1.ControllerRevision, error) {
 	// Serialize template data
 	// Wrap data in a map to ensure it's a valid JSON object (Kubernetes requirement for RawExtension)
 	wrappedData := map[string]interface{}{
@@ -87,6 +89,20 @@ func CreateControllerRevision(ctx context.Context, client kubernetes.Interface, 
 		return nil, fmt.Errorf("failed to get ControllerRevision: %w", err)
 	}
 
+	// Read informer history so numbering survives restarts and history cleanup.
+	// Labels narrow the list; ownership excludes history from an older ModelServing
+	// with the same name and from unrelated objects carrying the same label.
+	history, err := revisions.ControllerRevisions(ms.Namespace).List(labels.SelectorFromSet(map[string]string{ControllerRevisionLabelKey: ms.Name}))
+	if err != nil {
+		return nil, fmt.Errorf("failed to list ControllerRevisions: %w", err)
+	}
+	var maxRevision int64
+	for _, previous := range history {
+		if metav1.IsControlledBy(previous, ms) && previous.Revision > maxRevision {
+			maxRevision = previous.Revision
+		}
+	}
+
 	// Create ControllerRevision
 	cr := &appsv1.ControllerRevision{
 		ObjectMeta: metav1.ObjectMeta{
@@ -100,7 +116,7 @@ func CreateControllerRevision(ctx context.Context, client kubernetes.Interface, 
 				newModelServingOwnerRef(ms),
 			},
 		},
-		Revision: 1, // ControllerRevision revision number
+		Revision: maxRevision + 1,
 		Data: runtime.RawExtension{
 			Raw: data,
 		},
@@ -199,6 +215,7 @@ func GetRolesFromControllerRevision(cr *appsv1.ControllerRevision) ([]workloadv1
 func CleanupOldControllerRevisions(
 	ctx context.Context,
 	client kubernetes.Interface,
+	revisions appslisters.ControllerRevisionLister,
 	ms *workloadv1alpha1.ModelServing,
 	referencedRevisions ...string,
 ) error {
@@ -207,9 +224,7 @@ func CleanupOldControllerRevisions(
 		ControllerRevisionLabelKey: ms.Name,
 	})
 
-	list, err := client.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: selector.String(),
-	})
+	history, err := revisions.ControllerRevisions(ms.Namespace).List(selector)
 	if err != nil {
 		return fmt.Errorf("failed to list ControllerRevisions: %v", err)
 	}
@@ -253,8 +268,7 @@ func CleanupOldControllerRevisions(
 		historyLimit = max(0, int(*ms.Spec.RevisionHistoryLimit))
 	}
 	var unused []*appsv1.ControllerRevision
-	for i := range list.Items {
-		revision := &list.Items[i]
+	for _, revision := range history {
 		if !metav1.IsControlledBy(revision, ms) {
 			continue
 		}
@@ -264,14 +278,15 @@ func CleanupOldControllerRevisions(
 		}
 		unused = append(unused, revision)
 	}
-	sort.Slice(unused, func(i, j int) bool { return controllerRevisionLess(unused[i], unused[j]) })
+	sort.Slice(unused, func(i, j int) bool { return ControllerRevisionLess(unused[i], unused[j]) })
 
 	deletedCount := 0
 	var deletionErrors []error
 	for _, revision := range unused[:max(0, len(unused)-historyLimit)] {
 		uid := revision.UID
+		resourceVersion := revision.ResourceVersion
 		err := client.AppsV1().ControllerRevisions(ms.Namespace).Delete(ctx, revision.Name, metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid},
+			Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
 		})
 		if err != nil && !apierrors.IsNotFound(err) {
 			deletionErrors = append(deletionErrors, fmt.Errorf("delete ControllerRevision %s/%s: %w", ms.Namespace, revision.Name, err))

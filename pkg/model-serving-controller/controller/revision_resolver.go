@@ -241,43 +241,29 @@ func (h *revisionHistory) role(ctx context.Context, revision, name string) (work
 	return workloadv1alpha1.Role{}, &revisionResolutionError{fmt.Errorf("Role %s not found in ControllerRevision %s", name, revision)}
 }
 
-// desiredRevision keeps an existing identity when its immutable template is
-// equivalent, even if a newer binary calculates a different hash. The current
-// status wins deterministically; otherwise use the newest equivalent history.
+// desiredRevision follows the StatefulSet revision lifecycle: reuse the latest
+// equivalent snapshot, promote an older equivalent snapshot on rollback, or
+// create a new snapshot. Promotion changes only the numeric revision, preserving
+// historical identities even if a newer binary calculates a different hash.
 // Scheduler/plugins are immutable owner configuration, so only Role templates
 // participate in semantic history comparisons.
 func (h *revisionHistory) desiredRevision(ctx context.Context) (string, error) {
-	list, err := h.controller.kubeClientSet.AppsV1().ControllerRevisions(h.ms.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labels.SelectorFromSet(map[string]string{utils.ControllerRevisionLabelKey: h.ms.Name}).String(),
-	})
+	listed, err := h.controller.controllerRevisionLister.ControllerRevisions(h.ms.Namespace).List(
+		labels.SelectorFromSet(map[string]string{utils.ControllerRevisionLabelKey: h.ms.Name}))
 	if err != nil {
 		return "", fmt.Errorf("list ControllerRevisions: %w", err)
 	}
-	priority := func(cr appsv1.ControllerRevision) int {
-		revision := cr.Labels[utils.ControllerRevisionRevisionLabelKey]
-		if revision == h.ms.Status.UpdateRevision {
-			return 2
+	var history []*appsv1.ControllerRevision
+	for _, revision := range listed {
+		if metav1.IsControlledBy(revision, h.ms) {
+			history = append(history, revision)
 		}
-		if revision == h.ms.Status.CurrentRevision {
-			return 1
-		}
-		return 0
 	}
-	sort.Slice(list.Items, func(i, j int) bool {
-		a, b := list.Items[i], list.Items[j]
-		if priority(a) != priority(b) {
-			return priority(a) > priority(b)
-		}
-		if a.Revision != b.Revision {
-			return a.Revision > b.Revision
-		}
-		if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
-			return b.CreationTimestamp.Before(&a.CreationTimestamp)
-		}
-		return a.Name < b.Name
+	// Newest first, using the same ordering as StatefulSet controller history.
+	sort.Slice(history, func(i, j int) bool {
+		return utils.ControllerRevisionLess(history[j], history[i])
 	})
-	for i := range list.Items {
-		cr := &list.Items[i]
+	for _, cr := range history {
 		revision := cr.Labels[utils.ControllerRevisionRevisionLabelKey]
 		if revision == "" || cr.Name != utils.GenerateControllerRevisionName(h.ms.Name, revision) {
 			continue
@@ -286,12 +272,20 @@ func (h *revisionHistory) desiredRevision(ctx context.Context) (string, error) {
 		if snapshot.err == nil {
 			h.snapshots[revision] = snapshot
 			if utils.EqualRoleTemplatesForRevision(snapshot.roles, h.ms.Spec.Template.Roles) {
+				if cr.Name != history[0].Name {
+					promoted, err := utils.UpdateControllerRevision(ctx, h.controller.kubeClientSet, cr, history[0].Revision+1)
+					if err != nil {
+						return "", fmt.Errorf("promote rollback ControllerRevision: %w", err)
+					}
+					snapshot.revision = promoted
+					h.snapshots[revision] = snapshot
+				}
 				return h.selectTarget(ctx, revision)
 			}
 		}
 	}
 	revision := utils.ModelServingRevision(h.ms)
-	cr, err := utils.CreateControllerRevision(ctx, h.controller.kubeClientSet, h.ms, revision, h.ms.Spec.Template.Roles)
+	cr, err := utils.CreateControllerRevision(ctx, h.controller.kubeClientSet, h.controller.controllerRevisionLister, h.ms, revision, h.ms.Spec.Template.Roles)
 	if err != nil {
 		return "", fmt.Errorf("persist desired ControllerRevision: %w", err)
 	}

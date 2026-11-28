@@ -92,7 +92,7 @@ func (h *revisionHistory) recordMissingRevisionRollout(ctx context.Context, targ
 	if len(missing) == 0 {
 		return nil
 	}
-	cr, err := utils.CreateControllerRevision(ctx, h.controller.kubeClientSet, h.ms, target, h.ms.Spec.Template.Roles)
+	cr, err := utils.CreateControllerRevision(ctx, h.controller.kubeClientSet, h.controller.controllerRevisionLister, h.ms, target, h.ms.Spec.Template.Roles)
 	if err != nil {
 		return err
 	}

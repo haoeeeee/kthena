@@ -42,6 +42,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	appslisters "k8s.io/client-go/listers/apps/v1"
 	listerv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
@@ -105,16 +106,18 @@ type ModelServingController struct {
 	kubeClientSet      kubernetes.Interface
 	modelServingClient clientset.Interface
 
-	syncHandler           func(ctx context.Context, msKey string) error
-	podGroupManager       PodGroupManager
-	podsLister            listerv1.PodLister
-	podsInformer          cache.SharedIndexInformer
-	servicesLister        listerv1.ServiceLister
-	servicesInformer      cache.SharedIndexInformer
-	configMapsLister      listerv1.ConfigMapLister
-	configMapsInformer    cache.SharedIndexInformer
-	modelServingLister    listerv1alpha1.ModelServingLister
-	modelServingsInformer cache.SharedIndexInformer
+	syncHandler                 func(ctx context.Context, msKey string) error
+	podGroupManager             PodGroupManager
+	podsLister                  listerv1.PodLister
+	podsInformer                cache.SharedIndexInformer
+	servicesLister              listerv1.ServiceLister
+	servicesInformer            cache.SharedIndexInformer
+	configMapsLister            listerv1.ConfigMapLister
+	configMapsInformer          cache.SharedIndexInformer
+	modelServingLister          listerv1alpha1.ModelServingLister
+	modelServingsInformer       cache.SharedIndexInformer
+	controllerRevisionLister    appslisters.ControllerRevisionLister
+	controllerRevisionsInformer cache.SharedIndexInformer
 
 	// nolint
 	workqueue       workqueue.RateLimitingInterface
@@ -150,6 +153,13 @@ func NewModelServingController(kubeClientSet kubernetes.Interface, modelServingC
 	configMapsInformer := kubeInformerFactory.Core().V1().ConfigMaps()
 	modelServingInformerFactory := informersv1alpha1.NewSharedInformerFactory(modelServingClient, 0)
 	modelServingInformer := modelServingInformerFactory.Workload().V1alpha1().ModelServings()
+	// Revisions carry the ModelServing label, not the ServingGroup label used
+	// by the Pod/Service informer factory above.
+	revisionInformerFactory := informers.NewSharedInformerFactoryWithOptions(kubeClientSet, 0,
+		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+			opts.LabelSelector = workloadv1alpha1.ModelServingNameLabelKey
+		}))
+	controllerRevisions := revisionInformerFactory.Apps().V1().ControllerRevisions()
 
 	err = podsInformer.Informer().AddIndexers(cache.Indexers{
 		GroupNameKey: utils.GroupNameIndexFunc,
@@ -173,17 +183,19 @@ func NewModelServingController(kubeClientSet kubernetes.Interface, modelServingC
 	)
 
 	c := &ModelServingController{
-		kubeClientSet:         kubeClientSet,
-		modelServingClient:    modelServingClient,
-		podGroupManager:       nil,
-		podsLister:            podsInformer.Lister(),
-		podsInformer:          podsInformer.Informer(),
-		servicesLister:        servicesInformer.Lister(),
-		servicesInformer:      servicesInformer.Informer(),
-		configMapsLister:      configMapsInformer.Lister(),
-		configMapsInformer:    configMapsInformer.Informer(),
-		modelServingLister:    modelServingInformer.Lister(),
-		modelServingsInformer: modelServingInformer.Informer(),
+		kubeClientSet:               kubeClientSet,
+		modelServingClient:          modelServingClient,
+		podGroupManager:             nil,
+		podsLister:                  podsInformer.Lister(),
+		podsInformer:                podsInformer.Informer(),
+		servicesLister:              servicesInformer.Lister(),
+		servicesInformer:            servicesInformer.Informer(),
+		configMapsLister:            configMapsInformer.Lister(),
+		configMapsInformer:          configMapsInformer.Informer(),
+		modelServingLister:          modelServingInformer.Lister(),
+		modelServingsInformer:       modelServingInformer.Informer(),
+		controllerRevisionLister:    controllerRevisions.Lister(),
+		controllerRevisionsInformer: controllerRevisions.Informer(),
 		// nolint
 		workqueue:       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ModelServings"),
 		store:           store,
@@ -775,6 +787,7 @@ func (c *ModelServingController) Run(ctx context.Context, workers int) {
 	go c.servicesInformer.RunWithContext(ctx)
 	go c.configMapsInformer.RunWithContext(ctx)
 	go c.modelServingsInformer.RunWithContext(ctx)
+	go c.controllerRevisionsInformer.RunWithContext(ctx)
 
 	if err := c.podGroupManager.Run(ctx); err != nil {
 		klog.Errorf("failed to start PodGroup informer: %v", err)
@@ -786,6 +799,7 @@ func (c *ModelServingController) Run(ctx context.Context, workers int) {
 		c.servicesInformer.HasSynced,
 		c.configMapsInformer.HasSynced,
 		c.modelServingsInformer.HasSynced,
+		c.controllerRevisionsInformer.HasSynced,
 	) || ctx.Err() != nil {
 		return
 	}
@@ -1073,7 +1087,7 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 			} else if revisionToUse == newRevision {
 				// First startup: persist the current template before creating even a
 				// protected ordinal so later recovery never depends on mutable spec.
-				if _, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, revisionToUse, ms.Spec.Template.Roles); err != nil {
+				if _, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, c.controllerRevisionLister, ms, revisionToUse, ms.Spec.Template.Roles); err != nil {
 					scaleUpErr = fmt.Errorf("failed to create ControllerRevision %s for protected ordinal %d: %w", revisionToUse, ordinal, err)
 					return false
 				}
@@ -1094,7 +1108,7 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 			// All ServingGroups created with newRevision share this snapshot, so create
 			// it only once during this reconciliation.
 			klog.V(4).Infof("scaleUpServingGroups: creating ControllerRevision for newRevision=%s, modelServing=%s", newRevision, utils.GetNamespaceName(ms))
-			if _, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, newRevision, ms.Spec.Template.Roles); err != nil {
+			if _, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, c.controllerRevisionLister, ms, newRevision, ms.Spec.Template.Roles); err != nil {
 				scaleUpErr = fmt.Errorf("failed to create ControllerRevision for new revision %s: %w", newRevision, err)
 				return false
 			}
@@ -3209,7 +3223,7 @@ func (c *ModelServingController) updateModelServingStatus(
 
 		// Retry cleanup even when status has already converged. The last Pod
 		// reference may disappear later, or a previous cleanup may have failed.
-		return utils.CleanupOldControllerRevisions(ctx, c.kubeClientSet, copy, referencedRevisions...)
+		return utils.CleanupOldControllerRevisions(ctx, c.kubeClientSet, c.controllerRevisionLister, copy, referencedRevisions...)
 	})
 }
 

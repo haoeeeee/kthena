@@ -36,6 +36,7 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/plugins"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
 
 type fixture struct {
@@ -57,7 +58,7 @@ func newFixture(t *testing.T, workers int32, indices ...int) *fixture {
 	f := &fixture{client: fake.NewSimpleClientset(), role: role}
 	f.req = &plugins.HookRequest{ModelServing: ms, ServingGroup: "model-0", RoleName: role.Name, RoleID: "worker-0", KubeClient: f.client}
 	f.scope = NewScope(f.req, true, "ranktable.json")
-	_, err := utils.CreateControllerRevision(context.Background(), f.client, ms, "history", []workloadv1alpha1.Role{role})
+	_, err := utils.CreateControllerRevision(context.Background(), f.client, revisiontest.ControllerRevisions(f.client), ms, "history", []workloadv1alpha1.Role{role})
 	require.NoError(t, err)
 	for _, i := range indices {
 		pod := utils.GenerateEntryPod(*role.DeepCopy(), ms, "model-0", "worker-0", "history", utils.CalRoleTemplateHash(role))
@@ -221,7 +222,7 @@ func TestMissingHistoryDoesNotGuessLatest(t *testing.T) {
 
 func TestEquivalentRolesAcrossGlobalRevisions(t *testing.T) {
 	f := newFixture(t, 1, 0, 1)
-	_, err := utils.CreateControllerRevision(context.Background(), f.client, f.req.ModelServing, "other", []workloadv1alpha1.Role{f.role, {Name: "unchanged-other-role"}})
+	_, err := utils.CreateControllerRevision(context.Background(), f.client, revisiontest.ControllerRevisions(f.client), f.req.ModelServing, "other", []workloadv1alpha1.Role{f.role, {Name: "unchanged-other-role"}})
 	require.NoError(t, err)
 	pod := f.pods[1].DeepCopy()
 	pod.Labels[workloadv1alpha1.RevisionLabelKey] = "other"

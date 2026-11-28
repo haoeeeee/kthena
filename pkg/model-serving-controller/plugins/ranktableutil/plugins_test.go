@@ -40,6 +40,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/plugins/ranktable"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/plugins/ranktableutil"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
 
 func TestBothPluginsMaintainAppliedMembers(t *testing.T) {
@@ -55,7 +56,7 @@ func TestBothPluginsMaintainAppliedMembers(t *testing.T) {
 				ms := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "test", UID: "owner"},
 					Spec: workloadv1alpha1.ModelServingSpec{Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{role}}}}
 				client := fake.NewSimpleClientset()
-				_, err := utils.CreateControllerRevision(ctx, client, ms, "history", []workloadv1alpha1.Role{role})
+				_, err := utils.CreateControllerRevision(ctx, client, revisiontest.ControllerRevisions(client), ms, "history", []workloadv1alpha1.Role{role})
 				require.NoError(t, err)
 				// The latest spec is deliberately incompatible with applied W1.
 				ms.Spec.Template.Roles[0].WorkerReplicas = 2
@@ -184,7 +185,7 @@ func newMemberFixture(t *testing.T, podIP, group bool, workers int32, annotatedE
 	ms := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "test", UID: "owner"},
 		Spec: workloadv1alpha1.ModelServingSpec{Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{role}}}}
 	f := &memberFixture{client: fake.NewSimpleClientset(), completed: ranktable.RanktableStatusCompleted, initializing: ranktable.RanktableStatusInitializing}
-	_, err := utils.CreateControllerRevision(context.Background(), f.client, ms, "history", []workloadv1alpha1.Role{role})
+	_, err := utils.CreateControllerRevision(context.Background(), f.client, revisiontest.ControllerRevisions(f.client), ms, "history", []workloadv1alpha1.Role{role})
 	require.NoError(t, err)
 	level := "role"
 	if group {

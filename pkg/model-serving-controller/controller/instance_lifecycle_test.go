@@ -26,6 +26,7 @@ import (
 	api "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 	corev1 "k8s.io/api/core/v1"
 	extensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -182,7 +183,7 @@ func lifecycleController(t *testing.T, ms *api.ModelServing, histories ...*api.M
 	c.initialSync.Store(true)
 	t.Cleanup(c.workqueue.ShutDown)
 	for _, historical := range append(histories, ms) {
-		_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, historical, utils.ModelServingRevision(historical), historical.Spec.Template.Roles)
+		_, err := utils.CreateControllerRevision(context.Background(), c.kubeClientSet, revisiontest.ControllerRevisions(c.kubeClientSet), historical, utils.ModelServingRevision(historical), historical.Spec.Template.Roles)
 		require.NoError(t, err)
 	}
 	return c

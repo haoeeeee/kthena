@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	appslisters "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/client-go/util/retry"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
@@ -38,6 +39,7 @@ import (
 func RecordModelServingRevision(
 	ctx context.Context,
 	client kubernetes.Interface,
+	revisions appslisters.ControllerRevisionLister,
 	ms *workloadv1alpha1.ModelServing,
 	data []byte,
 ) (*appsv1.ControllerRevision, *int32, error) {
@@ -54,9 +56,7 @@ func RecordModelServingRevision(
 	selector := labels.SelectorFromSet(map[string]string{
 		ControllerRevisionLabelKey: ms.Name,
 	})
-	history, err := client.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: selector.String(),
-	})
+	history, err := revisions.ControllerRevisions(ms.Namespace).List(selector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list controller revisions: %w", err)
 	}
@@ -64,13 +64,12 @@ func RecordModelServingRevision(
 	var latest *appsv1.ControllerRevision
 	var equivalent *appsv1.ControllerRevision
 	var maxRevision int64
-	for i := range history.Items {
-		revision := &history.Items[i]
+	for _, revision := range history {
 		owner := metav1.GetControllerOfNoCopy(revision)
 		if owner == nil || owner.UID != ms.UID {
 			continue
 		}
-		if latest == nil || controllerRevisionLess(latest, revision) {
+		if latest == nil || ControllerRevisionLess(latest, revision) {
 			latest = revision
 		}
 		if revision.Revision > maxRevision {
@@ -78,7 +77,7 @@ func RecordModelServingRevision(
 		}
 		if revision.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 &&
 			bytes.Equal(revision.Data.Raw, data) {
-			if equivalent == nil || controllerRevisionLess(equivalent, revision) {
+			if equivalent == nil || ControllerRevisionLess(equivalent, revision) {
 				equivalent = revision
 			}
 		}
@@ -90,7 +89,7 @@ func RecordModelServingRevision(
 	nextRevision := maxRevision + 1
 
 	if equivalent != nil {
-		result, err := updateControllerRevision(ctx, client, equivalent, nextRevision)
+		result, err := UpdateControllerRevision(ctx, client, equivalent, nextRevision)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -130,7 +129,7 @@ func RecordModelServingRevision(
 				existing.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 &&
 				bytes.Equal(existing.Data.Raw, data) {
 				if existing.Revision < nextRevision {
-					existing, err = updateControllerRevision(ctx, client, existing, nextRevision)
+					existing, err = UpdateControllerRevision(ctx, client, existing, nextRevision)
 					if err != nil {
 						return nil, nil, err
 					}
@@ -147,9 +146,9 @@ func RecordModelServingRevision(
 	}
 }
 
-// controllerRevisionLess matches the ordering used by Kubernetes controller
+// ControllerRevisionLess matches the ordering used by Kubernetes controller
 // history: numeric revision, creation timestamp, then name.
-func controllerRevisionLess(left, right *appsv1.ControllerRevision) bool {
+func ControllerRevisionLess(left, right *appsv1.ControllerRevision) bool {
 	if left.Revision != right.Revision {
 		return left.Revision < right.Revision
 	}
@@ -159,7 +158,10 @@ func controllerRevisionLess(left, right *appsv1.ControllerRevision) bool {
 	return left.Name < right.Name
 }
 
-func updateControllerRevision(
+// UpdateControllerRevision advances only the numeric revision, preserving the
+// snapshot identity and data. Conflicts are retried without decreasing a number
+// already advanced by another writer.
+func UpdateControllerRevision(
 	ctx context.Context,
 	client kubernetes.Interface,
 	revision *appsv1.ControllerRevision,

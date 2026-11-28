@@ -34,6 +34,7 @@ import (
 
 	api "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
+	revisiontest "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
 
 func TestEvictionMustUseObservedHistoricalLayout(t *testing.T) {
@@ -54,7 +55,7 @@ func TestEvictionMustUseObservedHistoricalLayout(t *testing.T) {
 		p.Status = corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}
 	}
 	h, kube := newTestEvictionHandlerWithLivePods(ms, []*corev1.Pod{oldEntry, target}, []*corev1.Pod{oldEntry, target})
-	_, err := utils.CreateControllerRevision(ctx, kube, old, utils.ModelServingRevision(old), old.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(ctx, kube, revisiontest.ControllerRevisions(kube), old, utils.ModelServingRevision(old), old.Spec.Template.Roles)
 	require.NoError(t, err)
 	allowed, reason := h.checkEvictionWithTracker(ctx, ms, target)
 	require.False(t, allowed, "old missing worker cannot provide eviction credit: %s", reason)
@@ -135,7 +136,7 @@ func TestEvictionHistoricalCompleteness(t *testing.T) {
 				}
 				pods := append(previous, current...)
 				h, kube := newTestEvictionHandlerWithLivePods(ms, pods, pods)
-				_, err := utils.CreateControllerRevision(ctx, kube, old, utils.ModelServingRevision(old), old.Spec.Template.Roles)
+				_, err := utils.CreateControllerRevision(ctx, kube, revisiontest.ControllerRevisions(kube), old, utils.ModelServingRevision(old), old.Spec.Template.Roles)
 				require.NoError(t, err)
 				if tc.defect == "read-error" {
 					kube.PrependReactor("get", "controllerrevisions", func(clienttesting.Action) (bool, runtime.Object, error) {
@@ -191,7 +192,7 @@ func TestEvictionTrackerRetainsIncompleteHistoricalRole(t *testing.T) {
 	ms.Spec.Template.Roles[0].WorkerReplicas = 0
 	pods := evictionLayoutPods(old, "test-ms-0", "inference-0")
 	h, kube := newTestEvictionHandlerWithLivePods(ms, pods, pods)
-	_, err := utils.CreateControllerRevision(ctx, kube, old, utils.ModelServingRevision(old), old.Spec.Template.Roles)
+	_, err := utils.CreateControllerRevision(ctx, kube, revisiontest.ControllerRevisions(kube), old, utils.ModelServingRevision(old), old.Spec.Template.Roles)
 	require.NoError(t, err)
 	for _, unit := range []disruptionUnit{servingGroupUnit(ms, "test-ms-0"), roleUnit(ms, "test-ms-0", "inference", "inference-0")} {
 		entries := disruptionEntries{unit.key(): {expiresAt: time.Now().Add(time.Minute), triggerPodUID: "gone"}}
